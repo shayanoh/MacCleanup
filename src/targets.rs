@@ -118,6 +118,8 @@ struct Cand {
     group: String,
     label: String,
     subtitle: String,
+    /// A workspace member (its project folder is below the group's root).
+    member: bool,
     name: String,
     kind: RowKind,
     regen: String,
@@ -181,6 +183,7 @@ impl Targets {
                 group: e.tool.clone(),
                 label: e.tool.clone(),
                 subtitle: String::new(),
+                member: false,
                 name: e.label.clone(),
                 kind: match &e.mode {
                     Mode::Folder => RowKind::Folder,
@@ -196,17 +199,22 @@ impl Targets {
         work.stage(1, 3, "finding project folders");
         for c in detect_artifacts(root) {
             cands.push(Cand {
+                // Named relative to the root project: "apps/web/node_modules".
+                name: c.path.strip_prefix(&c.root).map_or_else(
+                    |_| c.kind.label().to_string(),
+                    |rel| rel.to_string_lossy().into_owned(),
+                ),
                 path: c.path,
                 node: c.node,
                 priority: 1,
                 section: SectionKind::Projects,
-                group: display_path(home, &c.project),
+                group: display_path(home, &c.root),
                 label: c
-                    .project
+                    .root
                     .file_name()
                     .map_or_else(|| "~".to_string(), |n| n.to_string_lossy().into_owned()),
                 subtitle: project_kind(c.kind).to_string(),
-                name: c.kind.label().to_string(),
+                member: c.project != c.root,
                 kind: RowKind::Folder,
                 regen: c.kind.regen().to_string(),
                 note: None,
@@ -244,6 +252,11 @@ impl Targets {
         };
 
         let mut groups: Vec<Group> = Vec::new();
+        // What each project group holds, to write its subtitle at the end.
+        let mut ecos: std::collections::HashMap<
+            String,
+            (std::collections::BTreeSet<String>, bool),
+        > = std::collections::HashMap::new();
         for (i, c) in cands.into_iter().enumerate() {
             let space = spaces.get(i).copied();
             let row = Row {
@@ -258,6 +271,11 @@ impl Targets {
                 space,
                 frees: space.map(|s| s.frees_now),
             };
+            if c.section == SectionKind::Projects {
+                let e = ecos.entry(c.group.clone()).or_default();
+                e.0.insert(c.subtitle.clone());
+                e.1 |= c.member;
+            }
             let trow = TRow {
                 row,
                 kind: c.kind,
@@ -279,6 +297,18 @@ impl Targets {
                     section: c.section,
                     rows: vec![trow],
                 }),
+            }
+        }
+        // "Node", "Node + Rust", "Node workspace": what the project holds.
+        for g in groups
+            .iter_mut()
+            .filter(|g| g.section == SectionKind::Projects)
+        {
+            if let Some((kinds, member)) = ecos.get(&g.title) {
+                g.subtitle = kinds.iter().cloned().collect::<Vec<_>>().join(" + ");
+                if *member {
+                    g.subtitle.push_str(" workspace");
+                }
             }
         }
         let mut t = Targets { groups };
@@ -489,6 +519,49 @@ mod tests {
         assert_eq!(label("~/shop"), "shop");
         assert_eq!(label("~/api"), "api");
         assert_eq!(label("App caches"), "App caches");
+    }
+
+    #[test]
+    fn workspace_members_are_listed_under_the_root_project() {
+        let s = sandbox(|h| {
+            write(&h.join("mono/package.json"), 10);
+            write(&h.join("mono/pnpm-workspace.yaml"), 10);
+            write(&h.join("mono/node_modules/a/i.js"), 30_000);
+            write(&h.join("mono/apps/web/package.json"), 10);
+            write(&h.join("mono/apps/web/node_modules/a/i.js"), 20_000);
+            write(&h.join("mono/src-tauri/Cargo.toml"), 10);
+            write(&h.join("mono/src-tauri/target/x"), 10_000);
+            write(&h.join("other/package.json"), 10);
+            write(&h.join("other/node_modules/a/i.js"), 5_000);
+        });
+        let t = build(&s, &[]);
+        let mut titles = titles(&t, SectionKind::Projects);
+        titles.sort();
+        assert_eq!(
+            titles,
+            ["~/mono", "~/other"],
+            "members do not get groups of their own"
+        );
+        let mono = t.groups.iter().find(|g| g.title == "~/mono").unwrap();
+        assert_eq!(mono.label, "mono");
+        let mut names: Vec<_> = mono
+            .rows
+            .iter()
+            .map(|r| r.row.name.to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["apps/web/node_modules", "node_modules", "src-tauri/target"]
+        );
+        assert!(
+            mono.subtitle.contains("Node") && mono.subtitle.contains("Rust"),
+            "{}",
+            mono.subtitle
+        );
+        assert!(mono.subtitle.contains("workspace"), "{}", mono.subtitle);
+        let other = t.groups.iter().find(|g| g.title == "~/other").unwrap();
+        assert_eq!(other.subtitle, "Node");
     }
 
     #[test]
