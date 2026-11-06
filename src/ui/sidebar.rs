@@ -49,6 +49,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 style
             };
             Line::from(vec![
+                Span::styled((i + 1).to_string(), Style::default().fg(DIM)),
                 Span::styled(marker.to_string(), style),
                 Span::styled(icon.to_string(), icon_style),
                 Span::styled(format!(" {}", entry.label), style),

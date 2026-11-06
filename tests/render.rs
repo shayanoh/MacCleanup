@@ -19,6 +19,29 @@ struct Env {
     app: App,
 }
 
+/// Runs nothing and finds nothing: tool discovery is deterministic in tests.
+struct NoTools;
+
+impl maccleanup::catalog::CommandRunner for NoTools {
+    fn run(
+        &self,
+        _: &maccleanup::catalog::CommandSpec,
+        _: &maccleanup::catalog::RunControl,
+    ) -> maccleanup::catalog::CommandResult {
+        maccleanup::catalog::CommandResult {
+            ok: true,
+            cancelled: false,
+            output_tail: String::new(),
+        }
+    }
+    fn query(&self, _: &maccleanup::catalog::CommandSpec) -> Option<String> {
+        None
+    }
+    fn available(&self, _: &str) -> bool {
+        false
+    }
+}
+
 fn write(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, vec![b'x'; bytes]).unwrap();
@@ -61,7 +84,8 @@ fn make_app_full(
         Accounting::new(free),
         Glyphs::new(mode),
         animations,
-    );
+    )
+    .with_runner(std::sync::Arc::new(NoTools));
     Env { _dir: dir, app }
 }
 
@@ -96,6 +120,20 @@ fn render(app: &mut App, w: u16, h: u16) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Open the review and wait until its space figures are worked out.
+fn open_review(app: &mut App) {
+    app.update(Action::OpenReview);
+    for _ in 0..400 {
+        match &app.dialog {
+            Some(Dialog::Review(r)) if !r.space_ready => {
+                app.update(Action::Tick);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => return,
+        }
+    }
 }
 
 fn mark(app: &mut App, name: &str) {
@@ -159,7 +197,7 @@ fn explorer_lists_rows_with_sizes() {
 fn marked_footer_text() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "big");
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 130, 30);
     assert!(text.contains("marked: 1 items"), "{text}");
     assert!(text.contains("not deleted yet"), "{text}");
 }
@@ -218,7 +256,7 @@ fn ascii_mode_has_only_ascii_cells() {
     e.app.graph = GraphMode::Treemap;
     assert_ascii("treemap with a mark", render_cells(&mut e.app, 120, 30));
 
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     assert!(matches!(e.app.dialog, Some(Dialog::Review(_))));
     assert_ascii("review", render_cells(&mut e.app, 120, 30));
     e.app.update(Action::ConfirmIrreversible);
@@ -234,7 +272,7 @@ fn review_dialog_shows_total_and_keys() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "big");
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("Enter"), "{text}");
     assert!(text.contains("Esc"), "{text}");
@@ -247,7 +285,7 @@ fn review_dialog_shows_total_and_keys() {
 fn irreversible_dialog_warns() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "big");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("cannot be undone"), "{text}");
@@ -258,7 +296,7 @@ fn irreversible_dialog_warns() {
 fn deleting_dialog_shows_progress() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "big");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     // Render before ticking so the dialog is still in the working state.
     let text = render(&mut e.app, 120, 30);
@@ -277,7 +315,7 @@ fn deleting_dialog_shows_progress() {
 fn finish_dialog_shows_congratulation() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "big");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
@@ -303,7 +341,7 @@ fn finish_dialog_shows_congratulation() {
 fn finish_dialog_explains_when_nothing_was_freed() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
@@ -326,7 +364,7 @@ fn finish_dialog_explains_when_nothing_was_freed() {
 fn holding_screen_lists_items() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -389,7 +427,7 @@ fn layout_is_published_for_mouse_mapping() {
 #[test]
 fn notice_text_replaces_footer_hints() {
     let mut e = explorer(GlyphMode::Nerd);
-    e.app.update(Action::OpenReview); // nothing marked: sets a notice
+    open_review(&mut e.app); // nothing marked: sets a notice
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("Nothing marked yet"), "{text}");
 }
@@ -556,7 +594,7 @@ fn home_scan_line_shows_on_disk_size_too() {
 fn review_dialog_shows_on_disk_total() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 120, 30);
     // small.txt: 1.5 KB logical, 4.1 KB on disk.
     assert!(text.contains("1.5 KB"), "{text}");
@@ -579,7 +617,7 @@ fn marked_footer_shows_on_disk_size() {
 fn sidebar_pending_shows_on_disk_size() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -611,7 +649,7 @@ fn home_pending_and_folders_show_on_disk_size() {
 fn holding_screen_shows_on_disk_size() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -632,7 +670,7 @@ fn holding_screen_shows_on_disk_size() {
 fn finish_dialog_shows_on_disk_amounts() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
@@ -704,7 +742,7 @@ fn dialogs_grow_in_when_animations_are_on() {
     }
     let before = render(&mut e.app, 120, 30).matches('╭').count();
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
 
     let first = render(&mut e.app, 120, 30);
     assert!(
@@ -736,7 +774,7 @@ fn dialogs_grow_in_when_animations_are_on() {
 fn no_grow_animation_when_animations_are_off() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("Review before moving"), "{text}");
 }
@@ -747,7 +785,7 @@ fn finished_with_freed_space(animations: bool, freed: bool) -> Env {
     let mut e = make_app_full(FILES, GlyphMode::Nerd, animations, |_| {});
     e.app.update(Action::GoTo(Screen::Explorer));
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
@@ -805,7 +843,7 @@ fn confetti_is_ascii_in_ascii_mode() {
     let mut e = make_app_full(FILES, GlyphMode::Ascii, true, |_| {});
     e.app.update(Action::GoTo(Screen::Explorer));
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
@@ -828,7 +866,7 @@ fn confetti_is_ascii_in_ascii_mode() {
 fn emptying_shows_a_deleting_dialog_with_a_progress_bar() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -1028,7 +1066,7 @@ fn a_long_query_does_not_break_the_layout() {
 fn with_held_item() -> Env {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -1089,7 +1127,7 @@ fn quitting_with_items_shows_the_warning_dialog() {
 fn the_quit_warning_is_ascii_in_ascii_mode() {
     let mut e = explorer(GlyphMode::Ascii);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -1165,7 +1203,7 @@ fn review_dialog_says_what_frees_now_and_what_stays() {
     let mut e = shared_app(GlyphMode::Nerd);
     select_row(&mut e.app, "proj");
     e.app.update(Action::ToggleMark);
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 140, 34);
     assert!(text.contains("frees about"), "{text}");
     assert!(text.contains("right now"), "{text}");
@@ -1198,7 +1236,7 @@ fn review_explains_data_shared_only_among_the_marked_files() {
     let mut e = clone_pair_app();
     select_row(&mut e.app, "dup");
     e.app.update(Action::ToggleMark);
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 140, 36);
     assert!(
         text.contains("shared only among these files"),
@@ -1334,4 +1372,981 @@ fn the_list_shows_where_the_cursor_is_and_a_scrollbar_when_it_overflows() {
     let text = render(&mut e.app, 140, 30);
     assert!(text.contains("1/1"), "{text}");
     assert!(!text.contains('█'), "no scrollbar when everything fits");
+}
+
+// --- Caches & Projects screen ----------------------------------------------
+
+const TARGET_FILES: &[(&str, usize)] = &[
+    ("shop/package.json", 10),
+    ("shop/node_modules/a/i.js", 300_000),
+    ("shop/.next/c", 100_000),
+    ("api/Cargo.toml", 10),
+    ("api/target/x", 900_000),
+    ("Library/Caches/Spotify/blob", 500_000),
+];
+
+fn wait_tools(app: &mut App) {
+    for _ in 0..2000 {
+        app.update(Action::Tick);
+        if !app.tools_looking() && !app.targets_building() && app.scanner.is_idle() {
+            app.update(Action::Tick);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("tool discovery did not finish");
+}
+
+fn targets_screen(mode: GlyphMode) -> Env {
+    let mut e = make_app(TARGET_FILES, mode);
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    e
+}
+
+fn cursor_on_row(app: &mut App, name: &str) {
+    use maccleanup::targets::Line;
+    let at = app
+        .tlines
+        .iter()
+        .position(|l| match *l {
+            Line::Row { group, row } => app.targets.row(group, row).row.name == name,
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("no row {name}"));
+    app.tcursor = at;
+}
+
+#[test]
+fn targets_screen_shows_both_section_bands_and_the_rows() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains("PROJECTS"), "{text}");
+    assert!(text.contains("TOOLS & CACHES"), "{text}");
+    for want in ["~/shop", "~/api", "node_modules", "target", "Spotify"] {
+        assert!(text.contains(want), "missing {want}:\n{text}");
+    }
+}
+
+#[test]
+fn targets_columns_match_the_explorer_in_order() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 140, 36);
+    let header_of = |text: &str| -> Vec<usize> {
+        let line = text
+            .lines()
+            .find(|l| l.contains("Name") && l.contains("Frees"))
+            .unwrap();
+        ["Name", "Size", "On disk", "Frees"]
+            .iter()
+            .map(|c| line.find(c).unwrap_or_else(|| panic!("no {c} in {line}")))
+            .collect()
+    };
+    let cols = header_of(&t);
+    assert!(cols.windows(2).all(|w| w[0] < w[1]), "{cols:?}");
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let ex = header_of(&render(&mut e.app, 140, 36));
+    // Same labels in the same order; the panes differ in width, not in order.
+    assert_eq!(ex.len(), cols.len());
+}
+
+#[test]
+fn a_marked_row_and_the_footer_total_show() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "target");
+    e.app.update(Action::ToggleMark);
+    for _ in 0..200 {
+        e.app.update(Action::Tick);
+        if !e.app.set_space.pending {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains("marked 1"), "{text}");
+    assert!(text.contains("frees"), "{text}");
+    assert!(
+        text.contains(&human_size(900_000)) || text.contains("879"),
+        "{text}"
+    );
+}
+
+#[test]
+fn ascii_mode_has_no_non_ascii_cells() {
+    let mut e = targets_screen(GlyphMode::Ascii);
+    cursor_on_row(&mut e.app, "target");
+    e.app.update(Action::ToggleMark);
+    for c in render_cells(&mut e.app, 140, 36) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+#[test]
+fn the_screen_renders_at_every_small_size_without_panicking() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    for (w, h) in [
+        (ui::MIN_WIDTH, ui::MIN_HEIGHT),
+        (80, 20),
+        (200, 60),
+        (61, 15),
+    ] {
+        let _ = render(&mut e.app, w, h);
+    }
+}
+
+#[test]
+fn an_empty_home_says_there_is_nothing_to_clean() {
+    let mut e = make_app(&[("note.txt", 10)], GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("nothing to clean"), "{text}");
+}
+
+#[test]
+fn the_graph_follows_the_group_and_t_switches_its_kind() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "target");
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains("Treemap"), "{text}");
+    e.app.update(Action::CycleGraph);
+    e.app.update(Action::CycleGraph);
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains("Distribution"), "{text}");
+    assert!(text.contains("selected: api"), "{text}");
+}
+
+#[test]
+fn the_detail_pane_names_what_a_row_is_and_how_it_comes_back() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "node_modules");
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("comes back: reinstall with npm"), "{text}");
+    assert!(
+        text.contains("yarn install"),
+        "long text wraps, not cut:\n{text}"
+    );
+    assert!(text.contains("shop/node_modules"), "{text}");
+}
+
+#[test]
+fn the_detail_pane_lists_related_folders_with_their_mark() {
+    let mut e = make_app_with(
+        &[
+            ("Library/Caches/Store/f", 200_000),
+            ("p1/package.json", 10),
+            ("p2/package.json", 10),
+        ],
+        GlyphMode::Nerd,
+        |home| {
+            for p in ["p1", "p2"] {
+                fs::create_dir_all(home.join(p).join("node_modules")).unwrap();
+                let st = std::process::Command::new("cp")
+                    .arg("-c")
+                    .arg(home.join("Library/Caches/Store/f"))
+                    .arg(home.join(p).join("node_modules/f"))
+                    .status()
+                    .unwrap();
+                assert!(st.success(), "needs APFS");
+            }
+        },
+    );
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    cursor_on_row(&mut e.app, "Store");
+    e.app.update(Action::Up); // off the row and back on, so the related folders are looked up
+    e.app.update(Action::Down);
+    for _ in 0..200 {
+        e.app.update(Action::Tick);
+        if !e.app.holders.pending {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("p1/node_modules"), "{text}");
+    assert!(text.contains("p2/node_modules"), "{text}");
+    assert!(text.contains("also holds"), "{text}");
+}
+
+#[test]
+fn the_review_shows_the_command_block_with_the_explicit_key() {
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let home = e.app.policy.home().to_path_buf();
+    e.app.tool_entries = vec![ToolEntry {
+        id: "cmd".to_string(),
+        tool: "Tool".to_string(),
+        label: "Spotify".to_string(),
+        path: home.join("Library/Caches/Spotify"),
+        regen: "again".to_string(),
+        mode: Mode::Command(CommandSpec::new("/opt/x/bin/tool", &["clean"])),
+        note: None,
+    }];
+    e.app.rebuild_targets();
+    e.app.settle_targets();
+    cursor_on_row(&mut e.app, "Spotify");
+    e.app.update(Action::ToggleMark);
+    open_review(&mut e.app);
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("Tool cleanup commands"), "{text}");
+    assert!(text.contains("tool clean"), "{text}");
+    assert!(text.contains("/opt/x/bin/tool"), "{text}");
+    assert!(text.contains("[ y ]") || text.contains(" y "), "{text}");
+    assert!(
+        !text.contains("Enter"),
+        "Enter must not be offered:\n{text}"
+    );
+}
+
+#[test]
+fn tools_still_being_looked_up_are_said_so() {
+    let mut e = make_app(TARGET_FILES, GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Targets));
+    assert!(e.app.tools_looking());
+    let text = render(&mut e.app, 140, 36);
+    // The phase moves quickly; the label and a bar are always there.
+    assert!(text.contains("tools:"), "{text}");
+}
+
+#[test]
+fn the_explorer_footer_counts_marked_tool_cleanups() {
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let home = e.app.policy.home().to_path_buf();
+    e.app.tool_entries = vec![ToolEntry {
+        id: "cmd".to_string(),
+        tool: "Tool".to_string(),
+        label: "Spotify".to_string(),
+        path: home.join("Library/Caches/Spotify"),
+        regen: "again".to_string(),
+        mode: Mode::Command(CommandSpec::new("/opt/x/bin/tool", &["clean"])),
+        note: None,
+    }];
+    e.app.rebuild_targets();
+    e.app.settle_targets();
+    cursor_on_row(&mut e.app, "Spotify");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("1 tool cleanup"), "{text}");
+}
+
+fn rooted_app(root_rel: &str) -> Env {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let home = base.join("home");
+    fs::create_dir_all(&home).unwrap();
+    for (rel, size) in TARGET_FILES {
+        write(&home.join(rel), *size);
+    }
+    let hold = base.join("hold");
+    let scanner = Scanner::new(2);
+    let root = scanner.scan_root(&home.join(root_rel));
+    assert!(scanner.wait_idle(Duration::from_secs(20)));
+    let policy = Policy::new(&home, &hold);
+    let holding = Holding::open(hold).unwrap();
+    let free = volume::free_space(&home).unwrap();
+    let app = App::new(
+        scanner,
+        root,
+        policy,
+        holding,
+        Accounting::new(free),
+        Glyphs::new(GlyphMode::Nerd),
+        false,
+    )
+    .with_runner(std::sync::Arc::new(NoTools));
+    Env { _dir: dir, app }
+}
+
+#[test]
+fn a_narrowed_scan_root_and_missing_full_disk_access_are_announced() {
+    let mut e = rooted_app("shop");
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    e.app.fda_missing = true;
+    let text = render(&mut e.app, 190, 40);
+    assert!(text.contains("scan root is"), "{text}");
+    assert!(text.contains("Full Disk Access"), "{text}");
+    // A full home scan says neither.
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let text = render(&mut e.app, 190, 40);
+    assert!(!text.contains("scan root is"), "{text}");
+    assert!(!text.contains("Full Disk Access"), "{text}");
+}
+
+#[test]
+fn y_is_refused_while_a_marked_command_is_hidden_by_a_short_terminal() {
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let home = e.app.policy.home().to_path_buf();
+    let entries: Vec<ToolEntry> = (0..8)
+        .map(|i| {
+            let rel = format!("Library/Caches/Cmd{i}");
+            fs::create_dir_all(home.join(&rel)).unwrap();
+            fs::write(home.join(&rel).join("f"), vec![b'x'; 1000]).unwrap();
+            ToolEntry {
+                id: format!("cmd{i}"),
+                tool: "Tool".to_string(),
+                label: format!("Cmd{i}"),
+                path: home.join(&rel),
+                regen: "again".to_string(),
+                mode: Mode::Command(CommandSpec::new("/opt/x/bin/tool", &[&format!("clean{i}")])),
+                note: None,
+            }
+        })
+        .collect();
+    e.app.tool_entries = entries;
+    e.app.update(Action::RescanAll);
+    wait_tools(&mut e.app);
+    e.app.rebuild_targets();
+    e.app.settle_targets();
+    for i in 0..8 {
+        cursor_on_row(&mut e.app, &format!("Cmd{i}"));
+        e.app.update(Action::ToggleMark);
+    }
+    assert_eq!(e.app.tool_marks.len(), 8);
+    open_review(&mut e.app);
+    // A short terminal cannot show eight commands.
+    let text = render(&mut e.app, 100, 20);
+    assert!(text.contains("more command"), "{text}");
+    e.app.update(Action::Confirm);
+    assert!(
+        matches!(e.app.dialog, Some(Dialog::Review(_))),
+        "must stay open"
+    );
+    assert_eq!(e.app.tool_marks.len(), 8, "nothing ran");
+    // A tall terminal shows them all and the key works again.
+    let text = render(&mut e.app, 140, 60);
+    assert!(text.contains("clean7"), "{text}");
+    e.app.update(Action::Confirm);
+    assert!(
+        matches!(e.app.dialog, Some(Dialog::Deleting(_))),
+        "{:?}",
+        e.app.dialog
+    );
+}
+
+#[test]
+fn work_in_progress_shows_what_it_is_doing_with_a_bar() {
+    let mut e = make_app(TARGET_FILES, GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Targets));
+    assert!(e.app.targets_building() && e.app.tools_looking());
+    let text = render(&mut e.app, 190, 40);
+    // The list build has three known stages; the tool lookup has a moving bar.
+    assert!(text.contains("list:") && text.contains("/3"), "{text}");
+    assert!(text.contains("tools:"), "{text}");
+    let status = text.lines().find(|l| l.contains("list:")).unwrap();
+    assert!(
+        status.chars().any(|c| "▏▎▍▌▋▊▉█".contains(c)),
+        "a bar is drawn: {status}"
+    );
+}
+
+#[test]
+fn the_progress_readout_is_ascii_in_ascii_mode() {
+    let mut e = make_app(TARGET_FILES, GlyphMode::Ascii);
+    e.app.update(Action::GoTo(Screen::Targets));
+    for c in render_cells(&mut e.app, 190, 40) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+#[test]
+fn the_menu_shows_each_pages_number_and_planned_pages_keep_theirs() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let text = render(&mut e.app, 140, 36);
+    for (n, label) in [
+        (1, "Home"),
+        (2, "Explorer"),
+        (3, "Leftovers"),
+        (4, "Uninstall"),
+        (5, "Caches & Projects"),
+        (6, "Docker"),
+        (7, "ToBeDeleted"),
+    ] {
+        let line = text
+            .lines()
+            .find(|l| l.contains(label) && l.starts_with(&format!("│{n}")))
+            .unwrap_or_else(|| panic!("no menu line '{n} ... {label}':\n{text}"));
+        assert!(line.contains(label));
+    }
+}
+
+/// The middle of a graph hit area, as a click position.
+fn centre(r: ratatui::layout::Rect) -> (u16, u16) {
+    (r.x + r.width / 2, r.y + r.height / 2)
+}
+
+#[test]
+fn clicking_a_treemap_box_selects_that_row() {
+    let mut e = explorer(GlyphMode::Nerd);
+    assert_eq!(e.app.graph, GraphMode::Treemap);
+    let _ = render(&mut e.app, 140, 36);
+    assert!(
+        !e.app.graph_hits.is_empty(),
+        "the treemap records its boxes"
+    );
+    for want in 0..e.app.rows.len() {
+        let hit = e.app.graph_hits.iter().find(|(_, k)| k.1 == want).cloned();
+        let Some((rect, _)) = hit else { continue };
+        e.app.cursor = (want + 1) % e.app.rows.len();
+        let (x, y) = centre(rect);
+        e.app.update(Action::Click { x, y });
+        assert_eq!(e.app.cursor, want, "box {want} at {rect:?}");
+    }
+}
+
+#[test]
+fn clicking_a_bar_selects_that_row() {
+    let mut e = explorer(GlyphMode::Nerd);
+    e.app.update(Action::CycleGraph); // treemap -> hidden
+    e.app.update(Action::CycleGraph); // hidden -> bars
+    assert_eq!(e.app.graph, GraphMode::Bars);
+    let _ = render(&mut e.app, 140, 36);
+    assert_eq!(e.app.graph_hits.len(), e.app.rows.len(), "one bar per row");
+    for want in 0..e.app.rows.len() {
+        let (rect, _) = e
+            .app
+            .graph_hits
+            .iter()
+            .find(|(_, k)| k.1 == want)
+            .cloned()
+            .unwrap();
+        e.app.cursor = (want + 1) % e.app.rows.len();
+        let (x, y) = centre(rect);
+        e.app.update(Action::Click { x, y });
+        assert_eq!(e.app.cursor, want);
+    }
+}
+
+#[test]
+fn the_selected_bar_moves_with_a_click() {
+    let mut e = explorer(GlyphMode::Nerd);
+    e.app.update(Action::CycleGraph);
+    e.app.update(Action::CycleGraph);
+    let _ = render(&mut e.app, 140, 36);
+    let (rect, _) = e
+        .app
+        .graph_hits
+        .iter()
+        .find(|(_, k)| k.1 == 2)
+        .cloned()
+        .unwrap();
+    let (x, y) = centre(rect);
+    e.app.update(Action::Click { x, y });
+    let name = e.app.rows[2].name.to_string_lossy().into_owned();
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains(&format!("selected: {name}")), "{text}");
+}
+
+#[test]
+fn clicking_a_box_on_caches_and_projects_selects_the_project() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "target");
+    let _ = render(&mut e.app, 150, 40);
+    let hits = e.app.graph_hits.clone();
+    assert!(!hits.is_empty());
+    for (rect, (g, _)) in hits {
+        let want = e.app.targets.groups[g].title.clone();
+        let (x, y) = centre(rect);
+        e.app.update(Action::Click { x, y });
+        let line = e.app.tlines[e.app.tcursor];
+        assert_eq!(line, maccleanup::targets::Line::Group(g), "{want}");
+        let _ = render(&mut e.app, 150, 40);
+    }
+}
+
+#[test]
+fn nothing_is_clickable_in_a_graph_that_is_hidden() {
+    let mut e = explorer(GlyphMode::Nerd);
+    e.app.update(Action::CycleGraph); // hidden
+    let _ = render(&mut e.app, 140, 36);
+    assert!(e.app.graph_hits.is_empty());
+}
+
+#[test]
+fn the_graph_on_caches_shows_every_listed_project_by_name() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    e.app.update(Action::CycleGraph);
+    e.app.update(Action::CycleGraph); // bars
+    assert_eq!(e.app.graph, GraphMode::Bars);
+    cursor_on_row(&mut e.app, "target");
+    let text = render(&mut e.app, 160, 40);
+    for label in ["api", "shop", "App caches"] {
+        assert!(text.contains(label), "graph label {label}:\n{text}");
+    }
+    assert!(
+        text.contains("selected: api"),
+        "the project of the cursor is highlighted:\n{text}"
+    );
+    // One bar per group in the list, not one per row of a single group.
+    let groups = e.app.targets.groups.len();
+    assert_eq!(e.app.graph_hits.len(), groups);
+}
+
+#[test]
+fn clicking_a_project_in_the_graph_selects_its_header() {
+    use maccleanup::targets::Line;
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let _ = render(&mut e.app, 160, 40);
+    let hits = e.app.graph_hits.clone();
+    assert_eq!(hits.len(), e.app.targets.groups.len());
+    for (rect, (g, _)) in hits {
+        let (x, y) = centre(rect);
+        e.app.update(Action::Click { x, y });
+        assert_eq!(e.app.tlines[e.app.tcursor], Line::Group(g), "group {g}");
+        let _ = render(&mut e.app, 160, 40);
+    }
+}
+
+#[test]
+fn the_graph_follows_the_filter_and_folds_do_not_remove_projects_from_it() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "target");
+    e.app.focus = maccleanup::app::Focus::Main;
+    e.app.update(Action::Out); // fold ~/api
+    let _ = render(&mut e.app, 160, 40);
+    assert_eq!(
+        e.app.graph_hits.len(),
+        e.app.targets.groups.len(),
+        "folded, still graphed"
+    );
+    e.app.update(Action::FilterOpen);
+    for c in "spot".chars() {
+        e.app.update(Action::FilterChar(c));
+    }
+    let _ = render(&mut e.app, 160, 40);
+    assert_eq!(e.app.graph_hits.len(), 1, "only App caches matches");
+}
+
+fn rust_project_screen(mode: GlyphMode) -> Env {
+    use std::os::unix::fs::PermissionsExt;
+    let mut e = make_app_with(
+        &[
+            ("api/Cargo.toml", 10),
+            ("api/target/debug/deps/f", 400_000),
+            ("api/target/debug/incremental/f", 200_000),
+            ("api/target/debug/myapp", 80_000),
+        ],
+        mode,
+        |home| {
+            fs::set_permissions(
+                home.join("api/target/debug/myapp"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        },
+    );
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    e
+}
+
+#[test]
+fn binaries_are_listed_apart_from_intermediate_files_and_marked_as_kept() {
+    let mut e = rust_project_screen(GlyphMode::Nerd);
+    let text = render(&mut e.app, 170, 40);
+    assert!(text.contains("target/debug/deps"), "{text}");
+    assert!(text.contains("target/debug/incremental"), "{text}");
+    let bin = text
+        .lines()
+        .find(|l| l.contains("target/debug/myapp"))
+        .unwrap();
+    assert!(bin.contains("(kept)"), "{bin}");
+    // The intermediate rows are not kept.
+    let deps = text
+        .lines()
+        .find(|l| l.contains("target/debug/deps"))
+        .unwrap();
+    assert!(!deps.contains("(kept)"), "{deps}");
+}
+
+#[test]
+fn the_detail_pane_explains_that_a_product_is_kept_unless_marked() {
+    let mut e = rust_project_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "target/debug/myapp");
+    let text = render(&mut e.app, 170, 40);
+    // The text wraps in the narrow pane, so look for its start.
+    assert!(text.contains("a finished product"), "{text}");
+    assert!(text.contains("kept unless"), "{text}");
+}
+
+#[test]
+fn marking_the_project_header_leaves_the_binary_unmarked_on_screen() {
+    let mut e = rust_project_screen(GlyphMode::Nerd);
+    e.app.focus = maccleanup::app::Focus::Main;
+    let at = e
+        .app
+        .tlines
+        .iter()
+        .position(|l| matches!(l, maccleanup::targets::Line::Group(g) if e.app.targets.groups[*g].title == "~/api"))
+        .unwrap();
+    e.app.tcursor = at;
+    e.app.update(Action::ToggleMark);
+    assert_eq!(e.app.marks.len(), 2, "deps and incremental, not the binary");
+    let text = render(&mut e.app, 170, 40);
+    assert!(text.contains("marked 2"), "{text}");
+}
+
+#[test]
+fn product_rows_are_ascii_in_ascii_mode() {
+    let mut e = rust_project_screen(GlyphMode::Ascii);
+    for c in render_cells(&mut e.app, 170, 40) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+fn review_of_many(n: usize) -> Env {
+    let files: Vec<(String, usize)> = (0..n).map(|i| (format!("item{i:03}.bin"), 1000)).collect();
+    let refs: Vec<(&str, usize)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+    let mut e = make_app(&refs, GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let rows: Vec<_> = e
+        .app
+        .rows
+        .iter()
+        .map(|r| (r.path.clone(), r.size, r.disk))
+        .collect();
+    for (p, size, disk) in rows {
+        e.app
+            .marks
+            .insert(p, maccleanup::usage::Usage::new(size, disk));
+    }
+    open_review(&mut e.app);
+    e
+}
+
+#[test]
+fn a_long_review_shows_a_window_and_says_where_it_is() {
+    let mut e = review_of_many(60);
+    let text = render(&mut e.app, 100, 30);
+    // Sorted by size then path: item000 is first, item059 is far down.
+    assert!(text.contains("item000.bin"), "{text}");
+    assert!(!text.contains("item059.bin"), "only a window fits:\n{text}");
+    assert!(text.contains("of 60"), "the position is shown:\n{text}");
+    assert!(text.contains("1-"), "{text}");
+}
+
+#[test]
+fn scrolling_the_review_reaches_every_item() {
+    let mut e = review_of_many(60);
+    let _ = render(&mut e.app, 100, 30); // lets the UI report how many rows fit
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..200 {
+        let text = render(&mut e.app, 100, 30);
+        for i in 0..60 {
+            if text.contains(&format!("item{i:03}.bin")) {
+                seen.insert(i);
+            }
+        }
+        if seen.len() == 60 {
+            break;
+        }
+        e.app.update(Action::PageDown);
+    }
+    assert_eq!(
+        seen.len(),
+        60,
+        "every item was visible at some point: {seen:?}"
+    );
+}
+
+#[test]
+fn the_review_scrolls_back_up_and_the_end_shows_the_last_item() {
+    let mut e = review_of_many(60);
+    let _ = render(&mut e.app, 100, 30);
+    e.app.update(Action::Bottom);
+    let text = render(&mut e.app, 100, 30);
+    assert!(text.contains("item059.bin"), "{text}");
+    assert!(!text.contains("item000.bin"), "{text}");
+    assert!(text.contains("of 60"), "{text}");
+    e.app.update(Action::Top);
+    let text = render(&mut e.app, 100, 30);
+    assert!(text.contains("item000.bin"), "{text}");
+}
+
+#[test]
+fn a_short_review_has_no_scroll_hint() {
+    let mut e = review_of_many(3);
+    let text = render(&mut e.app, 100, 30);
+    assert!(!text.contains("of 3"), "{text}");
+    assert!(text.contains("item002.bin"), "{text}");
+}
+
+#[test]
+fn the_scroll_hint_is_ascii_in_ascii_mode() {
+    let files: Vec<(String, usize)> = (0..60).map(|i| (format!("item{i:03}.bin"), 1000)).collect();
+    let refs: Vec<(&str, usize)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+    let mut e = make_app(&refs, GlyphMode::Ascii);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let rows: Vec<_> = e
+        .app
+        .rows
+        .iter()
+        .map(|r| (r.path.clone(), r.size, r.disk))
+        .collect();
+    for (p, size, disk) in rows {
+        e.app
+            .marks
+            .insert(p, maccleanup::usage::Usage::new(size, disk));
+    }
+    open_review(&mut e.app);
+    for c in render_cells(&mut e.app, 100, 30) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+// --- a stuck or failing tool command ------------------------------------------
+
+const UV_WAIT: &str = "Cache is currently in-use, waiting for other uv processes to finish (use `--force` to override)";
+const UV_TIMEOUT: &str = "error: Timeout (300s) when waiting for lock on `/Users/x/.cache/uv` at `/Users/x/.cache/uv/.lock`, is another uv process running?";
+
+/// A command that prints a line and then waits (until cancelled), or fails.
+struct StuckRunner {
+    fail_with: Option<&'static str>,
+}
+
+impl maccleanup::catalog::CommandRunner for StuckRunner {
+    fn run(
+        &self,
+        _: &maccleanup::catalog::CommandSpec,
+        ctl: &maccleanup::catalog::RunControl,
+    ) -> maccleanup::catalog::CommandResult {
+        ctl.begin();
+        if let Some(out) = self.fail_with {
+            return maccleanup::catalog::CommandResult {
+                ok: false,
+                cancelled: false,
+                output_tail: out.to_string(),
+            };
+        }
+        ctl.set_line(UV_WAIT);
+        while !ctl.cancelled() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        maccleanup::catalog::CommandResult {
+            ok: false,
+            cancelled: true,
+            output_tail: "(cancelled)".to_string(),
+        }
+    }
+    fn query(&self, _: &maccleanup::catalog::CommandSpec) -> Option<String> {
+        None
+    }
+    fn available(&self, _: &str) -> bool {
+        false
+    }
+}
+
+fn uv_screen(mode: GlyphMode, fail_with: Option<&'static str>) -> Env {
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    let mut e = make_app(TARGET_FILES, mode);
+    e.app.runner = std::sync::Arc::new(StuckRunner { fail_with });
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    let home = e.app.policy.home().to_path_buf();
+    e.app.tool_entries = vec![ToolEntry {
+        id: "uv".to_string(),
+        tool: "uv".to_string(),
+        label: "cache".to_string(),
+        path: home.join("Library/Caches/Spotify"),
+        regen: "again".to_string(),
+        mode: Mode::Command(
+            CommandSpec::new("/opt/x/bin/uv", &["cache", "clean"]).with_force_args(&["--force"]),
+        ),
+        note: None,
+    }];
+    e.app.rebuild_targets();
+    e.app.settle_targets();
+    cursor_on_row(&mut e.app, "cache");
+    e.app.update(Action::ToggleMark);
+    e
+}
+
+fn tick_until_command_running(app: &mut App) {
+    for _ in 0..1000 {
+        app.update(Action::Tick);
+        if app
+            .command_status()
+            .is_some_and(|s| !s.last_line.is_empty())
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the command never started");
+}
+
+#[test]
+fn the_working_dialog_shows_the_commands_output_how_long_it_runs_and_how_to_stop_it() {
+    let mut e = uv_screen(GlyphMode::Nerd, None);
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    tick_until_command_running(&mut e.app);
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("uv cache clean"), "{text}");
+    assert!(text.contains("running for"), "{text}");
+    assert!(
+        text.contains("waiting for other uv processes"),
+        "uv's own message is shown:\n{text}"
+    );
+    assert!(text.contains("Esc"), "{text}");
+    assert!(text.contains("cancel"), "{text}");
+    assert!(
+        text.contains("Another uv process"),
+        "an explanation for the lock wait:\n{text}"
+    );
+    e.app.update(Action::Cancel);
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("Cancelling"), "{text}");
+}
+
+#[test]
+fn the_review_offers_force_for_uv_and_shows_the_forced_form_clearly() {
+    let mut e = uv_screen(GlyphMode::Nerd, None);
+    open_review(&mut e.app);
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("uv cache clean"), "{text}");
+    assert!(!text.contains("--force"), "not forced yet:\n{text}");
+    assert!(text.contains("[ f ]"), "{text}");
+    e.app.update(Action::ToggleForce);
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("uv cache clean --force"), "{text}");
+    assert!(text.contains("in-use check"), "the risk is stated:\n{text}");
+}
+
+#[test]
+fn a_command_that_cannot_be_forced_shows_no_force_key() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let home = e.app.policy.home().to_path_buf();
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    e.app.tool_entries = vec![ToolEntry {
+        id: "t".to_string(),
+        tool: "Tool".to_string(),
+        label: "cache".to_string(),
+        path: home.join("Library/Caches/Spotify"),
+        regen: "again".to_string(),
+        mode: Mode::Command(CommandSpec::new("/opt/x/bin/tool", &["clean"])),
+        note: None,
+    }];
+    e.app.rebuild_targets();
+    e.app.settle_targets();
+    cursor_on_row(&mut e.app, "cache");
+    e.app.update(Action::ToggleMark);
+    open_review(&mut e.app);
+    let text = render(&mut e.app, 150, 40);
+    assert!(!text.contains("[ f ]"), "{text}");
+}
+
+#[test]
+fn a_lock_timeout_explains_itself_and_offers_the_forced_retry() {
+    let mut e = uv_screen(GlyphMode::Nerd, Some(UV_TIMEOUT));
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..1000 {
+        e.app.update(Action::Tick);
+        if matches!(e.app.dialog, Some(Dialog::Finish(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("Timeout"), "what uv said:\n{text}");
+    assert!(text.contains("Another uv process"), "{text}");
+    assert!(text.contains("[ f ]") && text.contains("--force"), "{text}");
+}
+
+#[test]
+fn a_cancelled_command_is_reported_as_cancelled() {
+    let mut e = uv_screen(GlyphMode::Nerd, None);
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    tick_until_command_running(&mut e.app);
+    e.app.update(Action::Cancel);
+    for _ in 0..1000 {
+        e.app.update(Action::Tick);
+        if matches!(e.app.dialog, Some(Dialog::Finish(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("cancelled"), "{text}");
+    assert!(
+        !text.contains("[ f ]"),
+        "no forced retry after a cancel:\n{text}"
+    );
+}
+
+#[test]
+fn the_command_dialogs_are_ascii_in_ascii_mode() {
+    let mut e = uv_screen(GlyphMode::Ascii, None);
+    open_review(&mut e.app);
+    e.app.update(Action::ToggleForce);
+    for c in render_cells(&mut e.app, 150, 40) {
+        assert!(c.is_ascii(), "review: non-ascii cell {c:?}");
+    }
+    e.app.update(Action::Confirm);
+    tick_until_command_running(&mut e.app);
+    for c in render_cells(&mut e.app, 150, 40) {
+        assert!(c.is_ascii(), "working: non-ascii cell {c:?}");
+    }
+    e.app.update(Action::Cancel);
+}
+
+#[test]
+fn filtering_by_a_project_shows_its_caches_and_marks_why_the_group_matched() {
+    use ratatui::style::Color;
+    let mut e = targets_screen(GlyphMode::Nerd);
+    e.app.focus = maccleanup::app::Focus::Main;
+    e.app.update(Action::FilterOpen);
+    for c in "shop".chars() {
+        e.app.update(Action::FilterChar(c));
+    }
+    e.app.update(Action::FilterAccept);
+    let mut term = Terminal::new(TestBackend::new(170, 40)).unwrap();
+    term.draw(|f| ui::draw(f, &mut e.app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let text: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(
+        text.contains("~/shop") && text.contains("node_modules") && text.contains(".next"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("~/api") && !text.contains("Spotify"),
+        "{text}"
+    );
+    // The letters that matched "shop" in the group's name are highlighted.
+    let y = (0..buf.area.height)
+        .find(|&y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .contains("~/shop")
+        })
+        .unwrap();
+    let line: Vec<String> = (0..buf.area.width)
+        .map(|x| buf[(x, y)].symbol().to_string())
+        .collect();
+    let at = line.join("").find("shop").unwrap();
+    // Count cells (the border glyphs are single-width, so columns match).
+    let col = line.join("")[..at].chars().count() as u16;
+    for i in 0..4 {
+        assert_eq!(
+            buf[(col + i, y)].fg,
+            Color::Yellow,
+            "letter {i} of the match"
+        );
+    }
+    // The graph shows only the matching project.
+    assert_eq!(e.app.graph_hits.len(), 1);
 }

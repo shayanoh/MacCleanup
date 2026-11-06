@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
@@ -349,6 +350,14 @@ pub struct Space {
     pub shared_inside: u64,
     /// What clones and hard links inside the folder already save.
     pub saved: u64,
+}
+
+impl Space {
+    /// What deleting everything in a *set* frees: also the data shared only
+    /// among the set's own files (its holders are all being deleted).
+    pub fn frees_all(&self) -> u64 {
+        self.frees_now.saturating_add(self.shared_inside)
+    }
 }
 
 impl Add for Space {
@@ -736,60 +745,26 @@ impl Scanner {
     /// Read the clone and hard-link tables once and work out the [`Space`]
     /// of every node. `locate` says which node (by index) a path belongs to.
     fn compute(&self, nodes: &[Arc<Node>], locate: &dyn Fn(&Path) -> Option<usize>) -> Vec<Space> {
-        let mut acc: Vec<Acc> = nodes
-            .iter()
-            .map(|n| Acc {
-                disk: n.disk(),
-                private: n.private(),
-                snap: n.snapshot_held(),
-                ..Acc::default()
-            })
-            .collect();
-        let mut counts: HashMap<usize, u64> = HashMap::new();
+        compute_with(&self.shared, seeds(nodes), locate)
+    }
 
-        for shard in &self.shared.clones.shards {
-            for group in lock(shard).values() {
-                counts.clear();
-                for dir in &group.members {
-                    if let Some(i) = locate(&dir.path) {
-                        *counts.entry(i).or_default() += 1;
-                    }
-                }
-                for (&i, &members) in &counts {
-                    let a = &mut acc[i];
-                    if members >= u64::from(group.refcnt) {
-                        a.inside += group.shared;
-                    } else {
-                        a.outside += group.shared;
-                    }
-                    a.saved_clones += group.shared.saturating_mul(members - 1);
-                }
-            }
+    /// A cheap handle that can work out set-wise space on another thread.
+    pub fn view(&self) -> SpaceView {
+        SpaceView {
+            shared: Arc::clone(&self.shared),
         }
+    }
 
-        for group in lock(&self.shared.links).values() {
-            counts.clear();
-            for path in &group.paths {
-                if let Some(i) = locate(path) {
-                    *counts.entry(i).or_default() += 1;
-                }
-            }
-            let credited = group.counted_by.as_deref().and_then(locate);
-            for (&i, &links) in &counts {
-                let a = &mut acc[i];
-                if credited != Some(i) {
-                    a.extra_links += group.disk;
-                }
-                if links >= group.nlink {
-                    a.frees_links += group.private;
-                    a.snap_links += group.disk - group.private;
-                } else {
-                    a.outside += group.disk;
-                }
-                a.saved_links += group.disk.saturating_mul(links - 1);
-            }
-        }
-        acc.into_iter().map(Acc::finish).collect()
+    /// Where the space of a whole set of (disjoint) folders would go if they
+    /// were all deleted together: a clone set frees only when every holder
+    /// is inside the set.
+    pub fn space_of_set(&self, nodes: &[Arc<Node>]) -> Space {
+        self.view().space_of_set(nodes)
+    }
+
+    /// [`Scanner::space`] for many disjoint folders in one pass.
+    pub fn spaces_of(&self, nodes: &[Arc<Node>]) -> Vec<Space> {
+        self.view().spaces_of(nodes)
     }
 
     /// Drop the hard-link entries inside a rescanned folder. A file that this
@@ -836,6 +811,39 @@ impl Scanner {
         }
     }
 
+    /// Take a subtree's bytes out of every total: the ancestors' counters,
+    /// the scan counters, the link and clone tables and the denied list.
+    fn forget_totals(&self, node: &Arc<Node>, parent: &Arc<Node>, old: &Tally) {
+        sub_up(parent, old);
+        for (counter, by) in [
+            (&self.shared.files_seen, old.files),
+            (&self.shared.bytes_seen, old.size),
+            (&self.shared.disk_seen, old.disk),
+        ] {
+            let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(by))
+            });
+        }
+        self.forget_links_under(node, parent);
+        self.shared.clones.forget_under(&node.path);
+        lock(&self.shared.denied).retain(|p| !p.starts_with(&node.path));
+    }
+
+    /// A folder that no longer exists (it was moved away or deleted): drop it
+    /// from the tree and from every total, without scanning anything. Returns
+    /// false while a scan runs, and for the root (it has no parent to leave).
+    pub fn forget_dir(&self, node: &Arc<Node>) -> bool {
+        if !self.is_idle() {
+            return false;
+        }
+        let Some(parent) = node.parent.upgrade() else {
+            return false;
+        };
+        self.forget_totals(node, &parent, &node.tally());
+        lock(&parent.subdirs).retain(|n| n.path != node.path);
+        true
+    }
+
     /// Start over: scan `path` again from scratch with fresh counters.
     /// Returns `None` while a scan is still running.
     pub fn rescan_all(&self, path: &Path) -> Option<Arc<Node>> {
@@ -867,21 +875,7 @@ impl Scanner {
         };
         refresh_local_snapshots();
         let old = node.tally();
-
-        // Forget what the old subtree contributed.
-        sub_up(&parent, &old);
-        for (counter, by) in [
-            (&self.shared.files_seen, old.files),
-            (&self.shared.bytes_seen, old.size),
-            (&self.shared.disk_seen, old.disk),
-        ] {
-            let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(by))
-            });
-        }
-        self.forget_links_under(node, &parent);
-        self.shared.clones.forget_under(&node.path);
-        lock(&self.shared.denied).retain(|p| !p.starts_with(&node.path));
+        self.forget_totals(node, &parent, &old);
 
         // Swap in a fresh node and mark every ancestor unfinished until the
         // new subtree completes.
@@ -952,6 +946,159 @@ impl Scanner {
             thread::sleep(Duration::from_millis(5));
         }
         true
+    }
+}
+
+/// Starting numbers for each node (what its own plain files add up to).
+fn seeds(nodes: &[Arc<Node>]) -> Vec<Acc> {
+    nodes
+        .iter()
+        .map(|n| Acc {
+            disk: n.disk(),
+            private: n.private(),
+            snap: n.snapshot_held(),
+            ..Acc::default()
+        })
+        .collect()
+}
+
+/// Read the clone and hard-link tables once and finish every seed.
+fn compute_with(
+    shared: &Shared,
+    mut acc: Vec<Acc>,
+    locate: &dyn Fn(&Path) -> Option<usize>,
+) -> Vec<Space> {
+    let mut counts: HashMap<usize, u64> = HashMap::new();
+    for shard in &shared.clones.shards {
+        for group in lock(shard).values() {
+            counts.clear();
+            for dir in &group.members {
+                if let Some(i) = locate(&dir.path) {
+                    *counts.entry(i).or_default() += 1;
+                }
+            }
+            for (&i, &members) in &counts {
+                let a = &mut acc[i];
+                if members >= u64::from(group.refcnt) {
+                    a.inside += group.shared;
+                } else {
+                    a.outside += group.shared;
+                }
+                a.saved_clones += group.shared.saturating_mul(members - 1);
+            }
+        }
+    }
+    for group in lock(&shared.links).values() {
+        counts.clear();
+        for path in &group.paths {
+            if let Some(i) = locate(path) {
+                *counts.entry(i).or_default() += 1;
+            }
+        }
+        let credited = group.counted_by.as_deref().and_then(locate);
+        for (&i, &links) in &counts {
+            let a = &mut acc[i];
+            if credited != Some(i) {
+                a.extra_links += group.disk;
+            }
+            if links >= group.nlink {
+                a.frees_links += group.private;
+                a.snap_links += group.disk - group.private;
+            } else {
+                a.outside += group.disk;
+            }
+            a.saved_links += group.disk.saturating_mul(links - 1);
+        }
+    }
+    acc.into_iter().map(Acc::finish).collect()
+}
+
+/// Set-wise space, usable from any thread while the scanner lives on.
+#[derive(Clone)]
+pub struct SpaceView {
+    shared: Arc<Shared>,
+}
+
+impl SpaceView {
+    /// See [`Scanner::space_of_set`].
+    pub fn space_of_set(&self, nodes: &[Arc<Node>]) -> Space {
+        if nodes.is_empty() {
+            return Space::default();
+        }
+        let mut seed = Acc::default();
+        for s in seeds(nodes) {
+            seed.disk += s.disk;
+            seed.private += s.private;
+            seed.snap += s.snap;
+        }
+        let roots: HashSet<&Path> = nodes.iter().map(|n| n.path.as_path()).collect();
+        // Clone members repeat the same few folders very often: remember
+        // the answer per folder instead of walking its ancestors each time.
+        let memo: RefCell<HashMap<PathBuf, Option<usize>>> = RefCell::new(HashMap::new());
+        let locate = |p: &Path| {
+            if let Some(known) = memo.borrow().get(p) {
+                return *known;
+            }
+            let found = p.ancestors().any(|a| roots.contains(a)).then_some(0);
+            memo.borrow_mut().insert(p.to_path_buf(), found);
+            found
+        };
+        compute_with(&self.shared, vec![seed], &locate)
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// Other folders that hold a clone or a hard link of data inside `node`
+    /// (the folders themselves, not the files), sorted.
+    pub fn sharers(&self, node: &Arc<Node>) -> Vec<PathBuf> {
+        let inside = |p: &Path| p.starts_with(&node.path);
+        let mut out: HashSet<PathBuf> = HashSet::new();
+        for shard in &self.shared.clones.shards {
+            for group in lock(shard).values() {
+                if group.members.iter().any(|m| inside(&m.path)) {
+                    out.extend(
+                        group
+                            .members
+                            .iter()
+                            .filter(|m| !inside(&m.path))
+                            .map(|m| m.path.clone()),
+                    );
+                }
+            }
+        }
+        for group in lock(&self.shared.links).values() {
+            if group.paths.iter().any(|p| inside(p)) {
+                out.extend(
+                    group
+                        .paths
+                        .iter()
+                        .filter(|p| !inside(p))
+                        .filter_map(|p| p.parent().map(Path::to_path_buf)),
+                );
+            }
+        }
+        let mut v: Vec<PathBuf> = out.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    /// See [`Scanner::spaces_of`].
+    pub fn spaces_of(&self, nodes: &[Arc<Node>]) -> Vec<Space> {
+        let index: HashMap<&Path, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.path.as_path(), i))
+            .collect();
+        let memo: RefCell<HashMap<PathBuf, Option<usize>>> = RefCell::new(HashMap::new());
+        let locate = |p: &Path| {
+            if let Some(known) = memo.borrow().get(p) {
+                return *known;
+            }
+            let found = p.ancestors().find_map(|a| index.get(a).copied());
+            memo.borrow_mut().insert(p.to_path_buf(), found);
+            found
+        };
+        compute_with(&self.shared, seeds(nodes), &locate)
     }
 }
 
@@ -1497,6 +1644,126 @@ mod tests {
 
     fn identity_holds(sp: &Space) -> bool {
         sp.footprint == sp.frees_now + sp.snapshots + sp.shared_inside + sp.shared_outside
+    }
+
+    /// store/f with clones in a/f and b/f: three holders of one block.
+    fn three_holders(r: &Path) -> (Scanner, Arc<Node>) {
+        write(&r.join("store/f"), 200_000);
+        clone_file(r, "store/f", "a/f");
+        clone_file(r, "store/f", "b/f");
+        scan(r, 2)
+    }
+
+    #[test]
+    fn set_frees_clone_data_only_when_every_holder_is_in_the_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let (s, root) = three_holders(r);
+        let node = |n: &str| root.subdir(&r.join(n)).unwrap();
+        let (store, a, b) = (node("store"), node("a"), node("b"));
+        assert_eq!(s.space_of_set(std::slice::from_ref(&a)).frees_all(), 0);
+        assert_eq!(s.space_of_set(&[a.clone(), b.clone()]).frees_all(), 0);
+        assert_eq!(s.space_of_set(&[store.clone(), a.clone()]).frees_all(), 0);
+        let all = s.space_of_set(&[store, a, b]);
+        assert!(all.frees_all() >= 200_000, "{all:?}");
+        assert_eq!(all.shared_outside, 0);
+    }
+
+    #[test]
+    fn set_space_identity_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let (s, root) = three_holders(r);
+        let store = root.subdir(&r.join("store")).unwrap();
+        let a = root.subdir(&r.join("a")).unwrap();
+        assert!(identity_holds(&s.space_of_set(&[store, a])));
+    }
+
+    #[test]
+    fn spaces_of_matches_space_for_disjoint_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let (s, root) = three_holders(r);
+        let a = root.subdir(&r.join("a")).unwrap();
+        let b = root.subdir(&r.join("b")).unwrap();
+        let many = s.spaces_of(&[a.clone(), b.clone()]);
+        assert_eq!(many, vec![s.space(&a), s.space(&b)]);
+    }
+
+    #[test]
+    fn a_set_of_one_node_equals_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let (s, root) = three_holders(r);
+        let a = root.subdir(&r.join("a")).unwrap();
+        assert_eq!(s.space_of_set(std::slice::from_ref(&a)), s.space(&a));
+    }
+
+    #[test]
+    fn sharers_lists_other_folders_holding_the_same_clone_or_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("store/f"), 200_000);
+        clone_file(r, "store/f", "a/f");
+        clone_file(r, "store/f", "b/f");
+        write(&r.join("a/x"), 8192);
+        hard_link(r, "a/x", "linked/y");
+        let (s, root) = scan(r, 2);
+        let node = |n: &str| root.subdir(&r.join(n)).unwrap();
+        let view = s.view();
+        assert_eq!(
+            view.sharers(&node("a")),
+            vec![r.join("b"), r.join("linked"), r.join("store")]
+        );
+        assert!(view.sharers(&node("b")).contains(&r.join("a")));
+        write(&r.join("lonely/z"), 100);
+        let (s2, root2) = scan(&r.join("lonely"), 2);
+        assert!(s2.view().sharers(&root2).is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_folder_removes_it_and_its_bytes_from_every_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/f1"), 8192);
+        write(&r.join("b/f2"), 4096);
+        let (s, root) = scan(r, 2);
+        assert_eq!((root.size(), root.files()), (12288, 2));
+        let b = root.subdir(&r.join("b")).unwrap();
+        assert!(s.forget_dir(&b));
+        assert_eq!((root.size(), root.files()), (8192, 1));
+        assert!(root.subdir(&r.join("b")).is_none());
+        assert_eq!(s.stats().files, 1);
+        assert_eq!(s.stats().bytes, 8192);
+    }
+
+    #[test]
+    fn forgetting_is_refused_while_a_scan_runs_and_for_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/f1"), 100);
+        let (s, root) = scan(r, 2);
+        let a = root.subdir(&r.join("a")).unwrap();
+        s.set_busy(true);
+        assert!(!s.forget_dir(&a));
+        s.set_busy(false);
+        assert!(!s.forget_dir(&root), "the root has no parent to leave");
+        assert!(root.subdir(&r.join("a")).is_some());
+    }
+
+    #[test]
+    fn a_forgotten_folder_no_longer_counts_as_a_holder_of_shared_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let (s, root) = three_holders(r);
+        let (a, b) = (
+            root.subdir(&r.join("a")).unwrap(),
+            root.subdir(&r.join("b")).unwrap(),
+        );
+        assert!(s.view().sharers(&b).contains(&r.join("a")));
+        assert!(s.forget_dir(&a));
+        assert!(!s.view().sharers(&b).contains(&r.join("a")));
+        assert!(s.view().sharers(&b).contains(&r.join("store")));
     }
 
     #[test]

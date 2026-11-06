@@ -58,7 +58,10 @@ pub fn env_with(files: &[(&str, usize)], setup: impl FnOnce(&Path)) -> Env {
         Accounting::new(free),
         Glyphs::new(GlyphMode::Nerd),
         false,
-    );
+    )
+    .with_runner(std::sync::Arc::new(
+        crate::catalog::command::FakeRunner::new(&[]),
+    ));
     // The app starts on Home; most tests exercise the explorer.
     app.update(Action::GoTo(Screen::Explorer));
     Env {
@@ -121,4 +124,43 @@ pub fn clone_file(from: &Path, to: &Path) {
         .unwrap()
         .success();
     assert!(ok, "cp -c failed: this test needs an APFS volume");
+}
+
+/// Tick until the background look for installed tools has finished.
+pub fn wait_tools(app: &mut App) {
+    for _ in 0..2000 {
+        app.update(Action::Tick);
+        if !app.tools_looking() && !app.targets_building() && app.scanner.is_idle() {
+            app.update(Action::Tick);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("tool discovery did not finish");
+}
+
+/// Tick until the joint-space and related-folders work has answered.
+pub fn wait_sets(app: &mut App) {
+    for _ in 0..2000 {
+        app.update(Action::Tick);
+        if !app.set_space.pending && !app.holders.pending && app.scanner.is_idle() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("background space work did not finish");
+}
+
+/// Open the review and wait until its space figures are worked out.
+pub fn open_review_ready(app: &mut App) {
+    app.update(Action::OpenReview);
+    for _ in 0..400 {
+        match &app.dialog {
+            Some(crate::app::Dialog::Review(r)) if !r.space_ready => {
+                app.update(Action::Tick);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => return,
+        }
+    }
 }

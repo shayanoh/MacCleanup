@@ -15,6 +15,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
+use crate::catalog::{CommandRunner, CommandSpec, RunControl};
 use crate::safety::Policy;
 use crate::softdelete::{DeleteCounters, HeldItem, HoldError, Holding};
 use crate::usage::Usage;
@@ -26,6 +27,8 @@ pub enum Phase {
     Moving,
     /// Permanently deleting files.
     Deleting,
+    /// Running tools' own cleanup commands.
+    Command,
 }
 
 #[derive(Clone, Debug)]
@@ -530,5 +533,208 @@ mod tests {
         let (_, _, failures) = finished(&events);
         assert_eq!(failures, 0, "a missing payload just clears the entry");
         assert!(s.holding.list().unwrap().is_empty());
+    }
+}
+
+/// What happened while cleanup commands ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandEvent {
+    Started {
+        index: usize,
+        total: usize,
+        line: String,
+    },
+    Done {
+        line: String,
+        ok: bool,
+        /// Stopped on request, or never started because of a cancel.
+        cancelled: bool,
+        output_tail: String,
+    },
+    Finished,
+}
+
+/// Tool cleanup commands running one after another on their own thread. A
+/// command that fails does not stop the ones after it; a cancel stops the
+/// running one and skips the rest.
+pub struct CommandJob {
+    rx: mpsc::Receiver<CommandEvent>,
+}
+
+impl CommandJob {
+    pub fn start(
+        runner: Arc<dyn CommandRunner>,
+        specs: Vec<CommandSpec>,
+        ctl: Arc<RunControl>,
+    ) -> CommandJob {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let total = specs.len();
+            for (index, spec) in specs.iter().enumerate() {
+                let line = spec.display();
+                if ctl.cancelled() {
+                    let _ = tx.send(CommandEvent::Done {
+                        line,
+                        ok: false,
+                        cancelled: true,
+                        output_tail: "not run (cancelled)".to_string(),
+                    });
+                    continue;
+                }
+                let _ = tx.send(CommandEvent::Started {
+                    index,
+                    total,
+                    line: line.clone(),
+                });
+                let result = runner.run(spec, &ctl);
+                let _ = tx.send(CommandEvent::Done {
+                    line,
+                    ok: result.ok,
+                    cancelled: result.cancelled,
+                    output_tail: result.output_tail,
+                });
+            }
+            let _ = tx.send(CommandEvent::Finished);
+        });
+        CommandJob { rx }
+    }
+
+    /// Everything that happened since the last poll (never blocks).
+    pub fn poll(&self) -> Vec<CommandEvent> {
+        self.rx.try_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use crate::catalog::command::FakeRunner;
+    use std::time::{Duration, Instant};
+
+    fn drain(job: &CommandJob) -> Vec<CommandEvent> {
+        let mut all = Vec::new();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            all.extend(job.poll());
+            if all.last() == Some(&CommandEvent::Finished) {
+                return all;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("command job did not finish: {all:?}");
+    }
+
+    #[test]
+    fn commands_run_in_order_and_report_each_result() {
+        let fake = Arc::new(FakeRunner::new(&[]).failing(&["b x"]));
+        let job = CommandJob::start(
+            fake.clone(),
+            vec![
+                CommandSpec::new("a", &["x"]),
+                CommandSpec::new("b", &["x"]),
+                CommandSpec::new("c", &["x"]),
+            ],
+            RunControl::new(),
+        );
+        let events = drain(&job);
+        let done: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                CommandEvent::Done { line, ok, .. } => Some((line.as_str(), *ok)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(done, [("a x", true), ("b x", false), ("c x", true)]);
+        assert_eq!(fake.calls().len(), 3, "a failure does not stop the rest");
+        assert!(matches!(
+            events[0],
+            CommandEvent::Started {
+                index: 0,
+                total: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn polling_does_not_wait_for_a_slow_command() {
+        let fake = Arc::new(FakeRunner::new(&[]).slow(Duration::from_millis(300)));
+        let job = CommandJob::start(fake, vec![CommandSpec::new("a", &[])], RunControl::new());
+        let started = Instant::now();
+        let _ = job.poll();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        drain(&job);
+    }
+
+    #[test]
+    fn an_empty_list_finishes_at_once() {
+        let job = CommandJob::start(
+            Arc::new(FakeRunner::new(&[])),
+            Vec::new(),
+            RunControl::new(),
+        );
+        assert_eq!(drain(&job), [CommandEvent::Finished]);
+    }
+
+    #[test]
+    fn cancelling_stops_the_running_command_and_skips_the_rest() {
+        let fake = Arc::new(FakeRunner::new(&[]).waiting_for_cancel());
+        let ctl = RunControl::new();
+        let job = CommandJob::start(
+            fake.clone(),
+            vec![
+                CommandSpec::new("a", &[]),
+                CommandSpec::new("b", &[]),
+                CommandSpec::new("c", &[]),
+            ],
+            Arc::clone(&ctl),
+        );
+        // Wait until the first one is running, then cancel.
+        let start = Instant::now();
+        while fake.calls().is_empty() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        ctl.cancel();
+        let events = drain(&job);
+        let done: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                CommandEvent::Done {
+                    line,
+                    ok,
+                    cancelled,
+                    output_tail,
+                } => Some((line.clone(), *ok, *cancelled, output_tail.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(done.len(), 3);
+        assert_eq!(
+            (done[0].1, done[0].2),
+            (false, true),
+            "the running one was stopped"
+        );
+        assert!(done[1].3.contains("not run") && done[2].3.contains("not run"));
+        assert_eq!(fake.calls().len(), 1, "b and c never started");
+    }
+
+    #[test]
+    fn a_cancel_before_the_first_command_runs_nothing() {
+        let fake = Arc::new(FakeRunner::new(&[]));
+        let ctl = RunControl::new();
+        ctl.cancel();
+        let job = CommandJob::start(fake.clone(), vec![CommandSpec::new("a", &[])], ctl);
+        let events = drain(&job);
+        assert!(fake.calls().is_empty());
+        assert!(
+            matches!(
+                events[0],
+                CommandEvent::Done {
+                    cancelled: true,
+                    ..
+                }
+            ),
+            "{events:?}"
+        );
     }
 }

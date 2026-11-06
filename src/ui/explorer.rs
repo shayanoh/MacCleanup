@@ -27,7 +27,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     render_list(frame, list_area, app);
     if let Some(graph_area) = graph_area {
-        graph::render(frame, graph_area, app);
+        app.graph_hits = graph::render(frame, graph_area, app);
     }
 }
 
@@ -71,7 +71,11 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         let idx = anim::spinner_frame(app.tick, g.spinner().len());
         Line::from(vec![
             Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
-            Span::raw(format!(" scanning{} {totals}", g.ellipsis())),
+            Span::raw(format!(" scanning{} {totals} ", g.ellipsis())),
+            Span::styled(
+                crate::fmt::marquee(app.tick, 10, &g),
+                Style::default().fg(ACCENT),
+            ),
         ])
     };
     frame.render_widget(
@@ -93,68 +97,10 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let query = filter::parse(&app.filter.query);
 
     // Column layout.
-    let icon_w = text_width(g.folder()).max(text_width(g.file()));
-    let mark_w = text_width(g.marked()).max(text_width(g.unmarked()));
-    let dot_w = text_width(g.safe());
-    let prefix_w = 2 + mark_w + 1 + icon_w + 1 + dot_w + 1;
-    // Size, on disk, frees: three 9-wide columns; the share bar goes first
-    // when the pane is narrow.
-    let fixed_no_share = prefix_w + 3 * (1 + 9);
-    let cw = inner.width.saturating_sub(1) as usize; // last column: scrollbar
-    let show_share = cw >= fixed_no_share + 9 + 16;
-    let fixed = fixed_no_share + if show_share { 9 } else { 0 };
-    let name_w = cw.saturating_sub(fixed).max(4);
-
-    // Header: the sorted column is white with an arrow, the others gray.
-    let sort = app.sort;
-    let arrow = |by: SortBy| -> String {
-        if sort != by {
-            return String::new();
-        }
-        let a = if by == SortBy::Name {
-            g.sort_asc()
-        } else {
-            g.sort_desc()
-        };
-        format!(" {a}")
-    };
-    let head_style = |by: SortBy| {
-        if sort == by {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(DIM)
-        }
-    };
-    let mut header = vec![
-        Span::raw(" ".repeat(prefix_w)),
-        Span::styled(
-            pad(format!("Name{}", arrow(SortBy::Name)), name_w),
-            head_style(SortBy::Name),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            right(&format!("Size{}", arrow(SortBy::Size)), 9),
-            head_style(SortBy::Size),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            right(&format!("On disk{}", arrow(SortBy::Disk)), 9),
-            head_style(SortBy::Disk),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            right(&format!("Frees{}", arrow(SortBy::Frees)), 9),
-            head_style(SortBy::Frees),
-        ),
-    ];
-    if show_share {
-        header.push(Span::styled(" Share", Style::default().fg(DIM)));
-    }
-    let header = Line::from(header);
+    let c = cols(inner.width, &g);
+    let (icon_w, mark_w, name_w, show_share) = (c.icon_w, c.mark_w, c.name_w, c.show_share);
     frame.render_widget(
-        Paragraph::new(header),
+        Paragraph::new(header_line(app.sort, &c, &g)),
         Rect::new(inner.x, inner.y + 2 + filter_h, inner.width, 1),
     );
 
@@ -220,12 +166,15 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 
     // Marked summary.
-    let marked = format!(
+    let mut marked = format!(
         "marked: {} items, {} (not deleted yet)",
         app.marks.len(),
         both_usage(app.marked())
     );
-    let style = if app.marks.is_empty() {
+    if !app.tool_marks.is_empty() {
+        marked.push_str(&format!(" + {} tool cleanup(s)", app.tool_marks.len()));
+    }
+    let style = if app.marks.is_empty() && app.tool_marks.is_empty() {
         Style::default().fg(DIM)
     } else {
         Style::default()
@@ -248,6 +197,122 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             1,
         ),
     );
+}
+
+/// The list columns, shared with every screen that looks like the Explorer.
+pub(super) struct Cols {
+    pub icon_w: usize,
+    pub mark_w: usize,
+    /// Cursor, mark, icon and safety dot: everything left of the name.
+    pub prefix_w: usize,
+    pub name_w: usize,
+    pub show_share: bool,
+}
+
+pub(super) fn cols(inner_width: u16, g: &Glyphs) -> Cols {
+    let icon_w = text_width(g.folder()).max(text_width(g.file()));
+    let mark_w = text_width(g.marked()).max(text_width(g.unmarked()));
+    let dot_w = text_width(g.safe());
+    let prefix_w = 2 + mark_w + 1 + icon_w + 1 + dot_w + 1;
+    // Size, on disk, frees: three 9-wide columns; the share bar goes first
+    // when the pane is narrow.
+    let fixed_no_share = prefix_w + 3 * (1 + 9);
+    let cw = inner_width.saturating_sub(1) as usize; // last column: scrollbar
+    let show_share = cw >= fixed_no_share + 9 + 16;
+    let fixed = fixed_no_share + if show_share { 9 } else { 0 };
+    let name_w = cw.saturating_sub(fixed).max(4);
+    Cols {
+        icon_w,
+        mark_w,
+        prefix_w,
+        name_w,
+        show_share,
+    }
+}
+
+/// Column titles: the sorted one is white with an arrow, the others gray.
+pub(super) fn header_line(sort: SortBy, c: &Cols, g: &Glyphs) -> Line<'static> {
+    let arrow = |by: SortBy| -> String {
+        if sort != by {
+            return String::new();
+        }
+        let a = if by == SortBy::Name {
+            g.sort_asc()
+        } else {
+            g.sort_desc()
+        };
+        format!(" {a}")
+    };
+    let head_style = |by: SortBy| {
+        if sort == by {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        }
+    };
+    let mut header = vec![
+        Span::raw(" ".repeat(c.prefix_w)),
+        Span::styled(
+            pad(format!("Name{}", arrow(SortBy::Name)), c.name_w),
+            head_style(SortBy::Name),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            right(&format!("Size{}", arrow(SortBy::Size)), 9),
+            head_style(SortBy::Size),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            right(&format!("On disk{}", arrow(SortBy::Disk)), 9),
+            head_style(SortBy::Disk),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            right(&format!("Frees{}", arrow(SortBy::Frees)), 9),
+            head_style(SortBy::Frees),
+        ),
+    ];
+    if c.show_share {
+        header.push(Span::styled(" Share", Style::default().fg(DIM)));
+    }
+    Line::from(header)
+}
+
+/// The Size, On disk and Frees cells of a row. `frees_text` replaces the
+/// Frees value (for example "up to 6 GB" on a tool command).
+pub(super) fn number_spans(
+    r: &Row,
+    queued: bool,
+    sort: SortBy,
+    frees_text: Option<String>,
+    g: &Glyphs,
+) -> Vec<Span<'static>> {
+    // A queued folder has no numbers yet: show that, not a misleading 0 B.
+    let unknown = right(g.ellipsis(), 9);
+    let cell = |v: String| if queued { unknown.clone() } else { v };
+    vec![
+        Span::styled(
+            format!(" {}", cell(right(&human_size(r.size), 9))),
+            value_style(sort == SortBy::Size),
+        ),
+        Span::styled(
+            format!(" {}", cell(right(&human_size(r.disk), 9))),
+            value_style(sort == SortBy::Disk),
+        ),
+        Span::styled(
+            format!(
+                " {}",
+                if queued {
+                    unknown.clone()
+                } else {
+                    frees_text.unwrap_or_else(|| frees_cell(r.frees, g))
+                }
+            ),
+            value_style(sort == SortBy::Frees),
+        ),
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -313,30 +378,7 @@ fn row_line<'a>(
         name_style,
         name_style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
     ));
-    // A queued folder has no numbers yet: show that, not a misleading 0 B.
-    let unknown = right(g.ellipsis(), 9);
-    let cell = |v: String| if queued { unknown.clone() } else { v };
-    spans.extend([
-        Span::styled(
-            format!(" {}", cell(right(&human_size(r.size), 9))),
-            value_style(app.sort == SortBy::Size),
-        ),
-        Span::styled(
-            format!(" {}", cell(right(&human_size(r.disk), 9))),
-            value_style(app.sort == SortBy::Disk),
-        ),
-        Span::styled(
-            format!(
-                " {}",
-                if queued {
-                    unknown.clone()
-                } else {
-                    frees_cell(r.frees, g)
-                }
-            ),
-            value_style(app.sort == SortBy::Frees),
-        ),
-    ]);
+    spans.extend(number_spans(&r, queued, app.sort, None, g));
     if show_share {
         let color = if queued { DIM } else { Color::Yellow };
         spans.push(Span::styled(
@@ -396,7 +438,7 @@ fn folder_totals(app: &App, width: usize) -> Line<'static> {
 }
 
 /// The Frees column: a size, or an ellipsis while it is not known yet.
-fn frees_cell(frees: Option<u64>, g: &Glyphs) -> String {
+pub(super) fn frees_cell(frees: Option<u64>, g: &Glyphs) -> String {
     right(
         &frees.map_or_else(|| g.ellipsis().to_string(), human_size),
         9,
@@ -404,7 +446,7 @@ fn frees_cell(frees: Option<u64>, g: &Glyphs) -> String {
 }
 
 /// The sorted column's values are white; the other size column is gray.
-fn value_style(sorted: bool) -> Style {
+pub(super) fn value_style(sorted: bool) -> Style {
     if sorted {
         Style::default().fg(Color::White)
     } else {

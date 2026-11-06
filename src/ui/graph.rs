@@ -7,13 +7,72 @@ use ratatui::widgets::Paragraph;
 use super::{ACCENT, DIM, SELECTED_BG, fit, fit_pad, panel, right, safety_color};
 use crate::app::{App, GraphMode};
 use crate::fmt::{eighths_bar, human_size};
+use crate::glyphs::Glyphs;
 use crate::safety::Safety;
 use crate::scan::Row;
 use crate::treemap::squarify;
 
-pub fn render(frame: &mut Frame, area: Rect, app: &App) {
-    let g = &app.glyphs;
-    let title = match app.graph {
+/// What a graph shows: a list of rows with how much each weighs, so the
+/// Explorer (one folder) and Caches & Projects (one group) draw the same way.
+pub struct GraphData {
+    pub rows: Vec<Row>,
+    /// The size each row is drawn with (on disk, or what sorting uses).
+    pub weights: Vec<u64>,
+    pub safeties: Vec<Safety>,
+    pub marked: Vec<bool>,
+    /// The highlighted row, if the cursor is on one of these.
+    pub cursor: Option<usize>,
+    /// What 100% means.
+    pub total: u64,
+    /// "of <scope>" in the caption: the folder or group name.
+    pub scope: String,
+    /// What a click on each row selects: `(group, row)` on Caches & Projects,
+    /// `(0, row)` in the Explorer.
+    pub keys: Vec<(usize, usize)>,
+}
+
+/// Where a click lands: the area drawn for a row, and what it selects.
+pub type GraphHit = (Rect, (usize, usize));
+
+impl GraphData {
+    /// The Explorer's current folder.
+    pub fn from_explorer(app: &App) -> GraphData {
+        let rows: Vec<Row> = app.rows.iter().map(Row::live).collect();
+        GraphData {
+            weights: rows.iter().map(|r| app.weight(r)).collect(),
+            safeties: rows.iter().map(|r| app.policy.classify(&r.path)).collect(),
+            marked: rows
+                .iter()
+                .map(|r| app.marks.contains_key(&r.path))
+                .collect(),
+            cursor: (app.cursor < rows.len()).then_some(app.cursor),
+            total: app.weight_total(),
+            scope: app.current().name.to_string_lossy().into_owned(),
+            keys: (0..rows.len()).map(|i| (0, i)).collect(),
+            rows,
+        }
+    }
+}
+
+pub fn render(frame: &mut Frame, area: Rect, app: &App) -> Vec<GraphHit> {
+    render_data(
+        frame,
+        area,
+        &app.glyphs,
+        app.graph,
+        &GraphData::from_explorer(app),
+    )
+}
+
+/// Draw the graph and return where each row can be clicked.
+pub fn render_data(
+    frame: &mut Frame,
+    area: Rect,
+    g: &Glyphs,
+    mode: GraphMode,
+    data: &GraphData,
+) -> Vec<GraphHit> {
+    let title = match mode {
         GraphMode::Treemap => " Treemap ",
         _ => " Distribution ",
     };
@@ -21,22 +80,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 8 || inner.height < 3 {
-        return;
+        return Vec::new();
     }
-    let rows: Vec<Row> = app.rows.iter().map(Row::live).collect();
-    if rows.is_empty() {
+    if data.rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled("nothing to show", Style::default().fg(DIM))),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
-        return;
+        return Vec::new();
     }
     let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
-    match app.graph {
-        GraphMode::Treemap => treemap(frame, body, app, &rows),
-        _ => bars(frame, body, app, &rows),
-    }
-    let caption = caption(app, &rows);
+    let hits = match mode {
+        GraphMode::Treemap => treemap(frame, body, g, data),
+        _ => bars(frame, body, g, data),
+    };
+    let caption = caption(data);
     frame.render_widget(
         Paragraph::new(Span::styled(
             fit(&caption, inner.width as usize, g),
@@ -44,49 +102,50 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
     );
+    hits
 }
 
 fn pct_of(size: u64, total: u64) -> u64 {
     (size as u128 * 100 / total.max(1) as u128) as u64
 }
 
-fn caption(app: &App, rows: &[Row]) -> String {
-    let total = app.weight_total().max(1);
-    match rows.get(app.cursor) {
-        Some(r) => format!(
+fn caption(data: &GraphData) -> String {
+    let total = data.total.max(1);
+    match data.cursor.and_then(|i| data.rows.get(i).map(|r| (i, r))) {
+        Some((i, r)) => format!(
             "selected: {} {}% of {}",
             r.name.to_string_lossy(),
-            pct_of(app.weight(r), total),
-            app.current().name.to_string_lossy()
+            pct_of(data.weights[i], total),
+            data.scope
         ),
         None => "selected: nothing".to_string(),
     }
 }
 
-fn bars(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
-    let g = &app.glyphs;
-    let total = app.weight_total().max(1);
+fn bars(frame: &mut Frame, area: Rect, g: &Glyphs, data: &GraphData) -> Vec<GraphHit> {
+    let total = data.total.max(1);
     let name_w = (area.width as usize / 3).clamp(6, 16);
     let pct_w = 5;
     let bar_w = (area.width as usize)
         .saturating_sub(name_w + pct_w + 2)
         .max(1);
-    let lines: Vec<Line> = rows
+    let lines: Vec<Line> = data
+        .rows
         .iter()
         .enumerate()
         .take(area.height as usize)
         .map(|(i, r)| {
-            let safety = app.policy.classify(&r.path);
+            let weight = data.weights[i];
             let line = Line::from(vec![
                 Span::raw(fit_pad(&r.name.to_string_lossy(), name_w, g)),
                 Span::raw(" "),
                 Span::styled(
-                    eighths_bar(app.weight(r) as f64 / total as f64, bar_w, g),
-                    Style::default().fg(safety_color(safety)),
+                    eighths_bar(weight as f64 / total as f64, bar_w, g),
+                    Style::default().fg(safety_color(data.safeties[i])),
                 ),
-                Span::raw(right(&format!("{}%", pct_of(app.weight(r), total)), pct_w)),
+                Span::raw(right(&format!("{}%", pct_of(weight, total)), pct_w)),
             ]);
-            if i == app.cursor {
+            if data.cursor == Some(i) {
                 line.style(
                     Style::default()
                         .bg(SELECTED_BG)
@@ -98,23 +157,30 @@ fn bars(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+    (0..data.rows.len().min(area.height as usize))
+        .map(|i| {
+            (
+                Rect::new(area.x, area.y + i as u16, area.width, 1),
+                data.keys[i],
+            )
+        })
+        .collect()
 }
 
-fn treemap(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
-    let g = &app.glyphs;
+fn treemap(frame: &mut Frame, area: Rect, g: &Glyphs, data: &GraphData) -> Vec<GraphHit> {
+    let mut hits = Vec::new();
     if area.width < 4 || area.height < 1 {
-        return;
+        return hits;
     }
-    let weights: Vec<u64> = rows.iter().map(|r| app.weight(r)).collect();
-    let rects = squarify(&weights, area.width, area.height);
+    let rects = squarify(&data.weights, area.width, area.height);
     for (i, cell) in rects.iter().enumerate() {
         let Some(c) = cell else { continue };
-        let r = &rows[i];
+        let r = &data.rows[i];
         let rect = Rect::new(area.x + c.x, area.y + c.y, c.w, c.h);
-        let safety = app.policy.classify(&r.path);
-        let selected = i == app.cursor;
-        let marked = app.marks.contains_key(&r.path);
-        let bg = fill_color(safety, selected, i);
+        hits.push((rect, data.keys[i]));
+        let selected = data.cursor == Some(i);
+        let marked = data.marked[i];
+        let bg = fill_color(data.safeties[i], selected, i);
         let fg = if selected { Color::White } else { Color::Gray };
         let style = Style::default().bg(bg).fg(fg);
         let w = rect.width as usize;
@@ -147,6 +213,7 @@ fn treemap(frame: &mut Frame, area: Rect, app: &App, rows: &[Row]) {
         }
         frame.render_widget(Paragraph::new(lines), rect);
     }
+    hits
 }
 
 /// Box colour: the safety hue, with three alternating shades so boxes of the

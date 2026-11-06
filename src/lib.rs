@@ -1,6 +1,8 @@
 pub mod accounting;
 pub mod anim;
 pub mod app;
+pub mod bg;
+pub mod catalog;
 pub mod cli;
 pub mod filter;
 pub mod fmt;
@@ -11,6 +13,7 @@ pub mod perms;
 pub mod safety;
 pub mod scan;
 pub mod softdelete;
+pub mod targets;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod treemap;

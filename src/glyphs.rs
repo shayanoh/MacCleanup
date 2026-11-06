@@ -55,6 +55,10 @@ impl Glyphs {
         self.pick("\u{f017}", "(p)")
     }
 
+    /// A tool's own cleanup command (instead of a folder).
+    pub fn command(&self) -> &'static str {
+        self.pick("\u{f120}", ">_")
+    }
     pub fn hatch(&self) -> &'static str {
         self.pick("░", "/")
     }

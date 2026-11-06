@@ -43,6 +43,37 @@ pub fn eighths_bar(frac: f64, width: usize, g: &Glyphs) -> String {
     out
 }
 
+/// "5m 02s": a time span for a progress readout.
+pub fn duration(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m {:02}s", s / 60, s % 60),
+        _ => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// A bar of unknown length: a lit block moving back and forth, exactly
+/// `width` characters wide. `tick` is the app tick (it advances every other tick).
+pub fn marquee(tick: u64, width: usize, g: &Glyphs) -> String {
+    let levels = g.eighths();
+    let (off, on) = (levels[0], levels[levels.len() - 1]);
+    if width == 0 {
+        return String::new();
+    }
+    let block = (width / 4).max(1).min(width);
+    let span = width - block;
+    let pos = if span == 0 {
+        0
+    } else {
+        let t = (tick / 2) as usize % (2 * span);
+        if t <= span { t } else { 2 * span - t }
+    };
+    (0..width)
+        .map(|i| if i >= pos && i < pos + block { on } else { off })
+        .collect()
+}
+
 /// "1.5 KB (4.1 KB on disk)": the logical size with what it takes on disk.
 pub fn both(size: u64, disk: u64) -> String {
     format!("{} ({} on disk)", human_size(size), human_size(disk))
@@ -56,6 +87,46 @@ pub fn both_usage(u: Usage) -> String {
 mod tests {
     use super::*;
     use crate::glyphs::{GlyphMode, Glyphs};
+
+    #[test]
+    fn durations_read_naturally() {
+        let d = |s| duration(std::time::Duration::from_secs(s));
+        assert_eq!(d(0), "0s");
+        assert_eq!(d(7), "7s");
+        assert_eq!(d(59), "59s");
+        assert_eq!(d(60), "1m 00s");
+        assert_eq!(d(302), "5m 02s");
+        assert_eq!(d(3599), "59m 59s");
+        assert_eq!(d(3600), "1h 00m");
+        assert_eq!(d(7384), "2h 03m");
+    }
+
+    #[test]
+    fn the_marquee_keeps_its_width_and_moves_back_and_forth() {
+        let g = Glyphs::new(GlyphMode::Nerd);
+        let full = *g.eighths().last().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for tick in 0..80 {
+            let m = marquee(tick, 12, &g);
+            assert_eq!(m.chars().count(), 12, "tick {tick}");
+            let lit = m.chars().filter(|c| *c == full).count();
+            assert_eq!(lit, 3, "{m:?}");
+            seen.insert(m);
+        }
+        assert!(seen.len() > 4, "it moves");
+        // The block comes back: same picture after one full there-and-back.
+        assert_eq!(marquee(0, 12, &g), marquee(2 * 2 * 9, 12, &g));
+    }
+
+    #[test]
+    fn the_marquee_never_panics_on_tiny_widths() {
+        let g = Glyphs::new(GlyphMode::Ascii);
+        for w in 0..5 {
+            for tick in 0..20 {
+                assert_eq!(marquee(tick, w, &g).chars().count(), w);
+            }
+        }
+    }
 
     #[test]
     fn human_size_cases() {

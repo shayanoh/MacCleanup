@@ -126,6 +126,12 @@ with open(os.path.join(home, "proj", "big.bin"), "wb") as f:
     f.write(b"x" * 200_000)
 with open(os.path.join(home, "note.txt"), "wb") as f:
     f.write(b"hello")
+# A small Node project for the Caches & Projects screen.
+os.makedirs(os.path.join(home, "shop", "node_modules", "dep"))
+with open(os.path.join(home, "shop", "package.json"), "wb") as f:
+    f.write(b"{}")
+with open(os.path.join(home, "shop", "node_modules", "dep", "index.js"), "wb") as f:
+    f.write(b"x" * 60_000)
 
 pid, fd = pty.fork()
 if pid == 0:
@@ -279,7 +285,7 @@ wait_gone("still holds 1 item")
 assert pid_alive(), "Esc must keep the app running"
 
 step("holding screen and restore")
-send(b"3")
+send(b"7")
 wait_for("1 items")
 send(b"r")
 wait_for("Restored")
@@ -292,6 +298,28 @@ with open(os.path.join(home, "late.bin"), "wb") as f:
     f.write(b"x" * 50_000)
 send(b"R")
 wait_for("late.bin")
+
+step("caches & projects: 5 opens it, space marks a row, d reviews, Esc cancels, space unmarks")
+send(b"5")
+wait_for("PROJECTS")
+wait_for("shop")  # the project, in the list and as the graph's label
+wait_for("Details")
+send(b"j")  # the ~/shop group
+send(b"j")  # its node_modules row
+pump(0.3)
+send(b" ")
+wait_for("marked 1")
+send(b"d")
+wait_for("Review before moving")
+assert "shop/node_modules" in screen.text(), "the review lists the folder"
+send(b"\x1b")
+wait_gone("Review before moving")
+send(b" ")
+wait_for("nothing marked")
+assert not os.path.exists(os.path.join(home, "ToBeDeleted", "items")) or not os.listdir(
+    os.path.join(home, "ToBeDeleted", "items")
+), "cancelling must move nothing"
+assert os.path.exists(os.path.join(home, "shop", "node_modules", "dep", "index.js"))
 
 step("irreversible path asks twice and needs y")
 send(b"2")

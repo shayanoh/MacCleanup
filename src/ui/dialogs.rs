@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     match &app.dialog {
         None => {}
         Some(Dialog::QuitWarning(w)) => quit_warning(frame, area, g, w, scale),
-        Some(Dialog::Review(r)) => review(frame, area, g, r, scale),
+        Some(Dialog::Review(r)) => review(frame, area, g, r, app.review_scroll, scale),
         Some(Dialog::Irreversible(r)) => irreversible(frame, area, g, r, scale),
         Some(Dialog::ConfirmForever(t)) => confirm_forever(frame, area, g, t, scale),
         Some(Dialog::Deleting(p)) => deleting(frame, area, app, p, scale),
@@ -88,6 +88,27 @@ fn popup(
     (!growing).then_some(inner)
 }
 
+/// What to tell the user when a command is stuck on (or failed on) a lock
+/// held by another process. Empty for any other output.
+fn lock_hint(text: &str) -> Option<&'static str> {
+    crate::catalog::is_lock_wait(text).then_some(
+        "Another uv process is using the cache (for example a `uv run` server). \
+         uv waits up to 5 minutes for it, then gives up.",
+    )
+}
+
+/// How many rows these lines take once wrapped to `width` columns.
+fn wrapped_rows(lines: &[Line], width: usize) -> usize {
+    let width = width.max(1);
+    lines
+        .iter()
+        .map(|l| {
+            let w: usize = l.spans.iter().map(|s| super::text_width(&s.content)).sum();
+            w.div_ceil(width).max(1)
+        })
+        .sum()
+}
+
 fn key_line<'a>(g: &Glyphs, keys: &[(&str, &str)]) -> Line<'a> {
     let mut spans = Vec::new();
     for (i, (key, what)) in keys.iter().enumerate() {
@@ -134,15 +155,76 @@ fn quit_warning(frame: &mut Frame, area: Rect, g: &Glyphs, w: &QuitWarning, scal
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
+/// Lines of the review that are neither folders nor commands.
+const REVIEW_FIXED: usize = 12;
+
+/// How the review fits a terminal: the commands come first, because every
+/// command that will run must be visible. Folders give way before commands
+/// do; commands drop their "via" line before they are cut; and when even
+/// that is not enough the review says so (and `y` is refused).
+#[derive(Clone, Copy, Debug)]
+pub struct ReviewLayout {
+    pub width: u16,
+    pub height: u16,
+    /// Commands take one line each (the "via <program>" line is dropped).
+    pub compact: bool,
+    pub shown_items: usize,
+    pub shown_commands: usize,
+    /// Some command cannot be shown at this size.
+    pub clipped: bool,
+}
+
+pub fn review_layout(area: Rect, r: &Review) -> ReviewLayout {
     let width = area.width.saturating_sub(4).min(96);
-    let wanted = r.items.len() as u16 + 14;
-    let height = wanted.min(area.height.saturating_sub(2)).max(13);
+    let n = r.commands.len();
+    // A forceable command gets one more line saying what `f` does.
+    let forceable = r.commands.iter().filter(|c| c.can_force).count();
+    let full = if n == 0 { 0 } else { n * 2 + 2 + forceable };
+    let compact_lines = if n == 0 { 0 } else { n + 2 };
+    let max_h = area.height.saturating_sub(2) as usize;
+    let height = (r.items.len() + full + 14).min(max_h).max(13);
+    let inner = height.min(max_h).saturating_sub(2);
+    let (compact, cmd_lines, clipped) = if REVIEW_FIXED + full <= inner {
+        (false, full, false)
+    } else if REVIEW_FIXED + compact_lines <= inner {
+        (true, compact_lines, false)
+    } else {
+        (true, compact_lines, n > 0)
+    };
+    let shown_commands = if clipped {
+        inner.saturating_sub(REVIEW_FIXED + 3)
+    } else {
+        n
+    };
+    let used = if clipped {
+        shown_commands + 3
+    } else {
+        cmd_lines
+    };
+    let room = inner.saturating_sub(REVIEW_FIXED + used);
+    let shown_items = r.items.len().min(if n == 0 { room.max(1) } else { room });
+    ReviewLayout {
+        width,
+        height: height as u16,
+        compact,
+        shown_items,
+        shown_commands,
+        clipped,
+    }
+}
+
+fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, scale: f64) {
+    let lay = review_layout(area, r);
+    let (width, height) = (lay.width, lay.height);
     let Some(inner) = popup(
         frame,
         area,
         g,
-        "Review before moving to ToBeDeleted",
+        if r.items.is_empty() {
+            "Review before running cleanup commands"
+        } else {
+            "Review before moving to ToBeDeleted"
+        },
         ACCENT,
         width,
         height,
@@ -150,7 +232,6 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
     ) else {
         return;
     };
-    let room = (inner.height as usize).saturating_sub(12);
     let name_w = (inner.width as usize).saturating_sub(34);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -162,8 +243,10 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
         ),
         Style::default().fg(DIM),
     )));
-    let shown = r.items.len().min(room.max(1));
-    for item in r.items.iter().take(shown) {
+    let shown = lay.shown_items;
+    // The list is a window onto the items; it never starts past the last full page.
+    let start = scroll.min(r.items.len().saturating_sub(shown));
+    for item in r.items.iter().skip(start).take(shown) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{} ", safety_dot(g, item.safety)),
@@ -183,23 +266,101 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
     }
     if r.items.len() > shown {
         lines.push(Line::from(Span::styled(
-            format!("{} and {} more", g.ellipsis(), r.items.len() - shown),
+            fit(
+                &format!(
+                    "{}-{} of {}   j/k, arrows, PgUp/PgDn, Ctrl-F/B or the wheel scroll",
+                    start + 1,
+                    (start + shown).min(r.items.len()),
+                    r.items.len()
+                ),
+                inner.width as usize,
+                g,
+            ),
             Style::default().fg(DIM),
         )));
     }
+    if !r.commands.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} Tool cleanup commands (run after the moves, cannot be undone)",
+                g.warn()
+            ),
+            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+        )));
+        for c in r.commands.iter().take(lay.shown_commands) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", g.dot()), Style::default().fg(DANGER)),
+                Span::styled(
+                    fit(&c.line, 40, g),
+                    // A forced command is drawn in red: it skips a safety check.
+                    if c.force {
+                        Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    },
+                ),
+                Span::styled(
+                    format!("  {}  up to {}", c.tool, human_size(c.up_to)),
+                    Style::default().fg(DIM),
+                ),
+            ]));
+            if !lay.compact {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    via {}",
+                        fit_start(&c.spec.program, (inner.width as usize).saturating_sub(8), g)
+                    ),
+                    Style::default().fg(DIM),
+                )));
+                if c.can_force {
+                    lines.push(Line::from(if c.force {
+                        Span::styled(
+                            "    FORCED: skips the in-use check; a process using it now may be disturbed",
+                            Style::default().fg(DANGER),
+                        )
+                    } else {
+                        Span::styled(
+                            "    waits up to 5 minutes if another process uses it; f forces it",
+                            Style::default().fg(DIM),
+                        )
+                    }));
+                }
+            }
+        }
+        if lay.clipped {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} and {} more command(s): make the terminal taller to see them (y is off)",
+                    g.ellipsis(),
+                    r.commands.len() - lay.shown_commands
+                ),
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("Total {}", both_usage(r.total)),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" will be moved."),
-    ]));
-    lines.push(Line::from(
-        "It is not freed until you empty ToBeDeleted.".to_string(),
-    ));
+    if r.items.is_empty() {
+        lines.push(Line::from("Nothing is moved; only the commands above run."));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("Total {}", both_usage(r.total)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" will be moved."),
+        ]));
+        lines.push(Line::from(
+            "It is not freed until you empty ToBeDeleted.".to_string(),
+        ));
+    }
     let sp = r.space;
-    if sp.frees_now >= sp.footprint {
+    if !r.space_ready {
+        lines.push(Line::from(Span::styled(
+            format!("Working out what this frees{}", g.ellipsis()),
+            Style::default().fg(DIM),
+        )));
+    } else if sp.frees_now >= sp.footprint {
         lines.push(Line::from(Span::styled(
             "Deleting for good frees all of it right now.",
             Style::default().fg(SAFE),
@@ -208,7 +369,7 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
         lines.push(Line::from(Span::styled(
             format!(
                 "Deleting for good frees about {} right now.",
-                human_size(sp.frees_now)
+                human_size(sp.frees_all())
             ),
             Style::default().fg(SAFE),
         )));
@@ -240,20 +401,45 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
             )));
         }
     }
-    lines.push(key_line(
-        g,
-        &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],
-    ));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "[ x ]",
-            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" Move, then empty now  {} cannot be undone", g.warn()),
-            Style::default().fg(DANGER),
-        ),
-    ]));
+    if r.commands.is_empty() {
+        lines.push(key_line(
+            g,
+            &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],
+        ));
+    } else if lay.clipped {
+        lines.push(key_line(g, &[("Esc", "Cancel")]));
+    } else {
+        // Commands cannot be undone, so Enter does nothing here.
+        let run = if r.items.is_empty() {
+            "Run the commands"
+        } else {
+            "Move, then run the commands"
+        };
+        if r.commands.iter().any(|c| c.can_force) {
+            lines.push(key_line(
+                g,
+                &[
+                    ("y", run),
+                    ("f", "Force (skip the in-use check)"),
+                    ("Esc", "Cancel"),
+                ],
+            ));
+        } else {
+            lines.push(key_line(g, &[("y", run), ("Esc", "Cancel")]));
+        }
+    }
+    if !r.items.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "[ x ]",
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" Move, then empty now  {} cannot be undone", g.warn()),
+                Style::default().fg(DANGER),
+            ),
+        ]));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -335,14 +521,15 @@ fn confirm_forever(frame: &mut Frame, area: Rect, g: &Glyphs, t: &ForeverTarget,
 
 fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress, scale: f64) {
     let g = &app.glyphs;
+    let command = p.phase == Phase::Command;
     let Some(inner) = popup(
         frame,
         area,
         g,
         "Working",
         ACCENT,
-        area.width.saturating_sub(4).min(76),
-        9,
+        area.width.saturating_sub(4).min(86),
+        if command { 15 } else { 9 },
         scale,
     ) else {
         return;
@@ -360,9 +547,10 @@ fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress, scale:
     let what = match p.phase {
         Phase::Moving => "Moving files to ToBeDeleted",
         Phase::Deleting => "Deleting for good",
+        Phase::Command => "Running cleanup commands",
     };
     let bar_w = (inner.width as usize).saturating_sub(7);
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
             Span::raw(format!(" {what}, please wait")),
@@ -372,18 +560,71 @@ fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress, scale:
             Span::styled(eighths_bar(frac, bar_w, g), Style::default().fg(SAFE)),
             Span::raw(format!(" {:>3}%", (frac * 100.0).floor() as u32)),
         ]),
-        Line::from(format!("{} / {} items", p.done, p.total)),
-        Line::from(format!(
+    ];
+    if command {
+        let status = app.command_status();
+        let elapsed = status
+            .as_ref()
+            .and_then(|s| s.elapsed)
+            .map_or_else(|| "0s".to_string(), crate::fmt::duration);
+        lines.push(Line::from(format!(
+            "command {} of {}",
+            (p.done + 1).min(p.total.max(1)),
+            p.total.max(1)
+        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                fit(&p.current.to_string_lossy(), 40, g),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  running for {elapsed}")),
+        ]));
+        let last = status.as_ref().map(|s| s.last_line.as_str()).unwrap_or("");
+        lines.push(Line::from(Span::styled(
+            fit(
+                &if last.is_empty() {
+                    "(no output yet)".to_string()
+                } else {
+                    format!("{} {last}", g.dot())
+                },
+                inner.width as usize,
+                g,
+            ),
+            Style::default().fg(DIM),
+        )));
+        lines.push(Line::raw(""));
+        if let Some(hint) = lock_hint(last) {
+            lines.push(Line::from(Span::styled(hint, Style::default().fg(CAUTION))));
+            lines.push(Line::from(Span::styled(
+                "Close it, or cancel here and retry with --force afterwards.",
+                Style::default().fg(CAUTION),
+            )));
+        }
+        if status.as_ref().is_some_and(|s| s.cancelling) {
+            lines.push(Line::from(Span::styled(
+                "Cancelling the command...",
+                Style::default().fg(CAUTION).add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::raw(""));
+            lines.push(key_line(
+                g,
+                &[("Esc", "Cancel this command (moves already made stay)")],
+            ));
+        }
+    } else {
+        lines.push(Line::from(format!("{} / {} items", p.done, p.total)));
+        lines.push(Line::from(format!(
             "{} of {}",
             human_size(p.usage.size),
             both_usage(p.of)
-        )),
-        Line::from(Span::styled(
+        )));
+        lines.push(Line::from(Span::styled(
             fit_start(&p.current.to_string_lossy(), inner.width as usize, g),
             Style::default().fg(DIM),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(lines), inner);
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) {
@@ -441,6 +682,36 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
             Style::default().fg(DANGER),
         )));
     }
+    for c in &f.commands {
+        let (mark, color) = if c.ok {
+            (g.check(), SAFE)
+        } else if c.cancelled {
+            (g.warn(), CAUTION)
+        } else {
+            (g.warn(), DANGER)
+        };
+        let note = if c.ok {
+            String::new()
+        } else if c.cancelled {
+            " (cancelled)".to_string()
+        } else if c.note.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", fit(&c.note, 60, g))
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{mark} {}{note}", c.line),
+            Style::default().fg(color),
+        )));
+        if c.lock_wait
+            && let Some(hint) = lock_hint(&c.note)
+        {
+            lines.push(Line::from(Span::styled(
+                format!("    {hint}"),
+                Style::default().fg(CAUTION),
+            )));
+        }
+    }
     lines.push(Line::from(format!(
         "Free space now {}   pending {}",
         human_size(app.free_now),
@@ -453,8 +724,20 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
         )));
     }
     lines.push(Line::raw(""));
-    lines.push(key_line(g, &[("Enter", "Done")]));
-    let height = lines.len() as u16 + 2;
+    if f.retry.is_empty() {
+        lines.push(key_line(g, &[("Enter", "Done")]));
+    } else {
+        lines.push(key_line(
+            g,
+            &[
+                ("f", "Retry with --force (skips uv's in-use check)"),
+                ("Enter", "Done"),
+            ],
+        ));
+    }
+    // Long lines wrap inside the window, so count rows, not lines.
+    let popup_w = area.width.saturating_sub(4).min(86);
+    let height = wrapped_rows(&lines, popup_w.saturating_sub(2) as usize) as u16 + 2;
     let Some(inner) = popup(
         frame,
         area,
@@ -553,5 +836,70 @@ mod tests {
             assert!(r.width <= 80 && r.height <= 12 && r.width >= 3);
         }
         assert_eq!(grown(Rect::new(0, 0, 0, 0), 80, 12, 0.5).area(), 0);
+    }
+}
+
+#[cfg(test)]
+mod review_layout_tests {
+    use super::*;
+    use crate::app::{Review, ReviewCommand, ReviewItem};
+    use crate::catalog::CommandSpec;
+    use crate::safety::Safety;
+    use crate::usage::Usage;
+
+    fn review(items: usize, commands: usize) -> Review {
+        Review {
+            items: (0..items)
+                .map(|i| ReviewItem {
+                    path: format!("/x/{i}").into(),
+                    usage: Usage::default(),
+                    safety: Safety::Safe,
+                })
+                .collect(),
+            commands: (0..commands)
+                .map(|i| ReviewCommand {
+                    id: format!("c{i}"),
+                    tool: "t".to_string(),
+                    line: format!("tool{i} clean"),
+                    spec: CommandSpec::new("tool", &["clean"]),
+                    up_to: 0,
+                    path: std::path::PathBuf::new(),
+                    can_force: false,
+                    force: false,
+                })
+                .collect(),
+            total: Usage::default(),
+            space: Default::default(),
+            space_ready: true,
+        }
+    }
+
+    #[test]
+    fn plenty_of_room_shows_everything_in_full() {
+        let l = review_layout(Rect::new(0, 0, 140, 50), &review(3, 2));
+        assert!(!l.clipped && !l.compact);
+        assert_eq!((l.shown_items, l.shown_commands), (3, 2));
+    }
+
+    #[test]
+    fn many_commands_on_a_short_terminal_drop_the_via_lines_first() {
+        let l = review_layout(Rect::new(0, 0, 140, 30), &review(2, 10));
+        assert!(l.compact, "{l:?}");
+        assert!(!l.clipped, "{l:?}");
+        assert_eq!(l.shown_commands, 10);
+    }
+
+    #[test]
+    fn when_the_commands_cannot_fit_the_review_says_so() {
+        let l = review_layout(Rect::new(0, 0, 140, 20), &review(2, 10));
+        assert!(l.clipped, "{l:?}");
+        assert!(l.shown_commands < 10);
+    }
+
+    #[test]
+    fn folders_alone_never_count_as_clipped() {
+        let l = review_layout(Rect::new(0, 0, 140, 16), &review(200, 0));
+        assert!(!l.clipped);
+        assert!(l.shown_items >= 1);
     }
 }

@@ -85,6 +85,22 @@ impl Query {
         positions.dedup();
         Some(positions)
     }
+
+    /// Does the query hold for several pieces of text that belong together
+    /// (a group's name and an item's name)? Each term has to match inside one
+    /// field, but different terms may match different fields; an excluding
+    /// term must be absent from every field.
+    pub fn matches_fields(&self, fields: &[&str]) -> bool {
+        let fields: Vec<Vec<char>> = fields.iter().map(|f| f.chars().collect()).collect();
+        self.terms.iter().all(|term| {
+            let holds = |f: &Vec<char>| term.positions(f).is_some();
+            if term.kind == Kind::Exclude {
+                fields.iter().all(holds)
+            } else {
+                fields.iter().any(holds)
+            }
+        })
+    }
 }
 
 impl Term {
@@ -159,6 +175,47 @@ mod tests {
 
     fn m(query: &str, text: &str) -> Option<Vec<usize>> {
         parse(query).matches(text)
+    }
+
+    fn f(query: &str, fields: &[&str]) -> bool {
+        parse(query).matches_fields(fields)
+    }
+
+    #[test]
+    fn each_term_may_match_a_different_field() {
+        assert!(f("shop next", &["shop", ".next"]));
+        assert!(f("next shop", &["shop", ".next"]), "order does not matter");
+        assert!(!f("shop next", &["shop", "node_modules"]));
+        assert!(!f("shop next", &["other", ".next"]));
+    }
+
+    #[test]
+    fn a_single_term_never_spans_two_fields() {
+        // "api" would match the joined text "App caches Spotify" by taking
+        // letters from both; it must match within one field.
+        assert!(!f("api", &["App caches", "Spotify"]));
+        assert!(f("api", &["api", "target"]));
+        assert!(f("spo", &["App caches", "Spotify"]));
+    }
+
+    #[test]
+    fn operators_work_per_field() {
+        assert!(f("'node", &["shop", "node_modules"]));
+        assert!(f("^sh", &["shop", "x"]));
+        assert!(!f("^op", &["shop", "x"]));
+    }
+
+    #[test]
+    fn an_exclusion_must_hold_for_every_field() {
+        assert!(!f("shop !next", &["shop", ".next"]));
+        assert!(f("shop !next", &["shop", "node_modules"]));
+        assert!(!f("!shop", &["shop", "node_modules"]));
+    }
+
+    #[test]
+    fn an_empty_query_matches_any_fields() {
+        assert!(f("", &["a", "b"]));
+        assert!(f("   ", &[]));
     }
 
     #[test]
