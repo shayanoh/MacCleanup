@@ -51,6 +51,7 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::Char(' ') => Some(Action::ToggleMark),
         KeyCode::Char('d') => Some(Action::OpenReview),
+        KeyCode::Char('m') if app.screen == Screen::Targets => Some(Action::MarkRelated),
         KeyCode::Char('g') => Some(Action::Top),
         KeyCode::Char('t') => Some(Action::CycleGraph),
         KeyCode::Char('s') => Some(Action::CycleSort),
@@ -195,6 +196,7 @@ mod tests {
             (key(KeyCode::Esc), Some(Action::Quit)),
             // Dialog-only and holding-only keys do nothing here.
             (ch('x'), None),
+            (ch('m'), None), // related-folders marking is Caches & Projects only
             (ch('y'), None),
             (ch('r'), Some(Action::Rescan)),
             (ch('R'), Some(Action::RescanAll)),

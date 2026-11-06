@@ -1018,6 +1018,40 @@ impl SpaceView {
             .unwrap_or_default()
     }
 
+    /// Other folders that hold a clone or a hard link of data inside `node`
+    /// (the folders themselves, not the files), sorted.
+    pub fn sharers(&self, node: &Arc<Node>) -> Vec<PathBuf> {
+        let inside = |p: &Path| p.starts_with(&node.path);
+        let mut out: HashSet<PathBuf> = HashSet::new();
+        for shard in &self.shared.clones.shards {
+            for group in lock(shard).values() {
+                if group.members.iter().any(|m| inside(&m.path)) {
+                    out.extend(
+                        group
+                            .members
+                            .iter()
+                            .filter(|m| !inside(&m.path))
+                            .map(|m| m.path.clone()),
+                    );
+                }
+            }
+        }
+        for group in lock(&self.shared.links).values() {
+            if group.paths.iter().any(|p| inside(p)) {
+                out.extend(
+                    group
+                        .paths
+                        .iter()
+                        .filter(|p| !inside(p))
+                        .filter_map(|p| p.parent().map(Path::to_path_buf)),
+                );
+            }
+        }
+        let mut v: Vec<PathBuf> = out.into_iter().collect();
+        v.sort();
+        v
+    }
+
     /// See [`Scanner::spaces_of`].
     pub fn spaces_of(&self, nodes: &[Arc<Node>]) -> Vec<Space> {
         let index: HashMap<&Path, usize> = nodes
@@ -1625,6 +1659,28 @@ mod tests {
         let (s, root) = three_holders(r);
         let a = root.subdir(&r.join("a")).unwrap();
         assert_eq!(s.space_of_set(std::slice::from_ref(&a)), s.space(&a));
+    }
+
+    #[test]
+    fn sharers_lists_other_folders_holding_the_same_clone_or_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("store/f"), 200_000);
+        clone_file(r, "store/f", "a/f");
+        clone_file(r, "store/f", "b/f");
+        write(&r.join("a/x"), 8192);
+        hard_link(r, "a/x", "linked/y");
+        let (s, root) = scan(r, 2);
+        let node = |n: &str| root.subdir(&r.join(n)).unwrap();
+        let view = s.view();
+        assert_eq!(
+            view.sharers(&node("a")),
+            vec![r.join("b"), r.join("linked"), r.join("store")]
+        );
+        assert!(view.sharers(&node("b")).contains(&r.join("a")));
+        write(&r.join("lonely/z"), 100);
+        let (s2, root2) = scan(&r.join("lonely"), 2);
+        assert!(s2.view().sharers(&root2).is_empty());
     }
 
     #[test]

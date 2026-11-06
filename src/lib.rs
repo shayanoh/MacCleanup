@@ -1,6 +1,7 @@
 pub mod accounting;
 pub mod anim;
 pub mod app;
+pub mod bg;
 pub mod catalog;
 pub mod cli;
 pub mod filter;

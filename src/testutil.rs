@@ -138,3 +138,15 @@ pub fn wait_tools(app: &mut App) {
     }
     panic!("tool discovery did not finish");
 }
+
+/// Tick until the joint-space and related-folders work has answered.
+pub fn wait_sets(app: &mut App) {
+    for _ in 0..2000 {
+        app.update(Action::Tick);
+        if !app.set_space.pending && !app.holders.pending && app.scanner.is_idle() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("background space work did not finish");
+}

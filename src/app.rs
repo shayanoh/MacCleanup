@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
@@ -6,6 +6,7 @@ use ratatui::layout::Rect;
 
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
+use crate::bg::Latest;
 use crate::catalog::{CommandRunner, SystemRunner, ToolEntry, discover_tools};
 use crate::filter;
 use crate::fmt::both_usage;
@@ -111,6 +112,8 @@ pub enum Action {
     Into,
     Out,
     ToggleMark,
+    /// Mark every folder that shares data with the selected row (Caches & Projects).
+    MarkRelated,
     OpenReview,
     CycleGraph,
     GrowGraph,
@@ -257,6 +260,32 @@ pub struct Detail {
     pub complete: bool,
 }
 
+/// Whether a path is in the selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarkState {
+    Unmarked,
+    Marked,
+    /// A folder above it is marked, so it goes with that one.
+    Covered(PathBuf),
+}
+
+/// Another folder that shares data with the selected row.
+#[derive(Clone, Debug)]
+pub struct Holder {
+    pub path: PathBuf,
+    pub usage: Usage,
+    pub state: MarkState,
+}
+
+/// Where the space of everything marked would go, as a set.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JointSpace {
+    /// The marked folders and files only.
+    pub base: Space,
+    /// The same plus the folders behind marked tool commands.
+    pub with_tools: Space,
+}
+
 /// What a Caches & Projects line stands for (survives a rebuild of the list).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LineKey {
@@ -325,6 +354,14 @@ pub struct App {
     /// Keys of the groups the user folded (kept across rebuilds).
     closed_groups: HashSet<String>,
     targets_synced: bool,
+    /// Tool commands marked for the review (the second kind of selection).
+    pub tool_marks: BTreeSet<String>,
+    /// Set-wise space of the whole selection, worked out on a thread.
+    pub set_space: Latest<JointSpace>,
+    set_exact: bool,
+    /// Folders sharing data with the selected row, worked out on a thread.
+    pub holders: Latest<(PathBuf, Vec<PathBuf>)>,
+    holders_key: Option<PathBuf>,
     pub runner: Arc<dyn CommandRunner>,
     job: Option<DeleteJob>,
     job_mode: DeleteMode,
@@ -436,6 +473,11 @@ impl App {
             tools_started: false,
             closed_groups: HashSet::new(),
             targets_synced: false,
+            tool_marks: BTreeSet::new(),
+            set_space: Latest::new(),
+            set_exact: true,
+            holders: Latest::new(),
+            holders_key: None,
             runner: Arc::new(SystemRunner),
             job: None,
             job_mode: DeleteMode::SoftOnly,
@@ -443,6 +485,7 @@ impl App {
             job_failure: None,
             quit_after_job: false,
         };
+        app.set_space.set_now(JointSpace::default());
         app.refresh_rows();
         app.refresh_held();
         app
@@ -723,6 +766,7 @@ impl App {
             Action::Into => self.enter(),
             Action::Out => self.leave(),
             Action::ToggleMark => self.toggle_mark(),
+            Action::MarkRelated => self.mark_related(),
             Action::OpenReview => self.open_review(),
             Action::CycleGraph => {
                 self.graph = match self.graph {
@@ -796,6 +840,14 @@ impl App {
             self.refresh_free();
         }
         self.poll_discovery();
+        self.set_space.poll();
+        self.holders.poll();
+        if self.scanner.is_idle() && !self.set_exact && !self.set_space.pending {
+            // The scan finished since the numbers were worked out: redo them.
+            self.marks_changed();
+            self.holders_key = None;
+            self.request_holders();
+        }
         if self.screen == Screen::Targets {
             let idle = self.scanner.is_idle();
             if (!idle && self.tick.is_multiple_of(10)) || (idle && !self.targets_synced) {
@@ -876,6 +928,7 @@ impl App {
             (_, Screen::Targets) => {
                 self.tcursor = step(self.tcursor, delta, self.tlines.len());
                 self.ensure_visible();
+                self.request_holders();
             }
             _ => {}
         }
@@ -965,27 +1018,305 @@ impl App {
     }
 
     fn toggle_mark(&mut self) {
-        if self.screen != Screen::Explorer {
-            return;
+        match self.screen {
+            Screen::Explorer => {
+                let Some(row) = self.selected_row() else {
+                    return;
+                };
+                let (path, usage) = (row.path.clone(), Usage::new(row.size, row.disk));
+                let name = row.name.to_string_lossy().into_owned();
+                self.mark_path(path, usage, &name);
+            }
+            Screen::Targets => self.toggle_target_mark(),
+            _ => {}
         }
-        let Some(row) = self.selected_row() else {
-            return;
-        };
-        let (path, usage) = (row.path.clone(), Usage::new(row.size, row.disk));
-        let name = row.name.to_string_lossy().into_owned();
+    }
+
+    /// Toggle one path in the shared selection, with the reasons it may be
+    /// refused. Returns true if the selection changed.
+    fn mark_path(&mut self, path: PathBuf, usage: Usage, name: &str) -> bool {
         if self.marks.remove(&path).is_some() {
-            return;
+            self.marks_changed();
+            return true;
         }
         if !self.policy.can_mark(&path) {
             self.notice = Some(format!("{name} is protected and cannot be deleted"));
-            return;
+            return false;
         }
         if self.marks.keys().any(|m| path.starts_with(m)) {
             self.notice = Some(format!("{name} is already covered by a marked folder"));
-            return;
+            return false;
         }
+        self.insert_mark(path, usage);
+        self.marks_changed();
+        true
+    }
+
+    /// Put a path in the selection (a marked folder swallows marks inside it).
+    fn insert_mark(&mut self, path: PathBuf, usage: Usage) {
         self.marks.retain(|m, _| !m.starts_with(&path));
         self.marks.insert(path, usage);
+    }
+
+    /// Is this path in the selection, covered by it, or not?
+    pub fn mark_state(&self, path: &Path) -> MarkState {
+        if self.marks.contains_key(path) {
+            return MarkState::Marked;
+        }
+        match self.marks.keys().find(|m| path.starts_with(m)) {
+            Some(parent) => MarkState::Covered(parent.clone()),
+            None => MarkState::Unmarked,
+        }
+    }
+
+    /// The same for a Caches & Projects row (command rows are marked by id).
+    pub fn row_mark(&self, t: &TRow) -> MarkState {
+        match &t.kind {
+            crate::targets::RowKind::Folder => self.mark_state(&t.row.path),
+            crate::targets::RowKind::Command { id, .. } => {
+                if self.tool_marks.contains(id) {
+                    MarkState::Marked
+                } else {
+                    match self.mark_state(&t.row.path) {
+                        MarkState::Covered(p) => MarkState::Covered(p),
+                        _ => MarkState::Unmarked,
+                    }
+                }
+            }
+        }
+    }
+
+    fn toggle_target_mark(&mut self) {
+        match self.tlines.get(self.tcursor).copied() {
+            Some(Line::Row { group, row }) => {
+                let t = self.targets.row(group, row).clone();
+                let name = t.row.name.to_string_lossy().into_owned();
+                match &t.kind {
+                    crate::targets::RowKind::Folder => {
+                        self.mark_path(
+                            t.row.path.clone(),
+                            Usage::new(t.row.size, t.row.disk),
+                            &name,
+                        );
+                    }
+                    crate::targets::RowKind::Command { id, .. } => {
+                        if !self.tool_marks.remove(id) {
+                            if let MarkState::Covered(_) = self.mark_state(&t.row.path) {
+                                self.notice =
+                                    Some(format!("{name} is already covered by a marked folder"));
+                                return;
+                            }
+                            self.tool_marks.insert(id.clone());
+                        }
+                        self.marks_changed();
+                    }
+                }
+            }
+            Some(Line::Group(g)) => {
+                let items = self.folder_rows_of(|gi, _| gi == g);
+                self.mark_many(items);
+            }
+            Some(Line::Section(kind)) => {
+                let items = self.folder_rows_of(|_, grp| grp.section == kind);
+                self.mark_many(items);
+            }
+            None => {}
+        }
+    }
+
+    /// The folder rows (never command rows) of the groups `keep` accepts.
+    fn folder_rows_of(
+        &self,
+        keep: impl Fn(usize, &crate::targets::Group) -> bool,
+    ) -> Vec<(PathBuf, Usage)> {
+        self.targets
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(i, g)| keep(*i, g))
+            .flat_map(|(_, g)| g.rows.iter())
+            .filter(|r| !r.is_command())
+            .map(|r| (r.row.path.clone(), Usage::new(r.row.size, r.row.disk)))
+            .collect()
+    }
+
+    /// Bulk toggle: if everything is already in, take it out; otherwise put
+    /// in whatever is allowed and not yet covered.
+    fn mark_many(&mut self, items: Vec<(PathBuf, Usage)>) {
+        if items.is_empty() {
+            return;
+        }
+        let all_in = items
+            .iter()
+            .all(|(p, _)| self.mark_state(p) != MarkState::Unmarked);
+        if all_in {
+            for (p, _) in &items {
+                self.marks.remove(p);
+            }
+        } else {
+            for (p, u) in items {
+                if self.mark_state(&p) == MarkState::Unmarked && self.policy.can_mark(&p) {
+                    self.insert_mark(p, u);
+                }
+            }
+        }
+        self.marks_changed();
+    }
+
+    /// Ask for fresh set-wise numbers after the selection changed.
+    pub fn marks_changed(&mut self) {
+        if self.marks.is_empty() && self.tool_marks.is_empty() {
+            self.set_space.set_now(JointSpace::default());
+            self.set_exact = true;
+            return;
+        }
+        let root = Arc::clone(&self.stack[0]);
+        let (mut nodes, mut files) = (Vec::new(), Vec::new());
+        for p in self.marks.keys() {
+            match locate(&root, p) {
+                Some(n) => nodes.push(n),
+                None => files.push(p.clone()),
+            }
+        }
+        // Folders behind marked tool commands (unless a marked folder covers them).
+        let tool_nodes: Vec<Arc<Node>> = self
+            .targets
+            .groups
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .filter(|r| match &r.kind {
+                crate::targets::RowKind::Command { id, .. } => {
+                    self.tool_marks.contains(id)
+                        && !self.marks.keys().any(|m| r.row.path.starts_with(m))
+                }
+                _ => false,
+            })
+            .filter_map(|r| r.row.node.clone())
+            .collect();
+        let view = self.scanner.view();
+        self.set_exact = self.scanner.is_idle();
+        self.set_space.spawn(move || {
+            let add_files = |mut sp: Space| {
+                for f in &files {
+                    if let Ok(fs) = file_space(f) {
+                        sp = sp + fs;
+                    }
+                }
+                sp
+            };
+            let base = add_files(view.space_of_set(&nodes));
+            let mut all = nodes;
+            all.extend(tool_nodes);
+            let with_tools = add_files(view.space_of_set(&outermost(all)));
+            JointSpace { base, with_tools }
+        });
+    }
+
+    /// What deleting everything marked frees, as a set; `None` while it is
+    /// being worked out.
+    pub fn joint_frees(&self) -> Option<u64> {
+        if self.set_space.pending {
+            return None;
+        }
+        self.set_space.value.map(|j| j.base.frees_all())
+    }
+
+    /// What the marked tool commands might add on top (an upper bound).
+    pub fn tools_up_to(&self) -> u64 {
+        if self.tool_marks.is_empty() {
+            return 0;
+        }
+        self.set_space.value.map_or(0, |j| {
+            j.with_tools.frees_all().saturating_sub(j.base.frees_all())
+        })
+    }
+
+    /// Look up which other folders share data with the selected row.
+    pub fn request_holders(&mut self) {
+        let Some(t) = self.selected_target() else {
+            return;
+        };
+        let path = t.row.path.clone();
+        if self.holders_key.as_ref() == Some(&path) {
+            return;
+        }
+        let Some(node) = t.row.node.clone() else {
+            return;
+        };
+        self.holders_key = Some(path.clone());
+        let candidates: Vec<PathBuf> = self
+            .targets
+            .groups
+            .iter()
+            .flat_map(|g| g.rows.iter().map(|r| r.row.path.clone()))
+            .filter(|p| *p != path)
+            .collect();
+        let view = self.scanner.view();
+        self.holders.spawn(move || {
+            let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+            for dir in view.sharers(&node) {
+                // Name the listed row that holds it, or the folder itself.
+                let owner = candidates.iter().find(|c| dir.starts_with(c));
+                out.insert(owner.cloned().unwrap_or(dir));
+            }
+            out.remove(&path);
+            (path, out.into_iter().take(50).collect())
+        });
+    }
+
+    /// The related folders of the selected row, with their sizes and marks.
+    pub fn holders_view(&self) -> Vec<Holder> {
+        let (Some(t), Some((key, paths))) = (self.selected_target(), &self.holders.value) else {
+            return Vec::new();
+        };
+        if *key != t.row.path {
+            return Vec::new();
+        }
+        paths
+            .iter()
+            .map(|p| {
+                let usage = match self.targets.find(p) {
+                    Some((g, r)) => {
+                        let row = &self.targets.row(g, r).row;
+                        Usage::new(row.size, row.disk)
+                    }
+                    None => locate(&self.stack[0], p)
+                        .map_or_else(Usage::default, |n| Usage::new(n.size(), n.disk())),
+                };
+                Holder {
+                    path: p.clone(),
+                    usage,
+                    state: self.mark_state(p),
+                }
+            })
+            .collect()
+    }
+
+    /// `m`: mark the selected folder and every folder that shares its data.
+    fn mark_related(&mut self) {
+        if self.screen != Screen::Targets {
+            return;
+        }
+        let mut changed = 0;
+        let mut todo: Vec<(PathBuf, Usage)> = Vec::new();
+        if let Some(t) = self.selected_target()
+            && !t.is_command()
+        {
+            todo.push((t.row.path.clone(), Usage::new(t.row.size, t.row.disk)));
+        }
+        todo.extend(self.holders_view().into_iter().map(|h| (h.path, h.usage)));
+        for (p, u) in todo {
+            if self.mark_state(&p) == MarkState::Unmarked && self.policy.can_mark(&p) {
+                self.insert_mark(p, u);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.marks_changed();
+            self.notice = Some(format!("Marked {changed} related folder(s)"));
+        } else {
+            self.notice = Some("Nothing more to mark here".to_string());
+        }
     }
 
     fn open_review(&mut self) {
@@ -1128,6 +1459,7 @@ impl App {
                             self.target_into();
                         } else {
                             self.tcursor = idx;
+                            self.request_holders();
                         }
                     }
                 }
@@ -1195,6 +1527,7 @@ impl App {
             .unwrap_or(self.tcursor)
             .min(self.tlines.len().saturating_sub(1));
         self.ensure_visible();
+        self.request_holders();
     }
 
     /// What a line stands for, so the cursor can follow it across rebuilds.
@@ -1404,6 +1737,7 @@ impl App {
         // Marks of items that no longer exist were moved; failed ones stay.
         self.marks
             .retain(|p, _| std::fs::symlink_metadata(p).is_ok());
+        self.marks_changed();
         self.refresh_free();
         self.refresh_held();
         self.refresh_rows();
@@ -1510,6 +1844,18 @@ impl App {
 }
 
 /// Move `pos` by `delta` within `0..len` (len 0 stays 0), without overflow.
+/// Keep only the outermost of a set of folders (drop any inside another).
+fn outermost(mut nodes: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
+    nodes.sort_by_key(|n| n.path.components().count());
+    let mut kept: Vec<Arc<Node>> = Vec::new();
+    for n in nodes {
+        if !kept.iter().any(|k| n.path.starts_with(&k.path)) {
+            kept.push(n);
+        }
+    }
+    kept
+}
+
 fn step(pos: usize, delta: i64, len: usize) -> usize {
     if len == 0 {
         return 0;
@@ -3328,5 +3674,240 @@ mod tests {
                 .unwrap_or("")
                 .contains("Rescanning everything")
         );
+    }
+
+    // --- shared selection and joint frees ------------------------------
+
+    use crate::testutil::{clone_file, wait_sets};
+
+    /// A cache folder `Store` and two projects whose node_modules clone it.
+    fn shared_app() -> crate::testutil::Env {
+        let mut e = env_with(
+            &[
+                ("Library/Caches/Store/f", 200_000),
+                ("p1/package.json", 10),
+                ("p2/package.json", 10),
+            ],
+            |home| {
+                clone_file(
+                    &home.join("Library/Caches/Store/f"),
+                    &home.join("p1/node_modules/f"),
+                );
+                clone_file(
+                    &home.join("Library/Caches/Store/f"),
+                    &home.join("p2/node_modules/f"),
+                );
+            },
+        );
+        e.app.update(Action::GoTo(Screen::Targets));
+        wait_tools(&mut e.app);
+        e.app.focus = Focus::Main;
+        e
+    }
+
+    fn cursor_on_path(app: &mut App, path: &Path) {
+        let at = app
+            .tlines
+            .iter()
+            .position(|l| match *l {
+                Line::Row { group, row } => app.targets.row(group, row).row.path == path,
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("no row for {}", path.display()));
+        app.tcursor = at;
+    }
+
+    fn mark_target(app: &mut App, path: &Path) {
+        cursor_on_path(app, path);
+        app.update(Action::ToggleMark);
+    }
+
+    #[test]
+    fn a_mark_made_on_targets_is_a_mark_in_the_explorer_selection() {
+        let mut e = shared_app();
+        let nm = e.home.join("p1/node_modules");
+        mark_target(&mut e.app, &nm);
+        assert!(e.app.marks.contains_key(&nm));
+        assert_eq!(e.app.mark_state(&nm), MarkState::Marked);
+    }
+
+    #[test]
+    fn a_mark_made_in_the_explorer_shows_on_targets() {
+        let mut e = shared_app();
+        let (p1, nm) = (e.home.join("p1"), e.home.join("p1/node_modules"));
+        e.app.update(Action::GoTo(Screen::Explorer));
+        select(&mut e.app, "p1");
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::GoTo(Screen::Targets));
+        assert_eq!(e.app.mark_state(&nm), MarkState::Covered(p1));
+    }
+
+    #[test]
+    fn marking_a_parent_in_the_explorer_replaces_a_child_marked_on_targets() {
+        let mut e = shared_app();
+        let nm = e.home.join("p1/node_modules");
+        mark_target(&mut e.app, &nm);
+        e.app.update(Action::GoTo(Screen::Explorer));
+        select(&mut e.app, "p1");
+        e.app.update(Action::ToggleMark);
+        let keys: Vec<_> = e.app.marks.keys().cloned().collect();
+        assert_eq!(keys, vec![e.home.join("p1")]);
+    }
+
+    #[test]
+    fn marking_inside_a_marked_folder_is_refused_on_targets() {
+        let mut e = shared_app();
+        e.app.update(Action::GoTo(Screen::Explorer));
+        select(&mut e.app, "p1");
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::GoTo(Screen::Targets));
+        let nm = e.home.join("p1/node_modules");
+        mark_target(&mut e.app, &nm);
+        assert!(
+            e.app
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("already covered")
+        );
+        assert_eq!(e.app.marks.len(), 1);
+    }
+
+    fn with_command_entries(e: &mut crate::testutil::Env) {
+        use crate::catalog::{CommandSpec, Mode, ToolEntry};
+        let mk = |id: &str, rel: &str, mode: Mode| ToolEntry {
+            id: id.to_string(),
+            tool: "T".to_string(),
+            label: id.to_string(),
+            path: e.home.join(rel),
+            regen: "again".to_string(),
+            mode,
+            note: None,
+        };
+        e.app.tool_entries = vec![
+            mk(
+                "cmd",
+                "Library/Caches/Store",
+                Mode::Command(CommandSpec::new("/x/tool", &["clean"])),
+            ),
+            mk("folder", "p1/node_modules", Mode::Folder),
+        ];
+        e.app.rebuild_targets();
+    }
+
+    #[test]
+    fn bulk_group_mark_marks_folder_rows_only() {
+        let mut e = shared_app();
+        with_command_entries(&mut e);
+        put_cursor_on(&mut e.app, "T");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.contains_key(&e.home.join("p1/node_modules")));
+        assert!(
+            e.app.tool_marks.is_empty(),
+            "a command is never marked in bulk"
+        );
+        // A second press unmarks the group's folder rows.
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.is_empty());
+    }
+
+    #[test]
+    fn a_section_mark_skips_command_rows_too() {
+        let mut e = shared_app();
+        with_command_entries(&mut e);
+        let at = e
+            .app
+            .tlines
+            .iter()
+            .position(|l| matches!(l, Line::Section(SectionKind::Tools)))
+            .unwrap();
+        e.app.tcursor = at;
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.tool_marks.is_empty());
+        assert!(!e.app.marks.is_empty());
+    }
+
+    #[test]
+    fn a_command_row_is_marked_by_marking_that_row() {
+        let mut e = shared_app();
+        with_command_entries(&mut e);
+        let store = e.home.join("Library/Caches/Store");
+        mark_target(&mut e.app, &store);
+        assert!(e.app.tool_marks.contains("cmd"));
+        assert!(e.app.marks.is_empty());
+        mark_target(&mut e.app, &store);
+        assert!(e.app.tool_marks.is_empty());
+    }
+
+    #[test]
+    fn joint_frees_rises_only_when_every_holder_is_marked() {
+        let mut e = shared_app();
+        let (store, n1, n2) = (
+            e.home.join("Library/Caches/Store"),
+            e.home.join("p1/node_modules"),
+            e.home.join("p2/node_modules"),
+        );
+        mark_target(&mut e.app, &n1);
+        wait_sets(&mut e.app);
+        assert_eq!(e.app.joint_frees(), Some(0));
+        mark_target(&mut e.app, &n2);
+        wait_sets(&mut e.app);
+        assert_eq!(e.app.joint_frees(), Some(0), "the store still holds it");
+        mark_target(&mut e.app, &store);
+        wait_sets(&mut e.app);
+        assert!(e.app.joint_frees().unwrap() >= 200_000);
+        // Keeping one holder: the figure drops again.
+        mark_target(&mut e.app, &n2);
+        wait_sets(&mut e.app);
+        assert_eq!(e.app.joint_frees(), Some(0));
+    }
+
+    #[test]
+    fn nothing_marked_frees_nothing_at_once() {
+        let e = shared_app();
+        assert_eq!(e.app.joint_frees(), Some(0));
+        assert!(!e.app.set_space.pending);
+    }
+
+    #[test]
+    fn related_folders_show_their_mark_state() {
+        let mut e = shared_app();
+        let (n1, n2) = (
+            e.home.join("p1/node_modules"),
+            e.home.join("p2/node_modules"),
+        );
+        mark_target(&mut e.app, &n2);
+        cursor_on_path(&mut e.app, &n1);
+        e.app.request_holders();
+        wait_sets(&mut e.app);
+        let h = e.app.holders_view();
+        let paths: Vec<_> = h.iter().map(|h| h.path.clone()).collect();
+        assert!(
+            paths.contains(&e.home.join("Library/Caches/Store")),
+            "{paths:?}"
+        );
+        let other = h.iter().find(|h| h.path == n2).unwrap();
+        assert_eq!(other.state, MarkState::Marked);
+        let store = h.iter().find(|h| h.path.ends_with("Store")).unwrap();
+        assert_eq!(store.state, MarkState::Unmarked);
+        assert!(
+            h.iter().all(|h| h.path != n1),
+            "the row itself is not listed"
+        );
+    }
+
+    #[test]
+    fn m_marks_every_related_holder_and_the_total_follows() {
+        let mut e = shared_app();
+        let n1 = e.home.join("p1/node_modules");
+        cursor_on_path(&mut e.app, &n1);
+        e.app.request_holders();
+        wait_sets(&mut e.app);
+        e.app.update(Action::MarkRelated);
+        wait_sets(&mut e.app);
+        for p in ["p1/node_modules", "p2/node_modules", "Library/Caches/Store"] {
+            assert!(e.app.marks.contains_key(&e.home.join(p)), "{p}");
+        }
+        assert!(e.app.joint_frees().unwrap() >= 200_000);
     }
 }
