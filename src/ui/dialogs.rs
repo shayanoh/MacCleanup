@@ -136,13 +136,22 @@ fn quit_warning(frame: &mut Frame, area: Rect, g: &Glyphs, w: &QuitWarning, scal
 
 fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
     let width = area.width.saturating_sub(4).min(96);
-    let wanted = r.items.len() as u16 + 14;
+    let command_lines = if r.commands.is_empty() {
+        0
+    } else {
+        r.commands.len() * 2 + 2
+    };
+    let wanted = (r.items.len() + command_lines) as u16 + 14;
     let height = wanted.min(area.height.saturating_sub(2)).max(13);
     let Some(inner) = popup(
         frame,
         area,
         g,
-        "Review before moving to ToBeDeleted",
+        if r.items.is_empty() {
+            "Review before running cleanup commands"
+        } else {
+            "Review before moving to ToBeDeleted"
+        },
         ACCENT,
         width,
         height,
@@ -150,7 +159,7 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
     ) else {
         return;
     };
-    let room = (inner.height as usize).saturating_sub(12);
+    let room = (inner.height as usize).saturating_sub(12 + command_lines);
     let name_w = (inner.width as usize).saturating_sub(34);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -187,17 +196,51 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
             Style::default().fg(DIM),
         )));
     }
+    if !r.commands.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} Tool cleanup commands (run after the moves, cannot be undone)",
+                g.warn()
+            ),
+            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+        )));
+        for c in &r.commands {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", g.dot()), Style::default().fg(DANGER)),
+                Span::styled(
+                    fit(&c.line, 40, g),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}  up to {}", c.tool, human_size(c.up_to)),
+                    Style::default().fg(DIM),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    via {}",
+                    fit_start(&c.spec.program, (inner.width as usize).saturating_sub(8), g)
+                ),
+                Style::default().fg(DIM),
+            )));
+        }
+    }
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("Total {}", both_usage(r.total)),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" will be moved."),
-    ]));
-    lines.push(Line::from(
-        "It is not freed until you empty ToBeDeleted.".to_string(),
-    ));
+    if r.items.is_empty() {
+        lines.push(Line::from("Nothing is moved; only the commands above run."));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("Total {}", both_usage(r.total)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" will be moved."),
+        ]));
+        lines.push(Line::from(
+            "It is not freed until you empty ToBeDeleted.".to_string(),
+        ));
+    }
     let sp = r.space;
     if sp.frees_now >= sp.footprint {
         lines.push(Line::from(Span::styled(
@@ -208,7 +251,7 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
         lines.push(Line::from(Span::styled(
             format!(
                 "Deleting for good frees about {} right now.",
-                human_size(sp.frees_now)
+                human_size(sp.frees_all())
             ),
             Style::default().fg(SAFE),
         )));
@@ -240,20 +283,40 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
             )));
         }
     }
-    lines.push(key_line(
-        g,
-        &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],
-    ));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "[ x ]",
-            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" Move, then empty now  {} cannot be undone", g.warn()),
-            Style::default().fg(DANGER),
-        ),
-    ]));
+    if r.commands.is_empty() {
+        lines.push(key_line(
+            g,
+            &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],
+        ));
+    } else {
+        // Commands cannot be undone, so Enter does nothing here.
+        lines.push(key_line(
+            g,
+            &[
+                (
+                    "y",
+                    if r.items.is_empty() {
+                        "Run the commands"
+                    } else {
+                        "Move, then run the commands"
+                    },
+                ),
+                ("Esc", "Cancel"),
+            ],
+        ));
+    }
+    if !r.items.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "[ x ]",
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" Move, then empty now  {} cannot be undone", g.warn()),
+                Style::default().fg(DANGER),
+            ),
+        ]));
+    }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -360,6 +423,12 @@ fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress, scale:
     let what = match p.phase {
         Phase::Moving => "Moving files to ToBeDeleted",
         Phase::Deleting => "Deleting for good",
+        Phase::Command => "Running cleanup commands",
+    };
+    let sizes = if p.phase == Phase::Command {
+        format!("running: {}", fit(&p.current.to_string_lossy(), 50, g))
+    } else {
+        format!("{} of {}", human_size(p.usage.size), both_usage(p.of))
     };
     let bar_w = (inner.width as usize).saturating_sub(7);
     let lines = vec![
@@ -373,11 +442,7 @@ fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress, scale:
             Span::raw(format!(" {:>3}%", (frac * 100.0).floor() as u32)),
         ]),
         Line::from(format!("{} / {} items", p.done, p.total)),
-        Line::from(format!(
-            "{} of {}",
-            human_size(p.usage.size),
-            both_usage(p.of)
-        )),
+        Line::from(sizes),
         Line::from(Span::styled(
             fit_start(&p.current.to_string_lossy(), inner.width as usize, g),
             Style::default().fg(DIM),
@@ -439,6 +504,22 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
                 None => format!("{} item(s) could not be processed", f.failures),
             },
             Style::default().fg(DANGER),
+        )));
+    }
+    for c in &f.commands {
+        let (mark, color) = if c.ok {
+            (g.check(), SAFE)
+        } else {
+            (g.warn(), DANGER)
+        };
+        let note = if c.ok || c.note.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", fit(&c.note, 40, g))
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{mark} {}{note}", c.line),
+            Style::default().fg(color),
         )));
     }
     lines.push(Line::from(format!(

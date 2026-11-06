@@ -207,11 +207,15 @@ mod fake {
 
     /// Records every command and never touches the system. `answers` are
     /// matched as substrings of `CommandSpec::full()` for queries.
+    type Probe = Box<dyn Fn(&CommandSpec) + Send + Sync>;
+
     pub struct FakeRunner {
         programs: Vec<String>,
         failing: Vec<String>,
         answers: Vec<(String, String)>,
         calls: Mutex<Vec<CommandSpec>>,
+        delay: std::time::Duration,
+        probe: Option<Probe>,
     }
 
     impl FakeRunner {
@@ -221,7 +225,21 @@ mod fake {
                 failing: Vec::new(),
                 answers: Vec::new(),
                 calls: Mutex::new(Vec::new()),
+                delay: std::time::Duration::ZERO,
+                probe: None,
             }
+        }
+
+        /// Every `run` takes this long (to prove the UI does not wait).
+        pub fn slow(mut self, delay: std::time::Duration) -> FakeRunner {
+            self.delay = delay;
+            self
+        }
+
+        /// Called with each command just before it "runs".
+        pub fn probing(mut self, f: impl Fn(&CommandSpec) + Send + Sync + 'static) -> FakeRunner {
+            self.probe = Some(Box::new(f));
+            self
         }
 
         /// Commands whose `display()` equals one of these fail.
@@ -245,6 +263,10 @@ mod fake {
 
     impl CommandRunner for FakeRunner {
         fn run(&self, spec: &CommandSpec) -> CommandResult {
+            if let Some(p) = &self.probe {
+                p(spec);
+            }
+            std::thread::sleep(self.delay);
             self.calls.lock().unwrap().push(spec.clone());
             let ok = !self.failing.contains(&spec.display());
             CommandResult {

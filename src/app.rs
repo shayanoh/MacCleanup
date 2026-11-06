@@ -7,11 +7,11 @@ use ratatui::layout::Rect;
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
 use crate::bg::Latest;
-use crate::catalog::{CommandRunner, SystemRunner, ToolEntry, discover_tools};
+use crate::catalog::{CommandRunner, CommandSpec, SystemRunner, ToolEntry, discover_tools};
 use crate::filter;
 use crate::fmt::both_usage;
 use crate::glyphs::Glyphs;
-use crate::jobs::{DeleteEvent, DeleteJob, DeleteMode, Phase};
+use crate::jobs::{CommandEvent, CommandJob, DeleteEvent, DeleteJob, DeleteMode, Phase};
 use crate::safety::{Policy, Safety};
 use crate::scan::{Node, Row, Scanner, Space, file_space, locate};
 use crate::softdelete::{HeldItem, Holding};
@@ -163,9 +163,32 @@ pub struct ReviewItem {
     pub safety: Safety,
 }
 
+/// A tool's own cleanup command in the review.
+#[derive(Clone, Debug)]
+pub struct ReviewCommand {
+    pub id: String,
+    pub tool: String,
+    /// `pnpm store prune`
+    pub line: String,
+    pub spec: CommandSpec,
+    /// The most it might free (what deleting its folder alone would).
+    pub up_to: u64,
+}
+
+/// How one cleanup command ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandOutcome {
+    pub line: String,
+    pub ok: bool,
+    /// The last line the command printed.
+    pub note: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Review {
     pub items: Vec<ReviewItem>,
+    /// Tool commands to run after the folders are moved.
+    pub commands: Vec<ReviewCommand>,
     pub total: Usage,
     /// Where the marked items' disk space would go: freed now, held by
     /// snapshots, or shared with clones and hard links that stay.
@@ -192,6 +215,8 @@ pub struct FinishInfo {
     pub failures: usize,
     /// Why the first item failed, if any did.
     pub first_failure: Option<String>,
+    /// How each tool command ended (empty when none ran).
+    pub commands: Vec<CommandOutcome>,
     /// App tick when the finish screen opened (drives the count-up).
     pub started_tick: u64,
 }
@@ -364,6 +389,11 @@ pub struct App {
     holders_key: Option<PathBuf>,
     pub runner: Arc<dyn CommandRunner>,
     job: Option<DeleteJob>,
+    cmd_job: Option<CommandJob>,
+    /// Ids and commands waiting to run (or running) after the moves.
+    pending_commands: Vec<(String, CommandSpec)>,
+    cmd_outcomes: Vec<CommandOutcome>,
+    last_moves: (Usage, Usage, usize),
     job_mode: DeleteMode,
     job_free_before: u64,
     job_failure: Option<String>,
@@ -480,6 +510,10 @@ impl App {
             holders_key: None,
             runner: Arc::new(SystemRunner),
             job: None,
+            cmd_job: None,
+            pending_commands: Vec::new(),
+            cmd_outcomes: Vec::new(),
+            last_moves: (Usage::default(), Usage::default(), 0),
             job_mode: DeleteMode::SoftOnly,
             job_free_before: 0,
             job_failure: None,
@@ -814,7 +848,7 @@ impl App {
     /// Quitting while a delete is running would kill it half-way, so wait
     /// for it to finish first.
     fn request_quit(&mut self) {
-        if self.job.is_some() {
+        if self.job.is_some() || self.cmd_job.is_some() {
             self.quit_after_job = true;
             self.notice = Some("Finishing the delete before quitting...".to_string());
         } else if matches!(self.dialog, Some(Dialog::QuitWarning(_))) || self.held.is_empty() {
@@ -831,6 +865,7 @@ impl App {
     fn on_tick(&mut self) {
         self.tick += 1;
         self.poll_job();
+        self.poll_commands();
         if self.animations {
             self.free_shown.step(self.free_now as f64, 0.15);
         } else {
@@ -1170,16 +1205,24 @@ impl App {
             self.set_exact = true;
             return;
         }
-        let root = Arc::clone(&self.stack[0]);
+        let inputs = self.joint_inputs();
+        let view = self.scanner.view();
+        self.set_exact = self.scanner.is_idle();
+        self.set_space.spawn(move || joint_of(&view, inputs));
+    }
+
+    /// What the set-wise calculation needs, copied so a thread can use it.
+    fn joint_inputs(&self) -> JointInputs {
+        let root = &self.stack[0];
         let (mut nodes, mut files) = (Vec::new(), Vec::new());
-        for p in self.marks.keys() {
-            match locate(&root, p) {
+        for (p, u) in &self.marks {
+            match locate(root, p) {
                 Some(n) => nodes.push(n),
-                None => files.push(p.clone()),
+                None => files.push((p.clone(), *u)),
             }
         }
         // Folders behind marked tool commands (unless a marked folder covers them).
-        let tool_nodes: Vec<Arc<Node>> = self
+        let tool_nodes = self
             .targets
             .groups
             .iter()
@@ -1193,23 +1236,11 @@ impl App {
             })
             .filter_map(|r| r.row.node.clone())
             .collect();
-        let view = self.scanner.view();
-        self.set_exact = self.scanner.is_idle();
-        self.set_space.spawn(move || {
-            let add_files = |mut sp: Space| {
-                for f in &files {
-                    if let Ok(fs) = file_space(f) {
-                        sp = sp + fs;
-                    }
-                }
-                sp
-            };
-            let base = add_files(view.space_of_set(&nodes));
-            let mut all = nodes;
-            all.extend(tool_nodes);
-            let with_tools = add_files(view.space_of_set(&outermost(all)));
-            JointSpace { base, with_tools }
-        });
+        JointInputs {
+            nodes,
+            files,
+            tool_nodes,
+        }
     }
 
     /// What deleting everything marked frees, as a set; `None` while it is
@@ -1320,10 +1351,11 @@ impl App {
     }
 
     fn open_review(&mut self) {
-        if self.screen != Screen::Explorer {
+        if !matches!(self.screen, Screen::Explorer | Screen::Targets) {
             return;
         }
-        if self.marks.is_empty() {
+        let commands = self.review_commands();
+        if self.marks.is_empty() && commands.is_empty() {
             self.notice = Some("Nothing marked yet. Press space to mark items.".to_string());
             return;
         }
@@ -1343,15 +1375,41 @@ impl App {
                 .then_with(|| a.path.cmp(&b.path))
         });
         let total = items.iter().map(|i| i.usage).sum();
-        let space = items
-            .iter()
-            .map(|item| self.space_of(&item.path, item.usage))
-            .sum();
+        // The same figure the footer shows, unless it is still being worked out.
+        let space = match (self.set_space.pending, self.set_space.value) {
+            (false, Some(j)) => j.base,
+            _ => joint_of(&self.scanner.view(), self.joint_inputs()).base,
+        };
         self.dialog = Some(Dialog::Review(Review {
             items,
+            commands,
             total,
             space,
         }));
+    }
+
+    /// The marked tool commands, as the review lists them.
+    fn review_commands(&self) -> Vec<ReviewCommand> {
+        self.targets
+            .groups
+            .iter()
+            .flat_map(|g| g.rows.iter().map(move |r| (g, r)))
+            .filter_map(|(g, r)| match &r.kind {
+                crate::targets::RowKind::Command { id, spec }
+                    if self.tool_marks.contains(id)
+                        && !self.marks.keys().any(|m| r.row.path.starts_with(m)) =>
+                {
+                    Some(ReviewCommand {
+                        id: id.clone(),
+                        tool: g.title.clone(),
+                        line: spec.display(),
+                        spec: spec.clone(),
+                        up_to: r.row.frees.unwrap_or(0),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Where the selected row's disk space would go (explorer only).
@@ -1390,24 +1448,6 @@ impl App {
                 space: file_space(&row.path).ok()?,
                 complete: true,
             })
-        }
-    }
-
-    /// Where a marked path's disk space would go. Unknown paths count as
-    /// plain files that free everything.
-    fn space_of(&self, path: &Path, usage: Usage) -> Space {
-        let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
-        if is_dir {
-            if let Some(node) = locate(&self.stack[0], path) {
-                return self.scanner.space(&node);
-            }
-        } else if let Ok(space) = file_space(path) {
-            return space;
-        }
-        Space {
-            footprint: usage.disk,
-            frees_now: usage.disk,
-            ..Space::default()
         }
     }
 
@@ -1653,6 +1693,17 @@ impl App {
         self.job_mode = mode;
         self.job_free_before = self.free_now;
         self.job_failure = None;
+        self.last_moves = (Usage::default(), Usage::default(), 0);
+        self.cmd_outcomes.clear();
+        self.pending_commands = review
+            .commands
+            .iter()
+            .map(|c| (c.id.clone(), c.spec.clone()))
+            .collect();
+        if items.is_empty() {
+            self.start_commands();
+            return;
+        }
         let items_total: Usage = items.iter().map(|(_, u)| *u).sum();
         self.dialog = Some(Dialog::Deleting(DeleteProgress {
             done: 0,
@@ -1710,6 +1761,13 @@ impl App {
         }
         if let Some((moved, emptied, failures)) = finished {
             self.job = None;
+            if !self.pending_commands.is_empty() {
+                // The folders are moved; now the tools' own commands run.
+                self.moves_done(moved, emptied);
+                self.last_moves = (moved, emptied, failures);
+                self.start_commands();
+                return;
+            }
             let (mode, free_before) = (self.job_mode, self.job_free_before);
             self.after_delete(mode, moved, emptied, failures, free_before);
             if self.quit_after_job {
@@ -1728,19 +1786,7 @@ impl App {
         failures: usize,
         free_before: u64,
     ) {
-        if moved != Usage::default() {
-            self.accounting.record_soft_delete(moved);
-        }
-        if emptied != Usage::default() {
-            self.accounting.record_emptied(emptied);
-        }
-        // Marks of items that no longer exist were moved; failed ones stay.
-        self.marks
-            .retain(|p, _| std::fs::symlink_metadata(p).is_ok());
-        self.marks_changed();
-        self.refresh_free();
-        self.refresh_held();
-        self.refresh_rows();
+        self.moves_done(moved, emptied);
         let reason = self.job_failure.take();
         self.dialog = Some(match mode {
             DeleteMode::SoftThenEmpty | DeleteMode::EmptyHeld => Dialog::Finish(FinishInfo {
@@ -1750,6 +1796,7 @@ impl App {
                 free_after: self.free_now,
                 failures,
                 first_failure: reason,
+                commands: Vec::new(),
                 started_tick: self.tick,
             }),
             DeleteMode::SoftOnly => {
@@ -1766,6 +1813,109 @@ impl App {
                 Dialog::Notice(msg)
             }
         });
+    }
+
+    /// Book what a move job did and refresh everything that shows it.
+    fn moves_done(&mut self, moved: Usage, emptied: Usage) {
+        if moved != Usage::default() {
+            self.accounting.record_soft_delete(moved);
+        }
+        if emptied != Usage::default() {
+            self.accounting.record_emptied(emptied);
+        }
+        // Marks of items that no longer exist were moved; failed ones stay.
+        self.marks
+            .retain(|p, _| std::fs::symlink_metadata(p).is_ok());
+        self.marks_changed();
+        self.refresh_free();
+        self.refresh_held();
+        self.refresh_rows();
+    }
+
+    /// Run the marked tool commands on a thread and show their progress.
+    fn start_commands(&mut self) {
+        let specs: Vec<CommandSpec> = self
+            .pending_commands
+            .iter()
+            .map(|(_, spec)| spec.clone())
+            .collect();
+        self.dialog = Some(Dialog::Deleting(DeleteProgress {
+            done: 0,
+            total: specs.len(),
+            usage: Usage::default(),
+            of: Usage::default(),
+            phase: Phase::Command,
+            current: PathBuf::new(),
+        }));
+        self.cmd_job = Some(CommandJob::start(Arc::clone(&self.runner), specs));
+    }
+
+    fn poll_commands(&mut self) {
+        let events = self
+            .cmd_job
+            .as_ref()
+            .map(CommandJob::poll)
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                CommandEvent::Started { index, total, line } => {
+                    if let Some(Dialog::Deleting(p)) = &mut self.dialog {
+                        p.done = index;
+                        p.total = total;
+                        p.phase = Phase::Command;
+                        p.current = PathBuf::from(line);
+                    }
+                }
+                CommandEvent::Done {
+                    line,
+                    ok,
+                    output_tail,
+                } => {
+                    let note = output_tail
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                        .trim()
+                        .chars()
+                        .take(100)
+                        .collect();
+                    self.cmd_outcomes.push(CommandOutcome { line, ok, note });
+                    if let Some(Dialog::Deleting(p)) = &mut self.dialog {
+                        p.done = self.cmd_outcomes.len();
+                    }
+                }
+                CommandEvent::Finished => self.commands_done(),
+            }
+        }
+    }
+
+    /// Every command has run: forget their marks and show how it went.
+    fn commands_done(&mut self) {
+        self.cmd_job = None;
+        for (id, _) in std::mem::take(&mut self.pending_commands) {
+            self.tool_marks.remove(&id);
+        }
+        self.marks_changed();
+        self.refresh_free();
+        self.refresh_held();
+        self.refresh_rows();
+        self.rebuild_targets();
+        let (moved, emptied, failures) = self.last_moves;
+        self.dialog = Some(Dialog::Finish(FinishInfo {
+            moved,
+            emptied,
+            free_before: self.job_free_before,
+            free_after: self.free_now,
+            failures,
+            first_failure: self.job_failure.take(),
+            commands: std::mem::take(&mut self.cmd_outcomes),
+            started_tick: self.tick,
+        }));
+        if self.quit_after_job {
+            self.quit_after_job = false;
+            self.request_quit();
+        }
     }
 
     fn restore_selected(&mut self) {
@@ -1844,6 +1994,32 @@ impl App {
 }
 
 /// Move `pos` by `delta` within `0..len` (len 0 stays 0), without overflow.
+/// The folders and files whose space is worked out together.
+struct JointInputs {
+    nodes: Vec<Arc<Node>>,
+    files: Vec<(PathBuf, Usage)>,
+    tool_nodes: Vec<Arc<Node>>,
+}
+
+fn joint_of(view: &crate::scan::SpaceView, inputs: JointInputs) -> JointSpace {
+    let add_files = |mut sp: Space| {
+        for (f, usage) in &inputs.files {
+            sp = sp
+                + file_space(f).unwrap_or(Space {
+                    footprint: usage.disk,
+                    frees_now: usage.disk,
+                    ..Space::default()
+                });
+        }
+        sp
+    };
+    let base = add_files(view.space_of_set(&inputs.nodes));
+    let mut all = inputs.nodes.clone();
+    all.extend(inputs.tool_nodes.iter().cloned());
+    let with_tools = add_files(view.space_of_set(&outermost(all)));
+    JointSpace { base, with_tools }
+}
+
 /// Keep only the outermost of a set of folders (drop any inside another).
 fn outermost(mut nodes: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
     nodes.sort_by_key(|n| n.path.components().count());
@@ -3909,5 +4085,227 @@ mod tests {
             assert!(e.app.marks.contains_key(&e.home.join(p)), "{p}");
         }
         assert!(e.app.joint_frees().unwrap() >= 200_000);
+    }
+
+    // --- tool commands in the shared review -----------------------------
+
+    use crate::catalog::command::FakeRunner;
+    use crate::catalog::{CommandSpec, Mode, ToolEntry};
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::time::Duration;
+
+    /// Two command rows (`Store`, `Other`) and two projects with node_modules.
+    fn command_app(runner: Arc<FakeRunner>) -> crate::testutil::Env {
+        let mut e = env_with(
+            &[
+                ("Library/Caches/Store/f", 200_000),
+                ("Library/Caches/Other/f", 100_000),
+                ("p1/package.json", 10),
+                ("p1/node_modules/f", 50_000),
+            ],
+            |_| {},
+        );
+        e.app.runner = runner;
+        let mk = |id: &str, rel: &str| ToolEntry {
+            id: id.to_string(),
+            tool: "Tool".to_string(),
+            label: id.to_string(),
+            path: e.home.join(rel),
+            regen: "again".to_string(),
+            mode: Mode::Command(CommandSpec::new(&format!("/x/{id}"), &["clean"])),
+            note: None,
+        };
+        e.app.tool_entries = vec![
+            mk("store", "Library/Caches/Store"),
+            mk("other", "Library/Caches/Other"),
+        ];
+        e.app.update(Action::GoTo(Screen::Targets));
+        wait_tools(&mut e.app);
+        // Discovery replaced the entries with what it found; use ours.
+        e.app.tool_entries = vec![
+            mk("store", "Library/Caches/Store"),
+            mk("other", "Library/Caches/Other"),
+        ];
+        e.app.rebuild_targets();
+        e.app.focus = Focus::Main;
+        e
+    }
+
+    fn review_of(app: &App) -> &Review {
+        match &app.dialog {
+            Some(Dialog::Review(r)) => r,
+            other => panic!("expected the review, got {other:?}"),
+        }
+    }
+
+    fn finish_of(app: &App) -> &FinishInfo {
+        match &app.dialog {
+            Some(Dialog::Finish(f)) => f,
+            other => panic!("expected the finish screen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_review_lists_folders_and_commands_together() {
+        let mut e = command_app(Arc::new(FakeRunner::new(&[])));
+        let (nm, store) = (
+            e.home.join("p1/node_modules"),
+            e.home.join("Library/Caches/Store"),
+        );
+        mark_target(&mut e.app, &nm);
+        mark_target(&mut e.app, &store);
+        e.app.update(Action::OpenReview);
+        let r = review_of(&e.app);
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].path, nm);
+        assert_eq!(r.commands.len(), 1);
+        assert_eq!(r.commands[0].line, "store clean");
+        assert_eq!(r.commands[0].spec.program, "/x/store");
+    }
+
+    #[test]
+    fn a_review_opens_from_the_explorer_with_marks_made_on_targets() {
+        let mut e = command_app(Arc::new(FakeRunner::new(&[])));
+        let nm = e.home.join("p1/node_modules");
+        mark_target(&mut e.app, &nm);
+        e.app.update(Action::GoTo(Screen::Explorer));
+        e.app.update(Action::OpenReview);
+        assert_eq!(review_of(&e.app).items.len(), 1);
+    }
+
+    #[test]
+    fn review_total_matches_the_joint_figure() {
+        let mut e = shared_app();
+        for p in ["p1/node_modules", "p2/node_modules", "Library/Caches/Store"] {
+            mark_target(&mut e.app, &e.home.join(p));
+        }
+        wait_sets(&mut e.app);
+        let joint = e.app.joint_frees().unwrap();
+        assert!(joint >= 200_000);
+        e.app.update(Action::OpenReview);
+        assert_eq!(review_of(&e.app).space.frees_all(), joint);
+    }
+
+    #[test]
+    fn nothing_runs_without_the_confirmation() {
+        let fake = Arc::new(FakeRunner::new(&[]));
+        let mut e = command_app(fake.clone());
+        let store = e.home.join("Library/Caches/Store");
+        mark_target(&mut e.app, &store);
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Cancel);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(fake.calls().is_empty());
+        assert!(e.app.tool_marks.contains("store"), "the mark stays");
+    }
+
+    #[test]
+    fn commands_run_after_the_folders_are_moved() {
+        let moved_first = Arc::new(AtomicBool::new(false));
+        let watch = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let (flag, w) = (Arc::clone(&moved_first), Arc::clone(&watch));
+        let fake = Arc::new(FakeRunner::new(&[]).probing(move |_| {
+            if let Some(p) = w.lock().unwrap().as_ref() {
+                flag.store(!p.exists(), AtomicOrdering::SeqCst);
+            }
+        }));
+        let mut e = command_app(fake.clone());
+        let nm = e.home.join("p1/node_modules");
+        *watch.lock().unwrap() = Some(nm.clone());
+        mark_target(&mut e.app, &nm);
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        assert!(
+            moved_first.load(AtomicOrdering::SeqCst),
+            "the folder was already moved when the command started"
+        );
+        assert_eq!(fake.calls().len(), 1);
+        assert!(!nm.exists());
+    }
+
+    #[test]
+    fn a_failing_command_neither_stops_the_next_nor_undoes_the_moves() {
+        let fake = Arc::new(FakeRunner::new(&[]).failing(&["store clean"]));
+        let mut e = command_app(fake.clone());
+        let nm = e.home.join("p1/node_modules");
+        for p in [
+            nm.clone(),
+            e.home.join("Library/Caches/Store"),
+            e.home.join("Library/Caches/Other"),
+        ] {
+            mark_target(&mut e.app, &p);
+        }
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        assert_eq!(fake.calls().len(), 2, "both commands ran");
+        assert!(!nm.exists(), "the folder stays moved");
+        let f = finish_of(&e.app);
+        let oks: Vec<_> = f.commands.iter().map(|c| (c.line.as_str(), c.ok)).collect();
+        assert_eq!(oks, [("store clean", false), ("other clean", true)]);
+    }
+
+    #[test]
+    fn x_moves_then_empties_the_folders_and_still_runs_the_commands() {
+        let fake = Arc::new(FakeRunner::new(&[]));
+        let mut e = command_app(fake.clone());
+        let nm = e.home.join("p1/node_modules");
+        mark_target(&mut e.app, &nm);
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::ConfirmIrreversible);
+        assert!(matches!(e.app.dialog, Some(Dialog::Irreversible(_))));
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        assert!(e.app.holding.list().unwrap().is_empty(), "emptied for good");
+        assert!(!nm.exists());
+        assert_eq!(fake.calls().len(), 1);
+        assert!(finish_of(&e.app).emptied.size > 0);
+    }
+
+    #[test]
+    fn a_review_of_only_commands_runs_and_clears_their_marks() {
+        let fake = Arc::new(FakeRunner::new(&[]));
+        let mut e = command_app(fake.clone());
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        e.app.update(Action::OpenReview);
+        assert!(review_of(&e.app).items.is_empty());
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        assert_eq!(fake.calls().len(), 1);
+        assert!(e.app.tool_marks.is_empty());
+        assert_eq!(finish_of(&e.app).commands.len(), 1);
+    }
+
+    #[test]
+    fn the_ui_does_not_wait_for_a_slow_command() {
+        let fake = Arc::new(FakeRunner::new(&[]).slow(Duration::from_millis(400)));
+        let mut e = command_app(fake);
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        e.app.update(Action::OpenReview);
+        let started = std::time::Instant::now();
+        e.app.update(Action::Confirm);
+        e.app.update(Action::Tick);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(matches!(e.app.dialog, Some(Dialog::Deleting(_))));
+        settle(&mut e.app);
+    }
+
+    #[test]
+    fn quitting_waits_for_a_running_command() {
+        let fake = Arc::new(FakeRunner::new(&[]).slow(Duration::from_millis(300)));
+        let mut e = command_app(fake);
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        e.app.update(Action::Quit);
+        assert!(!e.app.should_quit, "the command is still running");
+        settle(&mut e.app);
+        for _ in 0..20 {
+            e.app.update(Action::Tick);
+        }
+        assert!(e.app.should_quit);
     }
 }

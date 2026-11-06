@@ -105,6 +105,13 @@ fn dialog_key(code: KeyCode, dialog: &Dialog) -> Option<Action> {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Enter => Some(Action::Cancel),
             _ => None,
         },
+        // Tool commands cannot be undone: only an explicit `y` runs them.
+        Dialog::Review(r) if !r.commands.is_empty() => match code {
+            KeyCode::Char('y') => Some(Action::Confirm),
+            KeyCode::Char('x') if !r.items.is_empty() => Some(Action::ConfirmIrreversible),
+            KeyCode::Esc | KeyCode::Char('n') => Some(Action::Cancel),
+            _ => None,
+        },
         Dialog::Review(_) => match code {
             KeyCode::Enter => Some(Action::Confirm),
             KeyCode::Char('x') => Some(Action::ConfirmIrreversible),
@@ -501,5 +508,61 @@ mod tests {
             Some(Action::Quit),
             "Ctrl-C twice quits"
         );
+    }
+
+    fn review_with(items: usize, commands: usize) -> Dialog {
+        use crate::app::{Review, ReviewCommand, ReviewItem};
+        use crate::catalog::CommandSpec;
+        use crate::safety::Safety;
+        use crate::usage::Usage;
+        Dialog::Review(Review {
+            items: (0..items)
+                .map(|i| ReviewItem {
+                    path: format!("/x/{i}").into(),
+                    usage: Usage::default(),
+                    safety: Safety::Safe,
+                })
+                .collect(),
+            commands: (0..commands)
+                .map(|i| ReviewCommand {
+                    id: format!("c{i}"),
+                    tool: "t".to_string(),
+                    line: "tool clean".to_string(),
+                    spec: CommandSpec::new("tool", &["clean"]),
+                    up_to: 0,
+                })
+                .collect(),
+            total: Usage::default(),
+            space: Default::default(),
+        })
+    }
+
+    #[test]
+    fn a_review_with_commands_is_confirmed_only_by_y() {
+        let d = review_with(1, 1);
+        assert_eq!(
+            dialog_key(KeyCode::Enter, &d),
+            None,
+            "Enter never runs a command"
+        );
+        assert_eq!(dialog_key(KeyCode::Char('y'), &d), Some(Action::Confirm));
+        assert_eq!(
+            dialog_key(KeyCode::Char('x'), &d),
+            Some(Action::ConfirmIrreversible)
+        );
+        assert_eq!(dialog_key(KeyCode::Esc, &d), Some(Action::Cancel));
+    }
+
+    #[test]
+    fn a_review_of_only_commands_has_no_move_then_empty() {
+        let d = review_with(0, 2);
+        assert_eq!(dialog_key(KeyCode::Char('x'), &d), None);
+        assert_eq!(dialog_key(KeyCode::Char('y'), &d), Some(Action::Confirm));
+    }
+
+    #[test]
+    fn a_review_of_folders_only_still_confirms_with_enter() {
+        let d = review_with(2, 0);
+        assert_eq!(dialog_key(KeyCode::Enter, &d), Some(Action::Confirm));
     }
 }
