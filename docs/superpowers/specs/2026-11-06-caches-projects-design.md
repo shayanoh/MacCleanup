@@ -122,3 +122,26 @@ How it works:
 - The exact registry contents and commands per tool, verified against each tool's current documentation before use (not from memory).
 - Key choices not named above, wording, colors beyond the section bands.
 - Test plan, with emphasis on: the set-wise identity with clones, the keep-one-project case, marker-based detection, registry paths, review listing of commands, and the Explorer-consistency rule where it can be asserted (column order, sort cycle).
+
+## 11. As built (2026-11-06) and deferred items
+
+Implemented on branch `feat/caches-projects` per `docs/superpowers/plans/2026-11-06-caches-projects.md`. Decisions made while building (all **[My call]**, open to change):
+
+- Tool entries are discovered on a background thread (`catalog::discover_tools`); `ToolEntry` has `String` ids and one folder path each. The list itself (`Targets::build`) is built on a `bg::Latest` worker; sorting and folds are re-applied when it lands.
+- Row Frees columns stay per-row (what deleting that row alone frees). Section bands show the joint figure for the marked folders of that section; group headers show sums and a marked count; the footer shows the joint figure for the whole selection. There is no "+N if X is marked" what-if figure: the details pane lists the related folders with their state and `m` marks them.
+- The review's headline "frees about" is `frees_all` (the same figure as the footer). A review opened while that figure is still being worked out shows "Working out..." and fills it in. Commands are always shown: the "via" lines are dropped first, and if they still do not fit the review says so and `y` is refused.
+- Project detection never offers install trees (editor extensions, Node/Rust version managers, `.app` bundles, pnpm's global folder) or anything inside an unmatched `node_modules`.
+- App caches skip `com.apple.*`. Caches that may hold offline downloads or saved media (Spotify, Telegram, WhatsApp, Netflix, Plex, Apple Music/Podcasts, sync clients, Lightroom, ML model caches...) are classified Caution with "hard to rebuild" text (`safety::keeps_offline_data`, matched at word starts); they can still be marked and deleted.
+- Sidebar widened to 22 columns; `4` opens the screen (`3` stays ToBeDeleted); `Esc` here clears the filter or quits.
+
+Deferred minor items (found by the final review, not fixed):
+
+- A marked folder spanning both sections counts in only one band's "frees" (the footer is right).
+- A command mark survives under a covering folder mark and comes back if the folder is unmarked (it is still reviewed and needs `y`).
+- Fixed-entry commands (go, pip, yarn, uv, brew) clean the tool's configured folder, which can differ from the default folder shown.
+- `catalog::resolve` keeps relative `PATH` entries.
+- The `x` (irreversible) dialog does not say that tool commands also run.
+- A panicking command-job thread would leave the "Working" dialog up; `bg::Latest` keeps the last good value after a worker panic.
+- No "clear the whole selection" key.
+- Offline-data detection is a name list: apps not on it (Discord/Slack media, Obsidian, Box, ...) still show as safe.
+- Not yet verified with a real run: whether `pnpm store prune` frees cloned (not hard-linked) packages; until then the pnpm row only promises an upper bound.
