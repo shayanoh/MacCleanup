@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
-use super::explorer::{Cols, cols, value_style};
+use super::explorer::{Cols, value_style};
 use super::graph::{self, GraphData};
 use super::targets::{highlight, work_text};
 use super::{
@@ -47,15 +47,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// The columns: the Explorer's layout, with the Last used column a little
-/// wider and no On disk column (Docker has one size).
+/// The columns: the Explorer's look, with Size, Frees, Last used and
+/// Created (no On disk column: Docker has one size). The share bar goes
+/// first when the pane is narrow.
 fn docker_cols(width: u16, g: &Glyphs) -> Cols {
-    let mut c = cols(width, g);
-    // cols() reserves three 9-wide columns and the 10-wide Modified one;
-    // Docker has 9 + 9 + 11 + 9.
-    c.name_w = c.name_w.saturating_sub(1).max(4);
-    c.show_share = c.show_share && c.name_w >= 12;
-    c
+    let (icon_w, mark_w, prefix_w) = super::explorer::prefix_widths(g);
+    let numbers = (1 + NUM_W) + (1 + NUM_W) + (1 + LAST_USED_W) + (1 + NUM_W);
+    let cw = width.saturating_sub(1) as usize; // last column: scrollbar
+    let show_share = cw >= prefix_w + numbers + 9 + 16;
+    let fixed = prefix_w + numbers + if show_share { 9 } else { 0 };
+    Cols {
+        icon_w,
+        mark_w,
+        prefix_w,
+        name_w: cw.saturating_sub(fixed).max(4),
+        show_share,
+        show_modified: false,
+    }
 }
 
 fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {

@@ -321,6 +321,21 @@ assert not os.path.exists(os.path.join(home, "ToBeDeleted", "items")) or not os.
 ), "cancelling must move nothing"
 assert os.path.exists(os.path.join(home, "shop", "node_modules", "dep", "index.js"))
 
+step("docker: 6 opens the page; with a throwaway HOME there is no Docker Desktop context, and it says so")
+send(b"6")
+end = time.time() + 6.0
+while time.time() < end:
+    t = screen.text()
+    if "Docker Desktop not found" in t or "Docker is not installed" in t or "IMAGES" in t:
+        break
+    pump(0.1)
+else:
+    fail("the Docker page never said anything")
+assert "Docker" in screen.text()
+send(b"\x1b[B")  # a stray key on an empty page must not crash
+pump(0.3)
+assert pid_alive(), "the Docker page must not crash the app"
+
 step("irreversible path asks twice and needs y")
 send(b"2")
 wait_for("marked: 0 items")

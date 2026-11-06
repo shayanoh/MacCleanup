@@ -497,7 +497,7 @@ use ratatui::style::{Color, Style};
 #[test]
 fn explorer_header_marks_the_sorted_column() {
     let mut e = explorer(GlyphMode::Nerd);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(
         text.contains("On disk ▼"),
         "default is on-disk, descending:\n{text}"
@@ -508,22 +508,22 @@ fn explorer_header_marks_the_sorted_column() {
     );
 
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Frees ▼"), "{text}");
     assert!(!text.contains("On disk ▼"), "{text}");
 
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Modified ▼"), "{text}");
     assert!(!text.contains("Frees ▼"), "{text}");
 
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Name ▲"), "{text}");
     assert!(!text.contains("Modified ▼"), "{text}");
 
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Size ▼"), "{text}");
     assert!(!text.contains("Name ▲"), "{text}");
 }
@@ -531,16 +531,16 @@ fn explorer_header_marks_the_sorted_column() {
 #[test]
 fn explorer_header_arrows_are_ascii_in_ascii_mode() {
     let mut e = explorer(GlyphMode::Ascii);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("On disk v"), "{text}");
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Frees v"), "{text}");
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Modified v"), "{text}");
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Name ^"), "{text}");
 }
 
@@ -2835,4 +2835,23 @@ fn docker_file_browser_filter_row_and_path_follow_the_folder() {
         t.contains("big.db") && !t.contains("b.txt") && !t.contains("sub dir"),
         "{t}"
     );
+}
+
+#[test]
+fn explorer_keeps_names_readable_on_a_narrow_terminal_by_dropping_modified() {
+    let mut e = explorer(GlyphMode::Nerd);
+    let t = render(&mut e.app, 100, 30);
+    assert!(t.contains("small.txt"), "the whole name fits:\n{t}");
+    assert!(
+        !t.contains("Modified"),
+        "the Modified column gives way first:\n{t}"
+    );
+}
+
+#[test]
+fn explorer_shows_modified_when_there_is_room_for_it() {
+    let mut e = explorer(GlyphMode::Nerd);
+    let t = render(&mut e.app, 170, 30);
+    assert!(t.contains("Modified"), "{t}");
+    assert!(t.contains("small.txt"), "{t}");
 }

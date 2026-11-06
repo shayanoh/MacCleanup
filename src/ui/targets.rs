@@ -412,7 +412,14 @@ fn group_line(app: &App, gi: usize, c: &Cols) -> TextLine<'static> {
         base,
         base.fg(Color::Yellow),
     );
-    spans.extend(number_spans(&grp.as_row(), false, app.sort, None, g));
+    spans.extend(number_spans(
+        &grp.as_row(),
+        false,
+        app.sort,
+        None,
+        c.show_modified,
+        g,
+    ));
     TextLine::from(spans)
 }
 
@@ -516,7 +523,14 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
             9,
         )
     });
-    spans.extend(number_spans(&r, queued, app.sort, frees_text, g));
+    spans.extend(number_spans(
+        &r,
+        queued,
+        app.sort,
+        frees_text,
+        c.show_modified,
+        g,
+    ));
     if c.show_share {
         let color = if queued { DIM } else { Color::Yellow };
         spans.push(Span::styled(
