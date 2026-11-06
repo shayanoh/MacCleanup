@@ -2712,3 +2712,37 @@ fn docker_finish_screen_reports_the_vm_disk_file() {
     let t = render(&mut e.app, 150, 40);
     assert!(t.contains("Docker VM disk file"), "{t}");
 }
+
+#[test]
+fn docker_vm_disk_row_shows_at_the_top_with_its_upper_bound() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, DOCKER_DF, true, true);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("VM DISK"), "{t}");
+    assert!(t.contains("Shrink VM disk"), "{t}");
+    let band = t.lines().position(|l| l.contains("VM DISK")).unwrap();
+    let images = t.lines().position(|l| l.contains("IMAGES")).unwrap();
+    assert!(band < images, "the VM disk comes first:\n{t}");
+    let detail = {
+        docker_cursor(&mut e, "vm:trim");
+        render(&mut e.app, 210, 50)
+    };
+    assert!(detail.contains("fstrim"), "{detail}");
+}
+
+#[test]
+fn docker_finish_says_unchanged_when_the_trim_gave_nothing_back() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, DOCKER_DF, true, true);
+    docker_cursor(&mut e, "vm:trim");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..2000 {
+        e.app.update(Action::Tick);
+        if matches!(e.app.dialog, Some(Dialog::Finish(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("unchanged"), "{t}");
+}

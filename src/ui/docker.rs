@@ -367,6 +367,7 @@ fn header_line(sort: DSort, c: &Cols, g: &Glyphs) -> TextLine<'static> {
 
 fn section_title(sec: DSection) -> (&'static str, Color) {
     match sec {
+        DSection::VmDisk => (" VM DISK", Color::Yellow),
         DSection::Images => (" IMAGES", Color::Blue),
         DSection::Volumes => (" VOLUMES", Color::Magenta),
         DSection::BuildCache => (" BUILD CACHE", Color::Green),
@@ -376,6 +377,7 @@ fn section_title(sec: DSection) -> (&'static str, Color) {
 /// The marked items of one kind of section.
 fn section_marked(app: &App, sec: DSection) -> std::collections::BTreeSet<String> {
     let kinds: &[&str] = match sec {
+        DSection::VmDisk => &["vm:"],
         DSection::Images => &["image:", "container:"],
         DSection::Volumes => &["volume:"],
         DSection::BuildCache => &["cache:"],
@@ -394,6 +396,7 @@ fn section_line(app: &App, sec: DSection, width: usize) -> TextLine<'static> {
         .items
         .values()
         .filter(|f| match sec {
+            DSection::VmDisk => f.kind == ItemKind::VmTrim,
             DSection::Images => matches!(f.kind, ItemKind::Image | ItemKind::Container),
             DSection::Volumes => f.kind == ItemKind::Volume,
             DSection::BuildCache => f.kind == ItemKind::CacheRecord,
@@ -600,10 +603,19 @@ fn row_line(
                 }
                 ItemKind::VmTrim => {}
             }
-            let frees = if f.kind == ItemKind::Container {
-                "-".to_string()
-            } else {
-                human_size(f.frees_alone)
+            let frees = match f.kind {
+                ItemKind::Container => "-".to_string(),
+                // A trim can give back at most the gap: say so.
+                ItemKind::VmTrim => format!(
+                    "{}{}",
+                    if g.mode == crate::glyphs::GlyphMode::Ascii {
+                        "<="
+                    } else {
+                        "≤"
+                    },
+                    human_size(f.frees_alone)
+                ),
+                _ => human_size(f.frees_alone),
             };
             (
                 if f.kind == ItemKind::CacheRecord {
@@ -1228,7 +1240,26 @@ fn detail_lines_raw(app: &App, width: usize) -> Vec<TextLine<'static>> {
                 }
             }
         }
-        ItemKind::VmTrim => {}
+        ItemKind::VmTrim => {
+            out.push(plain(
+                "Runs fstrim inside Docker's VM so space freed by deleting things goes back to the Mac. It runs by itself after every Docker removal, and you can run it alone here."
+                    .to_string(),
+            ));
+            out.push(TextLine::raw(""));
+            out.push(plain(format!(
+                "Docker.raw takes {} on this Mac; Docker uses {} inside it.",
+                human_size(f.size),
+                human_size(data.map_or(0, |d| d.in_use()))
+            )));
+            out.push(TextLine::from(Span::styled(
+                format!("At most {} can come back.", human_size(f.frees_alone)),
+                Style::default().fg(Color::Green),
+            )));
+            out.push(TextLine::from(Span::styled(
+                "It may give back less (or nothing) when nothing was freed in Docker since the last trim.",
+                dim,
+            )));
+        }
     }
     if !matches!(f.kind, ItemKind::Container | ItemKind::CacheRecord) {
         let users = holder_names(f);

@@ -335,6 +335,31 @@ pub fn analyse(data: &DockerData, layers: &Layers) -> Analysis {
         );
     }
 
+    // The VM disk file: what a trim can give back, at most.
+    if let Some(raw) = data.vm_allocated {
+        items.insert(
+            TRIM_ITEM.to_string(),
+            ItemFacts {
+                kind: ItemKind::VmTrim,
+                name: "Shrink VM disk".to_string(),
+                size: raw,
+                frees_alone: raw.saturating_sub(data.in_use()),
+                kept_by_others: 0,
+                created: 0,
+                last_used: 0,
+                last_used_is_proxy: false,
+                holders: Vec::new(),
+                needs: Vec::new(),
+                removable: Ok(()),
+                bulk_ok: false,
+                approximate: false,
+                dangling: false,
+                unused: false,
+                depth: 0,
+            },
+        );
+    }
+
     // The trees.
     let volume_node = |name: &str| TreeNode {
         id: volume_item(name),
@@ -758,6 +783,37 @@ mod tests {
         assert_eq!(p.children[0].id, "cache:c");
         assert_eq!(a.items["cache:c"].depth, 1);
         assert_eq!(a.items["cache:p"].depth, 0);
+    }
+
+    #[test]
+    fn the_vm_trim_item_exists_only_when_the_vm_disk_is_known() {
+        let mut data = DockerData {
+            volumes: vec![volume("data", 40)],
+            layers_size: 10,
+            ..DockerData::default()
+        };
+        assert!(!analyse(&data, &Layers::new()).items.contains_key(TRIM_ITEM));
+        data.vm_allocated = Some(100);
+        let a = analyse(&data, &Layers::new());
+        let t = &a.items[TRIM_ITEM];
+        assert_eq!(t.kind, ItemKind::VmTrim);
+        assert_eq!(
+            (t.size, t.frees_alone),
+            (100, 50),
+            "100 on disk, 10 + 40 in use"
+        );
+        assert_eq!(t.removable, Ok(()));
+        assert!(!t.bulk_ok, "never taken by a bulk mark");
+        // An upper bound is never negative, and it frees nothing by itself.
+        data.vm_allocated = Some(30);
+        assert_eq!(
+            analyse(&data, &Layers::new()).items[TRIM_ITEM].frees_alone,
+            0
+        );
+        assert_eq!(
+            frees_of_set(&a, &data, &Layers::new(), &set(&[TRIM_ITEM])),
+            0
+        );
     }
 
     #[test]

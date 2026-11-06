@@ -380,9 +380,17 @@ impl App {
     /// Mark (or unmark) everything in a section that is safe to take in
     /// bulk: dangling images and unused build cache. Volumes never are.
     fn mark_docker_section(&mut self, section: DSection) {
-        if section == DSection::Volumes {
-            self.notice = Some("Volumes hold data: mark them one at a time".to_string());
-            return;
+        match section {
+            DSection::Volumes => {
+                self.notice = Some("Volumes hold data: mark them one at a time".to_string());
+                return;
+            }
+            DSection::VmDisk => {
+                self.notice =
+                    Some("Mark the Shrink VM disk row itself (space on the row)".to_string());
+                return;
+            }
+            _ => {}
         }
         let start = self.docker.cursor + 1;
         let ids: Vec<String> = self.docker.lines[start.min(self.docker.lines.len())..]
@@ -743,6 +751,62 @@ mod tests {
         assert!(e.app.tool_marks.is_empty());
         mark(&mut e.app, "container:c0ffee2");
         assert!(e.app.tool_marks.contains("vm:trim"));
+    }
+
+    /// An app whose home holds a Docker.raw, so the trim row exists.
+    fn app_with_vm_disk(fake: Arc<FakeRunner>) -> crate::testutil::Env {
+        let mut e = env(&[("a.txt", 10)]);
+        let raw = e
+            .home
+            .join("Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw");
+        std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        std::fs::write(&raw, vec![1u8; 8192]).unwrap();
+        e.app.runner = fake;
+        e.app.update(Action::GoTo(Screen::Docker));
+        wait_docker(&mut e.app);
+        e
+    }
+
+    #[test]
+    fn the_trim_row_alone_runs_only_the_build_and_the_trim() {
+        let fake = healthy();
+        let mut e = app_with_vm_disk(fake.clone());
+        cursor_on(&mut e.app, "vm:trim");
+        e.app.update(Action::ToggleMark);
+        assert_eq!(e.app.docker_marked().len(), 1);
+        e.app.update(Action::OpenReview);
+        assert_eq!(review_lines(&e.app).len(), 2);
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        let ran: Vec<String> = fake.calls().iter().map(|c| c.display()).collect();
+        assert!(
+            ran[0].contains("build") && ran[1].contains("--privileged"),
+            "{ran:?}"
+        );
+        let (before, after) = finish_of(&e.app).vm_disk.unwrap();
+        assert_eq!(
+            before, after,
+            "nothing changed in the fake: zero is reported as zero"
+        );
+    }
+
+    #[test]
+    fn the_vm_disk_section_is_never_bulk_marked() {
+        let mut e = app_with_vm_disk(healthy());
+        cursor_on(&mut e.app, "section:vm");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.tool_marks.is_empty());
+        assert!(e.app.notice.is_some());
+    }
+
+    #[test]
+    fn unmarking_the_trim_row_with_removals_marked_declines_it() {
+        let mut e = app_with_vm_disk(healthy());
+        mark(&mut e.app, "container:c0ffee2");
+        assert!(e.app.tool_marks.contains("vm:trim"));
+        mark(&mut e.app, "vm:trim");
+        assert!(!e.app.tool_marks.contains("vm:trim"));
+        assert!(e.app.docker.trim_declined);
     }
 
     #[test]

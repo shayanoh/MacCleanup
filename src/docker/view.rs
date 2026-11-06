@@ -11,6 +11,8 @@ use crate::filter::Query;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DSection {
+    /// The VM disk file (one row: shrink it).
+    VmDisk,
     Images,
     Volumes,
     BuildCache,
@@ -19,6 +21,7 @@ pub enum DSection {
 impl DSection {
     pub fn key(self) -> &'static str {
         match self {
+            DSection::VmDisk => "section:vm",
             DSection::Images => "section:images",
             DSection::Volumes => "section:volumes",
             DSection::BuildCache => "section:cache",
@@ -35,6 +38,8 @@ pub enum DKind {
     Container,
     Volume,
     Cache,
+    /// The "shrink the VM disk" row.
+    Trim,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,7 +102,8 @@ fn kind_of(k: ItemKind) -> DKind {
         ItemKind::Image => DKind::Image,
         ItemKind::Container => DKind::Container,
         ItemKind::Volume => DKind::Volume,
-        ItemKind::CacheRecord | ItemKind::VmTrim => DKind::Cache,
+        ItemKind::CacheRecord => DKind::Cache,
+        ItemKind::VmTrim => DKind::Trim,
     }
 }
 
@@ -247,9 +253,23 @@ impl DockerView {
             filtering: !filter.is_empty(),
         };
         let mut out = Vec::new();
-        for section in [DSection::Images, DSection::Volumes, DSection::BuildCache] {
+        for section in [
+            DSection::VmDisk,
+            DSection::Images,
+            DSection::Volumes,
+            DSection::BuildCache,
+        ] {
             let mut body = Vec::new();
             match section {
+                DSection::VmDisk => {
+                    if a.items.contains_key(crate::docker::analysis::TRIM_ITEM) {
+                        let node = TreeNode {
+                            id: crate::docker::analysis::TRIM_ITEM.to_string(),
+                            children: Vec::new(),
+                        };
+                        self.node_lines(&ctx, &node, 1, &[], &mut body);
+                    }
+                }
                 DSection::Images => {
                     for n in self.sorted(&ctx, a.images.iter().chain(&a.orphan_containers)) {
                         self.node_lines(&ctx, n, 1, &[], &mut body);
@@ -362,6 +382,21 @@ mod tests {
             ["section:images", "section:volumes", "section:cache"]
         );
         assert!(lines.iter().filter(|l| l.depth == 0).count() == 3);
+    }
+
+    #[test]
+    fn the_vm_disk_row_is_a_section_of_its_own_at_the_top_when_known() {
+        let mut f = fixture();
+        assert!(!keys(&view_lines(&f, &closed(&f), "")).contains(&"vm:trim"));
+        f.data.vm_allocated = Some(5_000);
+        f.a = analyse(&f.data, &f.layers);
+        let lines = view_lines(&f, &closed(&f), "");
+        assert_eq!(lines[0].key, "section:vm");
+        assert_eq!(lines[1].key, "vm:trim");
+        assert_eq!((lines[1].depth, lines[1].kind), (1, DKind::Trim));
+        // The filter reaches it by its name.
+        let filtered = view_lines(&f, &closed(&f), "shrink");
+        assert_eq!(keys(&filtered), ["section:vm", "vm:trim"]);
     }
 
     #[test]
