@@ -38,9 +38,21 @@ Press `5` (or choose it in the menu). It uses the Explorer's columns, sort, filt
 - **Stuck or slow commands:** while a tool command runs, the Working window shows its live output, how long it has run, and `Esc` stops it (it kills the command and anything it started, and skips the commands after it; folder moves already made stay). `q` or `Ctrl-C` stop it and quit. `uv cache clean` waits up to 5 minutes when another uv process holds the cache (a `uv run` server, for example), then fails; the window and the result screen say so in plain words. For commands that have a force form (`uv cache clean --force`), the review has an `f` key to switch to it (drawn in red, with a warning that it skips uv's in-use check), and after a lock failure the result screen offers `f` to retry with `--force` through the review, which still needs `y`.
 - **Tool commands:** caches that have their own clean command (pnpm, npm, Yarn, Go, uv, pip, Homebrew) are cleaned by that command, listed in the review with the exact install it runs. Each pnpm store version (`store/v10`, `store/v11`) is pruned by the pnpm that owns it; installs under fnm, nvm and volta, including corepack shims, are found, and commands run in your home folder with downloads and prompts disabled, so they cannot hang. A review that runs commands needs an explicit `y` (never `Enter`), and a failing command does not stop the others or undo the moves.
 
+### Docker
+
+Press `6` (needs Docker Desktop). One list, drawn like Caches & Projects, of everything Docker holds, with what is connected to what: a **VM DISK** row, then **IMAGES** (an image holds the containers made from it, and a container holds the volumes it mounts), **VOLUMES** nobody uses, and the **BUILD CACHE**. Columns: Size, Frees, Last used, Created (the last two give way on a narrow terminal so names stay readable).
+
+- **Exact numbers, worked out here:** Docker's own "unique size" can be wrong (it can even be negative), so shared and unique sizes come from the layers themselves. **Frees** is what removing just that item frees inside Docker; for several items marked together it is worked out as a set (a layer two images share is freed only when both are marked).
+- **Layers and build steps:** open an image to see its layers, each with the command that made it, its size, whether other images share it, and the biggest one. The details pane shows the **whole** command (wrapped; `J` / `K` scroll it when it does not fit).
+- **Last used** is Docker's own for build cache. For images and volumes Docker records nothing, so it is worked out from their containers and shown with a `~`; the details pane says so.
+- **Look inside:** `b` (or `Enter` on an image or volume with nothing to unfold) lists the files of an image or volume read-only, with sizes (folders count everything inside, like the Explorer) and dates; `l` opens a folder, `h` goes up, `Esc` goes back. A volume is mounted read-only (no network) in a tiny helper image of ours; an image runs only its own shell to list a folder (no network, read-only root), so images without a shell cannot be browsed. Containers cannot be listed without starting them, so they are not browsable.
+- **Removing:** marks go into the same selection and review as everything else (`d` on any screen reviews all of it). Docker's own commands do the removal, in the order they need: containers, images, volumes, build cache. Docker removals cannot be undone, so they need `y`, bulk marks (a section) take only dangling images and unused build cache, and an image or volume held by stopped containers needs those containers marked too (`m` marks them); the review says so and refuses to run until they are.
+- **Giving the space back to the Mac:** deleting things inside Docker does not shrink `Docker.raw`. After any removal the app runs a trim inside Docker's VM (the `Shrink VM disk` row is marked for you; unmark it to skip it, or mark that row alone any time), and the finish screen shows what `Docker.raw` took on your Mac before and after. The trim runs from a 2.5 MB helper image the app builds itself (`maccleanup/vm-tools`, from `busybox:musl`).
+- **Safe by construction:** every Docker command uses the Docker Desktop context only, the app never uses `--force`, and `Docker.raw` and Docker Desktop's data folders are protected from being deleted as files in the Explorer and on Caches & Projects.
+
 ## Planned
 
-Next is the Docker panel (images, volumes, containers and build cache by name, with their relations, cleaned through Docker's own commands), then app leftovers and the app uninstaller, then the other candidates: a Time Machine snapshots screen (list, thin or delete them; for now the app only tells you how much they hold), simulators and runtimes, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed (their menu numbers already work and say they are coming).
+Next are app leftovers and the app uninstaller, then the other candidates: a Time Machine snapshots screen (list, thin or delete them; for now the app only tells you how much they hold), simulators and runtimes, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed (their menu numbers already work and say they are coming).
 
 ## Build and run
 
@@ -81,6 +93,9 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `1` to `7` | Open the page at that position in the menu (the number is shown beside each entry; planned pages say they are coming) |
 | `h` / `l` (Caches & Projects) | Fold / open the group; `l` or `Enter` on a row shows it in the Explorer |
 | `m` (Caches & Projects) | Mark the selected folder and every folder that shares its data |
+| `m` (Docker) | Mark the stopped containers the selected image or volume needs removed first |
+| `b` (Docker) | Look inside the selected image or volume, read-only (`l` / `Enter` open a folder, `h` up, `Esc` back, `/` filters) |
+| `J` / `K` (Docker) | Scroll the details pane (the whole command line of a layer or build step) |
 | `r` / `D` / `E` (ToBeDeleted screen) | Restore / delete for good / empty all |
 | `q`, `Esc` | Quit (`Esc` first clears an active filter, then goes up a folder; quitting asks first if ToBeDeleted still holds items). While a tool command runs, `Esc` cancels it and `q` / `Ctrl-C` cancel it and quit |
 | mouse | Click rows, menu entries, and treemap boxes or bars (a click on the graph selects that row in the list); scroll with the wheel |
@@ -96,6 +111,7 @@ In the review dialog the item list scrolls when it is longer than the window: `j
 - Tool commands run only after you confirm with `y` (never `Enter`). The app never adds a `--force` on its own: you choose it with `f` in the review (shown in red with a warning), or retry with it after a lock failure, and it still goes through the review. A running command can always be cancelled, and everything it started is stopped with it.
 - Build products (a built program, an APK, a bundle, a `dist` folder) are listed as separate rows marked *(kept)*; marking a project or a section never selects them. Caches that may hold offline downloads or saved media (Spotify, Telegram, model caches, sync clients...) are drawn as caution, never as safe, but you can still clear them.
 - SDKs and toolchain installs (a Flutter SDK, Node or Rust installs, editor extensions, app bundles) are recognised by their layout and never listed as projects, wherever they live.
+- Docker removals (`docker image rm`, `container rm`, `volume rm`, build-cache prune) cannot be undone: they run only after `y` in the review, volumes (which can hold databases) are never taken by a bulk mark, and anything a running container holds cannot be marked.
 - The app never asks for your password. (Admin-only actions are planned: it will show the exact command with a copy button, you run it in another terminal, and then confirm in the app.)
 
 ## Development

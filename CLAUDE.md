@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-MacCleanup is a Rust TUI (colorful, animated, mouse-supported) that finds and reports disk usage on macOS and cleans up extra files safely. Milestone 1 (scanner, explorer, safety layer, soft delete, graphs, accounting, finish screen) and milestone 2 (the Caches & Projects screen) are implemented. Leftovers, uninstaller, Docker and the other candidates are planned (design doc) and appear dimmed in the sidebar.
+MacCleanup is a Rust TUI (colorful, animated, mouse-supported) that finds and reports disk usage on macOS and cleans up extra files safely. Milestone 1 (scanner, explorer, safety layer, soft delete, graphs, accounting, finish screen), milestone 2 (the Caches & Projects screen) and milestone 3 (the Docker screen) are implemented. Leftovers, uninstaller, Time Machine snapshots and the other candidates are planned (design doc) and appear dimmed in the sidebar.
 
 ## Commands
 
@@ -24,6 +24,7 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 - `scan.rs` multithreaded scanner (`Scanner`, `Node`, `Row`); `volume.rs` free space; `perms.rs` Full Disk Access check; `accounting.rs` pending vs freed; `treemap.rs` squarified layout.
 - `app.rs` all UI state and `App::update(Action)`; `input.rs` key and mouse mapping (key bindings live here); `anim.rs` animation helpers.
 - `catalog/` what can be cleaned: `artifacts.rs` (project build output found in the scan tree, only with its marker file beside it), `tools.rs` (`discover_tools`: tool caches, slow because it asks the installed tools, so it runs on a thread), `split.rs` (build folders split into intermediate folders and kept products), `resolve.rs` (every install of a program: `PATH`, fnm, nvm, volta), `command.rs` (`CommandSpec`, the `CommandRunner` trait, `SystemRunner`, test-only `FakeRunner`). `targets.rs` builds the Caches & Projects list (sections, groups, `TRow` = `scan::Row` plus meta); `bg.rs` is `Latest<T>`, background work where only the newest result counts.
+- `docker/` the Docker page: `model.rs` (plain data, `ItemId` = `image:`/`container:`/`volume:`/`cache:`/`vm:trim`), `api.rs` (parses Docker Engine API JSON; exact bytes), `cli.rs` (`DockerCli::connect/load/cli/api_get`: finds `docker`, pins the `desktop-linux` context, reads the API over its unix socket with `curl` through the `CommandRunner`; `vm_disk_allocated`), `analysis.rs` (the tree, shared/unique/frees from layer ids, `frees_of_set`, `removal_order`, `blockers`), `view.rs` (`DockerView::lines`: sections, folds, sort, filter), `remove.rs` (the removal command per item), `vmtools.rs` (our `maccleanup/vm-tools` helper image: Dockerfile on stdin, trim, `LIST_SCRIPT`, `browse_spec`), `browse.rs` (read-only file listing), `state.rs` (`DockerState`). The App side is `app/dockerpage.rs` (a child module of `app`, to reach private fields); drawing is `ui/docker.rs` and `ui/docker_files.rs`.
 - `filter.rs` fzf-style `Query` for the explorer's filter box (terms ANDed; fuzzy / `'exact` / `^prefix` / `suffix$` / `!exclude`; smart case; returns highlight positions).
 - `ui/` drawing only (`mod.rs` helpers, `sidebar`, `home`, `explorer` (also the shared column helpers `cols`/`header_line`/`number_spans`), `graph` (takes a `GraphData`), `targets`, `holding`, `dialogs`); `glyphs.rs` Nerd/ASCII symbols; `fmt.rs` sizes and bars; `cli.rs` flags; `main.rs` terminal setup and event loop.
 - Tests: unit tests sit beside the code; `tests/render.rs` (TestBackend rendering), `tests/cli_smoke.rs` (binary flags/exit codes); `testutil.rs` builds a sandbox `App` for unit tests.
@@ -63,6 +64,14 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 
 - Rescans (`r` folder, `R` all) swap a fresh subtree into the tree (`Scanner::rescan_dir`/`rescan_all`) and are refused while any scan runs; hard-link bookkeeping remembers which folder counted each inode so a subtree rescan can forget exactly its own entries.
 - Every scan is multithreaded for maximum speed: pool of `Scanner::default_threads()` (2x cores), a job per directory, no lock on the per-file hot path.
+
+### Docker
+
+- Docker is read from the Engine API over the Docker Desktop socket (`curl --unix-socket`, through `CommandRunner`, so tests use `FakeRunner` and fixtures in `tests/fixtures/docker/`); the CLI only prints rounded sizes. Every command pins `--context=desktop-linux`; nothing ever runs on another context. Docker's `UniqueSize` is not trusted (it can be negative): shared, unique and frees come from layer ids (`docker/analysis.rs`).
+- Docker items are `ReviewCommand`s in the shared selection (`App::tool_marks`, ids from `docker::model::ItemId`), reviewed and run by the existing review and `CommandJob`: irreversible, `y` only, no `--force` ever, order containers, images, volumes, build cache, then the build (when missing) and the trim of the VM disk. Bulk marks take only dangling images and unused build cache; volumes are never bulk-marked; refusals live in `ItemFacts::removable`, stopped-container dependencies in `ItemFacts::needs` / `analysis::blockers` (the review's `problems`).
+- The VM-disk trim is added automatically when a removal is marked (`DockerState::trim_auto`; unmarking it with removals marked sets `trim_declined`), runs from `maccleanup/vm-tools` (FROM `busybox:musl`, 2.5 MB; bump `vmtools::VERSION` when the Dockerfile changes), and the finish screen shows `Docker.raw`'s allocated size before and after (`FinishInfo::vm_disk`). `fstrim -v`'s own number is never shown as a result.
+- `Docker.raw` and Docker Desktop's data folders are protected in `safety.rs`. Browsing is read-only (volume mounted `:ro`, `--network none`, images run only `sh` with `LIST_SCRIPT`); containers are not browsable. Everything we create is labelled `com.maccleanup=1`.
+- The details pane wraps every line to its width and scrolls (`Action::DetailScroll`, `DockerState::detail_scroll/detail_max`); the list truncates a long command but the details never do. Optional columns (Modified on Explorer-like screens; Last used and Created on Docker) give way before names do (`MIN_NAME_*`).
 
 ### Responsiveness and background work
 
