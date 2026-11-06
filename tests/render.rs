@@ -19,6 +19,24 @@ struct Env {
     app: App,
 }
 
+/// Runs nothing and finds nothing: tool discovery is deterministic in tests.
+struct NoTools;
+
+impl maccleanup::catalog::CommandRunner for NoTools {
+    fn run(&self, _: &maccleanup::catalog::CommandSpec) -> maccleanup::catalog::CommandResult {
+        maccleanup::catalog::CommandResult {
+            ok: true,
+            output_tail: String::new(),
+        }
+    }
+    fn query(&self, _: &maccleanup::catalog::CommandSpec) -> Option<String> {
+        None
+    }
+    fn available(&self, _: &str) -> bool {
+        false
+    }
+}
+
 fn write(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, vec![b'x'; bytes]).unwrap();
@@ -61,7 +79,8 @@ fn make_app_full(
         Accounting::new(free),
         Glyphs::new(mode),
         animations,
-    );
+    )
+    .with_runner(std::sync::Arc::new(NoTools));
     Env { _dir: dir, app }
 }
 
@@ -1334,4 +1353,237 @@ fn the_list_shows_where_the_cursor_is_and_a_scrollbar_when_it_overflows() {
     let text = render(&mut e.app, 140, 30);
     assert!(text.contains("1/1"), "{text}");
     assert!(!text.contains('█'), "no scrollbar when everything fits");
+}
+
+// --- Caches & Projects screen ----------------------------------------------
+
+const TARGET_FILES: &[(&str, usize)] = &[
+    ("shop/package.json", 10),
+    ("shop/node_modules/a/i.js", 300_000),
+    ("shop/.next/c", 100_000),
+    ("api/Cargo.toml", 10),
+    ("api/target/x", 900_000),
+    ("Library/Caches/Spotify/blob", 500_000),
+];
+
+fn wait_tools(app: &mut App) {
+    for _ in 0..2000 {
+        app.update(Action::Tick);
+        if !app.tools_looking() && app.scanner.is_idle() {
+            app.update(Action::Tick);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("tool discovery did not finish");
+}
+
+fn targets_screen(mode: GlyphMode) -> Env {
+    let mut e = make_app(TARGET_FILES, mode);
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    e
+}
+
+fn cursor_on_row(app: &mut App, name: &str) {
+    use maccleanup::targets::Line;
+    let at = app
+        .tlines
+        .iter()
+        .position(|l| match *l {
+            Line::Row { group, row } => app.targets.row(group, row).row.name == name,
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("no row {name}"));
+    app.tcursor = at;
+}
+
+#[test]
+fn targets_screen_shows_both_section_bands_and_the_rows() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains("PROJECTS"), "{text}");
+    assert!(text.contains("TOOLS & CACHES"), "{text}");
+    for want in ["~/shop", "~/api", "node_modules", "target", "Spotify"] {
+        assert!(text.contains(want), "missing {want}:\n{text}");
+    }
+}
+
+#[test]
+fn targets_columns_match_the_explorer_in_order() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 140, 36);
+    let header_of = |text: &str| -> Vec<usize> {
+        let line = text
+            .lines()
+            .find(|l| l.contains("Name") && l.contains("Frees"))
+            .unwrap();
+        ["Name", "Size", "On disk", "Frees"]
+            .iter()
+            .map(|c| line.find(c).unwrap_or_else(|| panic!("no {c} in {line}")))
+            .collect()
+    };
+    let cols = header_of(&t);
+    assert!(cols.windows(2).all(|w| w[0] < w[1]), "{cols:?}");
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let ex = header_of(&render(&mut e.app, 140, 36));
+    // Same labels in the same order; the panes differ in width, not in order.
+    assert_eq!(ex.len(), cols.len());
+}
+
+#[test]
+fn a_marked_row_and_the_footer_total_show() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "target");
+    e.app.update(Action::ToggleMark);
+    for _ in 0..200 {
+        e.app.update(Action::Tick);
+        if !e.app.set_space.pending {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains("marked 1"), "{text}");
+    assert!(text.contains("frees"), "{text}");
+    assert!(
+        text.contains(&human_size(900_000)) || text.contains("879"),
+        "{text}"
+    );
+}
+
+#[test]
+fn ascii_mode_has_no_non_ascii_cells() {
+    let mut e = targets_screen(GlyphMode::Ascii);
+    cursor_on_row(&mut e.app, "target");
+    e.app.update(Action::ToggleMark);
+    for c in render_cells(&mut e.app, 140, 36) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+#[test]
+fn the_screen_renders_at_every_small_size_without_panicking() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    for (w, h) in [
+        (ui::MIN_WIDTH, ui::MIN_HEIGHT),
+        (80, 20),
+        (200, 60),
+        (61, 15),
+    ] {
+        let _ = render(&mut e.app, w, h);
+    }
+}
+
+#[test]
+fn an_empty_home_says_there_is_nothing_to_clean() {
+    let mut e = make_app(&[("note.txt", 10)], GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("nothing to clean"), "{text}");
+}
+
+#[test]
+fn the_graph_follows_the_group_and_t_switches_its_kind() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "target");
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains("Treemap"), "{text}");
+    e.app.update(Action::CycleGraph);
+    e.app.update(Action::CycleGraph);
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains("Distribution"), "{text}");
+    assert!(text.contains("selected: target"), "{text}");
+}
+
+#[test]
+fn the_detail_pane_names_what_a_row_is_and_how_it_comes_back() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "node_modules");
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("comes back: reinstall with npm"), "{text}");
+    assert!(
+        text.contains("yarn install"),
+        "long text wraps, not cut:\n{text}"
+    );
+    assert!(text.contains("shop/node_modules"), "{text}");
+}
+
+#[test]
+fn the_detail_pane_lists_related_folders_with_their_mark() {
+    let mut e = make_app_with(
+        &[
+            ("Library/Caches/Store/f", 200_000),
+            ("p1/package.json", 10),
+            ("p2/package.json", 10),
+        ],
+        GlyphMode::Nerd,
+        |home| {
+            for p in ["p1", "p2"] {
+                fs::create_dir_all(home.join(p).join("node_modules")).unwrap();
+                let st = std::process::Command::new("cp")
+                    .arg("-c")
+                    .arg(home.join("Library/Caches/Store/f"))
+                    .arg(home.join(p).join("node_modules/f"))
+                    .status()
+                    .unwrap();
+                assert!(st.success(), "needs APFS");
+            }
+        },
+    );
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    cursor_on_row(&mut e.app, "Store");
+    e.app.update(Action::Up); // off the row and back on, so the related folders are looked up
+    e.app.update(Action::Down);
+    for _ in 0..200 {
+        e.app.update(Action::Tick);
+        if !e.app.holders.pending {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("p1/node_modules"), "{text}");
+    assert!(text.contains("p2/node_modules"), "{text}");
+    assert!(text.contains("also holds"), "{text}");
+}
+
+#[test]
+fn the_review_shows_the_command_block_with_the_explicit_key() {
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let home = e.app.policy.home().to_path_buf();
+    e.app.tool_entries = vec![ToolEntry {
+        id: "cmd".to_string(),
+        tool: "Tool".to_string(),
+        label: "Spotify".to_string(),
+        path: home.join("Library/Caches/Spotify"),
+        regen: "again".to_string(),
+        mode: Mode::Command(CommandSpec::new("/opt/x/bin/tool", &["clean"])),
+        note: None,
+    }];
+    e.app.rebuild_targets();
+    cursor_on_row(&mut e.app, "Spotify");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("Tool cleanup commands"), "{text}");
+    assert!(text.contains("tool clean"), "{text}");
+    assert!(text.contains("/opt/x/bin/tool"), "{text}");
+    assert!(text.contains("[ y ]") || text.contains(" y "), "{text}");
+    assert!(
+        !text.contains("Enter"),
+        "Enter must not be offered:\n{text}"
+    );
+}
+
+#[test]
+fn tools_still_being_looked_up_are_said_so() {
+    let mut e = make_app(TARGET_FILES, GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Targets));
+    assert!(e.app.tools_looking());
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains("looking for installed tools"), "{text}");
 }

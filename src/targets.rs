@@ -71,8 +71,9 @@ impl Group {
         self.rows.iter().map(|r| r.row.frees).sum()
     }
 
-    /// The group as a pseudo-row, so groups sort by the same keys as rows.
-    fn as_row(&self) -> Row {
+    /// The group as a pseudo-row, so groups sort by the same keys as rows
+    /// and draw their totals in the same columns.
+    pub fn as_row(&self) -> Row {
         Row {
             name: self.title.clone().into(),
             path: PathBuf::new(),

@@ -309,6 +309,10 @@ pub struct JointSpace {
     pub base: Space,
     /// The same plus the folders behind marked tool commands.
     pub with_tools: Space,
+    /// Just the marked folders that belong to the Projects section.
+    pub projects: Space,
+    /// Just the marked folders that belong to the Tools & Caches section.
+    pub tools: Space,
 }
 
 /// What a Caches & Projects line stands for (survives a rebuild of the list).
@@ -1236,7 +1240,28 @@ impl App {
             })
             .filter_map(|r| r.row.node.clone())
             .collect();
+        // Which section each marked folder belongs to (by the rows it covers).
+        let (mut projects, mut tools) = (Vec::new(), Vec::new());
+        for n in &nodes {
+            let section = self
+                .targets
+                .groups
+                .iter()
+                .find(|g| {
+                    g.rows
+                        .iter()
+                        .any(|r| r.row.path.starts_with(&n.path) || n.path.starts_with(&r.row.path))
+                })
+                .map(|g| g.section);
+            match section {
+                Some(SectionKind::Projects) => projects.push(Arc::clone(n)),
+                Some(SectionKind::Tools) => tools.push(Arc::clone(n)),
+                None => {}
+            }
+        }
         JointInputs {
+            projects,
+            tools,
             nodes,
             files,
             tool_nodes,
@@ -1250,6 +1275,17 @@ impl App {
             return None;
         }
         self.set_space.value.map(|j| j.base.frees_all())
+    }
+
+    /// The joint figure for the marked folders of one section.
+    pub fn section_frees(&self, section: SectionKind) -> Option<u64> {
+        if self.set_space.pending {
+            return None;
+        }
+        self.set_space.value.map(|j| match section {
+            SectionKind::Projects => j.projects.frees_all(),
+            SectionKind::Tools => j.tools.frees_all(),
+        })
     }
 
     /// What the marked tool commands might add on top (an upper bound).
@@ -1996,6 +2032,9 @@ impl App {
 /// Move `pos` by `delta` within `0..len` (len 0 stays 0), without overflow.
 /// The folders and files whose space is worked out together.
 struct JointInputs {
+    /// The marked folders in each section (other marks belong to neither).
+    projects: Vec<Arc<Node>>,
+    tools: Vec<Arc<Node>>,
     nodes: Vec<Arc<Node>>,
     files: Vec<(PathBuf, Usage)>,
     tool_nodes: Vec<Arc<Node>>,
@@ -2014,10 +2053,17 @@ fn joint_of(view: &crate::scan::SpaceView, inputs: JointInputs) -> JointSpace {
         sp
     };
     let base = add_files(view.space_of_set(&inputs.nodes));
+    let projects = view.space_of_set(&inputs.projects);
+    let tools = view.space_of_set(&inputs.tools);
     let mut all = inputs.nodes.clone();
     all.extend(inputs.tool_nodes.iter().cloned());
     let with_tools = add_files(view.space_of_set(&outermost(all)));
-    JointSpace { base, with_tools }
+    JointSpace {
+        base,
+        with_tools,
+        projects,
+        tools,
+    }
 }
 
 /// Keep only the outermost of a set of folders (drop any inside another).
