@@ -266,13 +266,16 @@ pump(0.6)
 assert os.path.exists(os.path.join(home, "proj", "big.bin")), "Enter must not confirm irreversible"
 assert "cannot be undone" in screen.text(), "dialog should still be open"
 send(b"y")
-wait_for("Congratulations")
+# The headline ("Congratulations" vs "Nothing freed yet") depends on the real
+# volume free space, which other disk activity can mask for a 200 KB delete.
+# Assert the deterministic part: the dialog reports the delete.
+wait_for("deleted for good")
 assert not os.path.exists(os.path.join(home, "proj")), "proj should be gone for good"
 assert not glob.glob(os.path.join(home, "ToBeDeleted", "items", "*")), "holding should be empty"
 
 step("quit")
 send(b"\r")
-wait_gone("Congratulations")
+wait_gone("deleted for good")
 send(b"q")
 end = time.time() + 4
 status = None
