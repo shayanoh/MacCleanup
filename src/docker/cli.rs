@@ -319,7 +319,7 @@ mod tests {
         std::fs::write(&path, vec![1u8; 8192]).unwrap();
         f.set_len(200_000_000).unwrap();
         let allocated = vm_disk_allocated(dir.path()).unwrap();
-        assert!(allocated >= 8192 && allocated < 50_000_000, "{allocated}");
+        assert!((8192..50_000_000).contains(&allocated), "{allocated}");
         assert_eq!(vm_disk_allocated(&dir.path().join("missing")), None);
     }
 
