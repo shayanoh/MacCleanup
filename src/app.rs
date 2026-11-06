@@ -365,6 +365,8 @@ pub struct App {
     pub tick: u64,
     pub notice: Option<String>,
     pub layout: UiLayout,
+    /// Where a click on the graph lands, written by the UI every frame.
+    pub graph_hits: Vec<(Rect, (usize, usize))>,
     pub animations: bool,
     pub glyphs: Glyphs,
     pub transition_start: u64,
@@ -501,6 +503,7 @@ impl App {
             tick: 0,
             notice: None,
             layout: UiLayout::default(),
+            graph_hits: Vec::new(),
             animations,
             glyphs,
             transition_start: 0,
@@ -1552,7 +1555,9 @@ impl App {
     fn click(&mut self, x: u16, y: u16) {
         let l = self.layout;
         let inside = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
-        if inside(l.sidebar) {
+        if let Some(&(_, key)) = self.graph_hits.iter().find(|(r, _)| inside(*r)) {
+            self.select_from_graph(key);
+        } else if inside(l.sidebar) {
             if y <= l.sidebar.y {
                 return;
             }
@@ -1803,6 +1808,31 @@ impl App {
             g.open = open;
         }
         self.rebuild_tlines(Some(LineKey::Group(key)));
+    }
+
+    /// A click on a graph box or bar: select the matching row of the list.
+    fn select_from_graph(&mut self, (group, row): (usize, usize)) {
+        self.focus = Focus::Main;
+        self.filter.editing = false;
+        match self.screen {
+            Screen::Explorer if row < self.rows.len() => {
+                self.cursor = row;
+                self.ensure_visible();
+                self.refresh_detail();
+            }
+            Screen::Targets => {
+                let at = self
+                    .tlines
+                    .iter()
+                    .position(|l| *l == Line::Row { group, row });
+                if let Some(at) = at {
+                    self.tcursor = at;
+                    self.ensure_visible();
+                    self.request_holders();
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Go to the Explorer showing `path`'s folder with `path` selected.
@@ -4587,5 +4617,72 @@ mod tests {
         let before = app.screen;
         app.update(Action::Menu(7));
         assert_eq!(app.screen, before);
+    }
+
+    // --- clicking the graphs -------------------------------------------
+
+    #[test]
+    fn clicking_a_graph_box_selects_that_row_in_the_explorer() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        let last = app.rows.len() - 1;
+        app.graph_hits = vec![(Rect::new(60, 3, 10, 2), (0, last))];
+        app.cursor = 0;
+        app.update(Action::Click { x: 62, y: 4 });
+        assert_eq!(app.cursor, last);
+        assert_eq!(
+            app.detail.as_ref().map(|d| d.path.clone()),
+            Some(app.rows[last].path.clone())
+        );
+    }
+
+    #[test]
+    fn clicking_outside_every_graph_box_changes_nothing() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        app.graph_hits = vec![(Rect::new(60, 3, 10, 2), (0, 1))];
+        app.cursor = 0;
+        for (x, y) in [(59, 3), (70, 3), (60, 2), (60, 5)] {
+            app.update(Action::Click { x, y });
+            assert_eq!(app.cursor, 0, "({x},{y})");
+        }
+    }
+
+    #[test]
+    fn clicking_a_graph_box_selects_that_row_on_targets() {
+        let mut e = targets_app();
+        let app = &mut e.app;
+        let rows: Vec<(usize, usize)> = app
+            .tlines
+            .iter()
+            .filter_map(|l| match *l {
+                Line::Row { group, row } => Some((group, row)),
+                _ => None,
+            })
+            .collect();
+        let want = *rows.last().unwrap();
+        app.graph_hits = vec![(Rect::new(70, 3, 10, 2), want)];
+        app.tcursor = 0;
+        app.update(Action::Click { x: 71, y: 3 });
+        let got = app.selected_target().unwrap().row.path.clone();
+        assert_eq!(got, app.targets.row(want.0, want.1).row.path);
+    }
+
+    #[test]
+    fn a_graph_click_for_a_row_the_filter_hides_is_ignored() {
+        let mut e = targets_app();
+        let app = &mut e.app;
+        app.focus = Focus::Main;
+        app.update(Action::FilterOpen);
+        for c in "spot".chars() {
+            app.update(Action::FilterChar(c));
+        }
+        app.update(Action::FilterAccept);
+        let before = app.tcursor;
+        // An api/target row is not in the filtered list.
+        let (g, r) = app.targets.find(&e.home.join("api/target")).unwrap();
+        app.graph_hits = vec![(Rect::new(70, 3, 10, 2), (g, r))];
+        app.update(Action::Click { x: 71, y: 3 });
+        assert_eq!(app.tcursor, before);
     }
 }

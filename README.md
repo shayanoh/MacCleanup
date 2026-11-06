@@ -73,7 +73,7 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `m` (Caches & Projects) | Mark the selected folder and every folder that shares its data |
 | `r` / `D` / `E` (ToBeDeleted screen) | Restore / delete for good / empty all |
 | `q`, `Esc` | Quit (`Esc` first clears an active filter, then goes up a folder; quitting asks first if ToBeDeleted still holds items) |
-| mouse | Click rows and menu entries, scroll with the wheel |
+| mouse | Click rows, menu entries, and treemap boxes or bars (a click on the graph selects that row in the list); scroll with the wheel |
 
 In the review dialog: `Enter` moves items to ToBeDeleted, `x` offers "move, then empty now" (irreversible), `Esc` cancels. Irreversible actions need an explicit `y`; `Enter` never confirms them. When the review contains tool commands, only `y` runs it.
 

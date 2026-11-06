@@ -27,7 +27,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     render_list(frame, list_area, app);
     if let Some(graph_area) = graph_area {
-        graph::render(frame, graph_area, app);
+        app.graph_hits = graph::render(frame, graph_area, app);
     }
 }
 

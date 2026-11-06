@@ -1768,3 +1768,99 @@ fn the_menu_shows_each_pages_number_and_planned_pages_keep_theirs() {
         assert!(line.contains(label));
     }
 }
+
+/// The middle of a graph hit area, as a click position.
+fn centre(r: ratatui::layout::Rect) -> (u16, u16) {
+    (r.x + r.width / 2, r.y + r.height / 2)
+}
+
+#[test]
+fn clicking_a_treemap_box_selects_that_row() {
+    let mut e = explorer(GlyphMode::Nerd);
+    assert_eq!(e.app.graph, GraphMode::Treemap);
+    let _ = render(&mut e.app, 140, 36);
+    assert!(
+        !e.app.graph_hits.is_empty(),
+        "the treemap records its boxes"
+    );
+    for want in 0..e.app.rows.len() {
+        let hit = e.app.graph_hits.iter().find(|(_, k)| k.1 == want).cloned();
+        let Some((rect, _)) = hit else { continue };
+        e.app.cursor = (want + 1) % e.app.rows.len();
+        let (x, y) = centre(rect);
+        e.app.update(Action::Click { x, y });
+        assert_eq!(e.app.cursor, want, "box {want} at {rect:?}");
+    }
+}
+
+#[test]
+fn clicking_a_bar_selects_that_row() {
+    let mut e = explorer(GlyphMode::Nerd);
+    e.app.update(Action::CycleGraph); // treemap -> hidden
+    e.app.update(Action::CycleGraph); // hidden -> bars
+    assert_eq!(e.app.graph, GraphMode::Bars);
+    let _ = render(&mut e.app, 140, 36);
+    assert_eq!(e.app.graph_hits.len(), e.app.rows.len(), "one bar per row");
+    for want in 0..e.app.rows.len() {
+        let (rect, _) = e
+            .app
+            .graph_hits
+            .iter()
+            .find(|(_, k)| k.1 == want)
+            .cloned()
+            .unwrap();
+        e.app.cursor = (want + 1) % e.app.rows.len();
+        let (x, y) = centre(rect);
+        e.app.update(Action::Click { x, y });
+        assert_eq!(e.app.cursor, want);
+    }
+}
+
+#[test]
+fn the_selected_bar_moves_with_a_click() {
+    let mut e = explorer(GlyphMode::Nerd);
+    e.app.update(Action::CycleGraph);
+    e.app.update(Action::CycleGraph);
+    let _ = render(&mut e.app, 140, 36);
+    let (rect, _) = e
+        .app
+        .graph_hits
+        .iter()
+        .find(|(_, k)| k.1 == 2)
+        .cloned()
+        .unwrap();
+    let (x, y) = centre(rect);
+    e.app.update(Action::Click { x, y });
+    let name = e.app.rows[2].name.to_string_lossy().into_owned();
+    let text = render(&mut e.app, 140, 36);
+    assert!(text.contains(&format!("selected: {name}")), "{text}");
+}
+
+#[test]
+fn clicking_a_box_on_caches_and_projects_selects_the_row() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "target");
+    let _ = render(&mut e.app, 150, 40);
+    // The graph shows the group under the cursor; another group's rows are
+    // not in it, but this group's other rows are.
+    let hits = e.app.graph_hits.clone();
+    assert!(!hits.is_empty());
+    for (rect, (g, r)) in hits {
+        let want = e.app.targets.row(g, r).row.path.clone();
+        let (x, y) = centre(rect);
+        e.app.update(Action::Click { x, y });
+        assert_eq!(
+            e.app.selected_target().map(|t| t.row.path.clone()),
+            Some(want)
+        );
+        let _ = render(&mut e.app, 150, 40);
+    }
+}
+
+#[test]
+fn nothing_is_clickable_in_a_graph_that_is_hidden() {
+    let mut e = explorer(GlyphMode::Nerd);
+    e.app.update(Action::CycleGraph); // hidden
+    let _ = render(&mut e.app, 140, 36);
+    assert!(e.app.graph_hits.is_empty());
+}

@@ -26,7 +26,13 @@ pub struct GraphData {
     pub total: u64,
     /// "of <scope>" in the caption: the folder or group name.
     pub scope: String,
+    /// What a click on each row selects: `(group, row)` on Caches & Projects,
+    /// `(0, row)` in the Explorer.
+    pub keys: Vec<(usize, usize)>,
 }
+
+/// Where a click lands: the area drawn for a row, and what it selects.
+pub type GraphHit = (Rect, (usize, usize));
 
 impl GraphData {
     /// The Explorer's current folder.
@@ -42,22 +48,30 @@ impl GraphData {
             cursor: (app.cursor < rows.len()).then_some(app.cursor),
             total: app.weight_total(),
             scope: app.current().name.to_string_lossy().into_owned(),
+            keys: (0..rows.len()).map(|i| (0, i)).collect(),
             rows,
         }
     }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, app: &App) {
+pub fn render(frame: &mut Frame, area: Rect, app: &App) -> Vec<GraphHit> {
     render_data(
         frame,
         area,
         &app.glyphs,
         app.graph,
         &GraphData::from_explorer(app),
-    );
+    )
 }
 
-pub fn render_data(frame: &mut Frame, area: Rect, g: &Glyphs, mode: GraphMode, data: &GraphData) {
+/// Draw the graph and return where each row can be clicked.
+pub fn render_data(
+    frame: &mut Frame,
+    area: Rect,
+    g: &Glyphs,
+    mode: GraphMode,
+    data: &GraphData,
+) -> Vec<GraphHit> {
     let title = match mode {
         GraphMode::Treemap => " Treemap ",
         _ => " Distribution ",
@@ -66,20 +80,20 @@ pub fn render_data(frame: &mut Frame, area: Rect, g: &Glyphs, mode: GraphMode, d
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 8 || inner.height < 3 {
-        return;
+        return Vec::new();
     }
     if data.rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled("nothing to show", Style::default().fg(DIM))),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
-        return;
+        return Vec::new();
     }
     let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
-    match mode {
+    let hits = match mode {
         GraphMode::Treemap => treemap(frame, body, g, data),
         _ => bars(frame, body, g, data),
-    }
+    };
     let caption = caption(data);
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -88,6 +102,7 @@ pub fn render_data(frame: &mut Frame, area: Rect, g: &Glyphs, mode: GraphMode, d
         )),
         Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
     );
+    hits
 }
 
 fn pct_of(size: u64, total: u64) -> u64 {
@@ -107,7 +122,7 @@ fn caption(data: &GraphData) -> String {
     }
 }
 
-fn bars(frame: &mut Frame, area: Rect, g: &Glyphs, data: &GraphData) {
+fn bars(frame: &mut Frame, area: Rect, g: &Glyphs, data: &GraphData) -> Vec<GraphHit> {
     let total = data.total.max(1);
     let name_w = (area.width as usize / 3).clamp(6, 16);
     let pct_w = 5;
@@ -142,17 +157,27 @@ fn bars(frame: &mut Frame, area: Rect, g: &Glyphs, data: &GraphData) {
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
+    (0..data.rows.len().min(area.height as usize))
+        .map(|i| {
+            (
+                Rect::new(area.x, area.y + i as u16, area.width, 1),
+                data.keys[i],
+            )
+        })
+        .collect()
 }
 
-fn treemap(frame: &mut Frame, area: Rect, g: &Glyphs, data: &GraphData) {
+fn treemap(frame: &mut Frame, area: Rect, g: &Glyphs, data: &GraphData) -> Vec<GraphHit> {
+    let mut hits = Vec::new();
     if area.width < 4 || area.height < 1 {
-        return;
+        return hits;
     }
     let rects = squarify(&data.weights, area.width, area.height);
     for (i, cell) in rects.iter().enumerate() {
         let Some(c) = cell else { continue };
         let r = &data.rows[i];
         let rect = Rect::new(area.x + c.x, area.y + c.y, c.w, c.h);
+        hits.push((rect, data.keys[i]));
         let selected = data.cursor == Some(i);
         let marked = data.marked[i];
         let bg = fill_color(data.safeties[i], selected, i);
@@ -188,6 +213,7 @@ fn treemap(frame: &mut Frame, area: Rect, g: &Glyphs, data: &GraphData) {
         }
         frame.render_widget(Paragraph::new(lines), rect);
     }
+    hits
 }
 
 /// Box colour: the safety hue, with three alternating shades so boxes of the

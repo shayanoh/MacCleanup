@@ -34,7 +34,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         ])
         .areas(area);
         render_list(frame, list, app);
-        render_side(frame, side, app);
+        app.graph_hits = render_side(frame, side, app);
     } else {
         render_list(frame, area, app);
     }
@@ -559,38 +559,47 @@ fn summary_line(app: &App, width: usize) -> TextLine<'static> {
 }
 
 /// The graph (unless hidden) over the detail pane.
-fn render_side(frame: &mut Frame, area: Rect, app: &App) {
+fn render_side(frame: &mut Frame, area: Rect, app: &App) -> Vec<graph::GraphHit> {
     let g = app.glyphs;
     if app.graph == GraphMode::Hidden || area.height < 16 {
         render_detail(frame, area, app, &g);
-        return;
+        return Vec::new();
     }
     let [top, bottom] =
         Layout::vertical([Constraint::Percentage(45), Constraint::Fill(1)]).areas(area);
-    graph::render_data(frame, top, &g, app.graph, &graph_data(app));
+    let hits = graph::render_data(frame, top, &g, app.graph, &graph_data(app));
     render_detail(frame, bottom, app, &g);
+    hits
 }
 
 /// The rows of the group under the cursor (or of the whole section).
 fn graph_data(app: &App) -> GraphData {
-    let (rows, cursor): (Vec<&TRow>, Option<usize>) = match app.tlines.get(app.tcursor).copied() {
-        Some(Line::Row { group, row }) => {
-            (app.targets.groups[group].rows.iter().collect(), Some(row))
-        }
-        Some(Line::Group(group)) => (app.targets.groups[group].rows.iter().collect(), None),
+    // Every row of the group (or section) as (group, row, data).
+    let of_group = |gi: usize| {
+        app.targets.groups[gi]
+            .rows
+            .iter()
+            .enumerate()
+            .map(move |(ri, t)| (gi, ri, t))
+    };
+    let line = app.tlines.get(app.tcursor).copied();
+    let (rows, cursor): (Vec<(usize, usize, &TRow)>, Option<usize>) = match line {
+        Some(Line::Row { group, row }) => (of_group(group).collect(), Some(row)),
+        Some(Line::Group(group)) => (of_group(group).collect(), None),
         Some(Line::Section(kind)) => (
-            app.targets
-                .groups
-                .iter()
-                .filter(|x| x.section == kind)
-                .flat_map(|x| x.rows.iter())
+            (0..app.targets.groups.len())
+                .filter(|gi| app.targets.groups[*gi].section == kind)
+                .flat_map(of_group)
                 .collect(),
             None,
         ),
         None => (Vec::new(), None),
     };
-    let weights: Vec<u64> = rows.iter().map(|t| weight(app.sort, &t.row)).collect();
-    let scope = match app.tlines.get(app.tcursor).copied() {
+    let weights: Vec<u64> = rows
+        .iter()
+        .map(|(_, _, t)| weight(app.sort, &t.row))
+        .collect();
+    let scope = match line {
         Some(Line::Row { group, .. }) | Some(Line::Group(group)) => {
             app.targets.groups[group].title.clone()
         }
@@ -600,12 +609,13 @@ fn graph_data(app: &App) -> GraphData {
     };
     GraphData {
         total: weights.iter().sum(),
-        safeties: rows.iter().map(|t| t.safety).collect(),
+        safeties: rows.iter().map(|(_, _, t)| t.safety).collect(),
         marked: rows
             .iter()
-            .map(|t| app.row_mark(t) == MarkState::Marked)
+            .map(|(_, _, t)| app.row_mark(t) == MarkState::Marked)
             .collect(),
-        rows: rows.iter().map(|t| t.row.live()).collect(),
+        keys: rows.iter().map(|(g, r, _)| (*g, *r)).collect(),
+        rows: rows.iter().map(|(_, _, t)| t.row.live()).collect(),
         weights,
         cursor,
         scope,
