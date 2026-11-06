@@ -681,10 +681,11 @@ impl App {
             Action::ShrinkGraph => self.graph_pct = self.graph_pct.saturating_sub(5).max(20),
             Action::CycleSort => {
                 self.sort = match self.sort {
+                    // Same order as the column headers: Name, Size, On disk, Frees.
+                    SortBy::Name => SortBy::Size,
+                    SortBy::Size => SortBy::Disk,
                     SortBy::Disk => SortBy::Frees,
-                    SortBy::Frees => SortBy::Size,
-                    SortBy::Size => SortBy::Name,
-                    SortBy::Name => SortBy::Disk,
+                    SortBy::Frees => SortBy::Name,
                 };
                 self.refresh_rows();
             }
@@ -1494,19 +1495,21 @@ mod tests {
     }
 
     #[test]
-    fn sort_cycles_disk_frees_size_name() {
+    fn sort_cycles_in_the_order_of_the_column_headers() {
+        // Header order is Name, Size, On disk, Frees; `s` walks it left to right.
         let mut e = sort_env();
         let app = &mut e.app;
+        assert_eq!(app.sort, SortBy::Disk, "on disk is the default");
         app.update(Action::CycleSort);
         assert_eq!(app.sort, SortBy::Frees);
         // Plain files free what they occupy, so this order matches on-disk.
         assert_eq!(names(app), ["real.bin", "a.bin", "sparse.bin"]);
         app.update(Action::CycleSort);
-        assert_eq!(app.sort, SortBy::Size);
-        assert_eq!(names(app), ["sparse.bin", "real.bin", "a.bin"]);
-        app.update(Action::CycleSort);
         assert_eq!(app.sort, SortBy::Name);
         assert_eq!(names(app), ["a.bin", "real.bin", "sparse.bin"]);
+        app.update(Action::CycleSort);
+        assert_eq!(app.sort, SortBy::Size);
+        assert_eq!(names(app), ["sparse.bin", "real.bin", "a.bin"]);
         app.update(Action::CycleSort);
         assert_eq!(app.sort, SortBy::Disk);
         assert_eq!(names(app), ["real.bin", "a.bin", "sparse.bin"]);
@@ -1534,6 +1537,7 @@ mod tests {
         assert!(sparse.size > sparse.disk);
         assert_eq!(app.weight(&sparse), sparse.disk);
         app.update(Action::CycleSort); // by what it frees
+        app.update(Action::CycleSort); // by name
         app.update(Action::CycleSort); // by size
         assert_eq!(app.sort, SortBy::Size);
         assert_eq!(app.weight(&sparse), sparse.size);
@@ -2681,6 +2685,7 @@ mod tests {
         assert_eq!(sp.footprint, 8192 + 12288);
         assert_eq!(app.weight_total(), 8192 + 12288);
         app.update(Action::CycleSort); // by what frees
+        app.update(Action::CycleSort); // by name
         app.update(Action::CycleSort); // by size: the logical total
         assert_eq!(app.sort, SortBy::Size);
         assert_eq!(app.weight_total(), app.current().size());

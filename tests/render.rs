@@ -476,12 +476,13 @@ fn explorer_header_marks_the_sorted_column() {
 
     e.app.update(Action::CycleSort);
     let text = render(&mut e.app, 120, 30);
-    assert!(text.contains("Size ▼"), "{text}");
+    assert!(text.contains("Name ▲"), "{text}");
     assert!(!text.contains("Frees ▼"), "{text}");
 
     e.app.update(Action::CycleSort);
     let text = render(&mut e.app, 120, 30);
-    assert!(text.contains("Name ▲"), "{text}");
+    assert!(text.contains("Size ▼"), "{text}");
+    assert!(!text.contains("Name ▲"), "{text}");
 }
 
 #[test]
@@ -492,7 +493,6 @@ fn explorer_header_arrows_are_ascii_in_ascii_mode() {
     e.app.update(Action::CycleSort);
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("Frees v"), "{text}");
-    e.app.update(Action::CycleSort);
     e.app.update(Action::CycleSort);
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("Name ^"), "{text}");
@@ -513,6 +513,7 @@ fn sorted_column_is_white_and_the_others_gray() {
     assert_eq!(frees.fg, Some(Color::White));
     assert_eq!(disk.fg, Some(Color::DarkGray));
 
+    e.app.update(Action::CycleSort); // by Name
     e.app.update(Action::CycleSort); // by Size
     let frees = find_text(&mut e.app, 120, 30, "Frees").unwrap();
     let size = find_text(&mut e.app, 120, 30, "Size").unwrap();
