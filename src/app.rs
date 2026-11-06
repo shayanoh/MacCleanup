@@ -313,24 +313,32 @@ pub struct App {
     quit_after_job: bool,
 }
 
-fn sort_rows(rows: &mut [Row], by: SortBy) {
+/// The order the explorer (and every screen like it) puts rows in: biggest
+/// first for the size columns, A to Z for names; ties fall back to the rest.
+pub fn cmp_rows(by: SortBy, a: &Row, b: &Row) -> std::cmp::Ordering {
     match by {
-        SortBy::Disk => rows.sort_by(|a, b| {
-            b.disk
-                .cmp(&a.disk)
-                .then_with(|| b.size.cmp(&a.size))
-                .then_with(|| a.name.cmp(&b.name))
-        }),
-        SortBy::Frees => rows.sort_by(|a, b| {
-            b.frees
-                .unwrap_or(0)
-                .cmp(&a.frees.unwrap_or(0))
-                .then_with(|| b.disk.cmp(&a.disk))
-                .then_with(|| a.name.cmp(&b.name))
-        }),
-        SortBy::Size => rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name))),
-        SortBy::Name => rows.sort_by_key(|r| r.name.to_string_lossy().to_lowercase()),
+        SortBy::Disk => b
+            .disk
+            .cmp(&a.disk)
+            .then_with(|| b.size.cmp(&a.size))
+            .then_with(|| a.name.cmp(&b.name)),
+        SortBy::Frees => b
+            .frees
+            .unwrap_or(0)
+            .cmp(&a.frees.unwrap_or(0))
+            .then_with(|| b.disk.cmp(&a.disk))
+            .then_with(|| a.name.cmp(&b.name)),
+        SortBy::Size => b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)),
+        SortBy::Name => a
+            .name
+            .to_string_lossy()
+            .to_lowercase()
+            .cmp(&b.name.to_string_lossy().to_lowercase()),
     }
+}
+
+fn sort_rows(rows: &mut [Row], by: SortBy) {
+    rows.sort_by(|a, b| cmp_rows(by, a, b));
 }
 
 /// Scroll window: keep `cursor` inside `[offset, offset + visible)`.

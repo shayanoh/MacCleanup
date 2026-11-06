@@ -12,6 +12,7 @@ pub mod perms;
 pub mod safety;
 pub mod scan;
 pub mod softdelete;
+pub mod targets;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod treemap;
