@@ -21,6 +21,21 @@ pub fn is_docker_id(id: &str) -> bool {
         .any(|p| id.starts_with(p))
 }
 
+/// A Docker command as the review shows it: without the context flag
+/// (noise) and with long image ids shortened. Only for display: what runs is
+/// the spec itself.
+pub fn display_line(spec: &crate::catalog::CommandSpec) -> String {
+    spec.display()
+        .split(' ')
+        .filter(|w| !w.starts_with("--context="))
+        .map(|w| match w.strip_prefix("sha256:") {
+            Some(hex) if hex.len() > 12 => format!("sha256:{}\u{2026}", &hex[..12]),
+            _ => w.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl App {
     /// Start (or queue) a read of Docker on a thread.
     pub fn reload_docker(&mut self) {
@@ -308,7 +323,7 @@ impl App {
         let command = |id: String, spec: crate::catalog::CommandSpec, up_to: u64| ReviewCommand {
             id,
             tool: "Docker".to_string(),
-            line: spec.display(),
+            line: display_line(&spec),
             spec,
             up_to,
             path: PathBuf::new(),
@@ -839,12 +854,33 @@ mod tests {
             BUILD.to_string(),
             TRIM.to_string(),
         ];
-        let want: Vec<String> = want
-            .iter()
-            .map(|w| format!("docker --context=desktop-linux {w}"))
-            .collect();
+        let want: Vec<String> = want.iter().map(|w| format!("docker {w}")).collect();
         assert_eq!(lines, want);
         let _ = CTX;
+    }
+
+    #[test]
+    fn the_review_line_names_the_target_and_drops_the_context_flag() {
+        let mut e = loaded_app();
+        mark(&mut e.app, "container:c0ffee2");
+        e.app.update(Action::OpenReview);
+        let lines = review_lines(&e.app);
+        assert_eq!(lines[0], "docker container rm c0ffee2");
+        assert!(lines.iter().all(|l| !l.contains("--context")), "{lines:?}");
+    }
+
+    #[test]
+    fn long_image_ids_are_shortened_for_display_only() {
+        let id = "sha256:063f36aae39753ad4d99f8ba34dbc828bb9b419819959ad1d2c2d1d04af239d4";
+        let spec = crate::catalog::CommandSpec::new(
+            "/usr/local/bin/docker",
+            &["--context=desktop-linux", "image", "rm", id],
+        );
+        assert_eq!(
+            display_line(&spec),
+            "docker image rm sha256:063f36aae397\u{2026}"
+        );
+        assert_eq!(spec.args[3], id, "what runs is untouched");
     }
 
     #[test]

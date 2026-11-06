@@ -47,22 +47,54 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// The columns: the Explorer's look, with Size, Frees, Last used and
-/// Created (no On disk column: Docker has one size). The share bar goes
-/// first when the pane is narrow.
-fn docker_cols(width: u16, g: &Glyphs) -> Cols {
+/// Names never get less than this many columns; the Created column, then
+/// Last used, and the share bar before them, give way instead.
+const MIN_NAME_W: usize = 16;
+
+/// The Explorer's columns plus which of Docker's optional ones fit.
+struct DCols {
+    base: Cols,
+    last_used: bool,
+    created: bool,
+}
+
+impl std::ops::Deref for DCols {
+    type Target = Cols;
+    fn deref(&self) -> &Cols {
+        &self.base
+    }
+}
+
+/// Size, Frees, then Last used and Created if they fit (no On disk column:
+/// Docker has one size). The share bar goes first when the pane is narrow.
+fn docker_cols(width: u16, g: &Glyphs) -> DCols {
     let (icon_w, mark_w, prefix_w) = super::explorer::prefix_widths(g);
-    let numbers = (1 + NUM_W) + (1 + NUM_W) + (1 + LAST_USED_W) + (1 + NUM_W);
     let cw = width.saturating_sub(1) as usize; // last column: scrollbar
-    let show_share = cw >= prefix_w + numbers + 9 + 16;
+    let size_frees = 2 * (1 + NUM_W);
+    let (last, created) = (1 + LAST_USED_W, 1 + NUM_W);
+    let room = cw.saturating_sub(prefix_w + size_frees);
+    let (last_used, created_on) = if room >= last + created + MIN_NAME_W {
+        (true, true)
+    } else if room >= last + MIN_NAME_W {
+        (true, false)
+    } else {
+        (false, false)
+    };
+    let numbers =
+        size_frees + if last_used { last } else { 0 } + if created_on { created } else { 0 };
+    let show_share = cw >= prefix_w + numbers + 9 + MIN_NAME_W;
     let fixed = prefix_w + numbers + if show_share { 9 } else { 0 };
-    Cols {
-        icon_w,
-        mark_w,
-        prefix_w,
-        name_w: cw.saturating_sub(fixed).max(4),
-        show_share,
-        show_modified: false,
+    DCols {
+        base: Cols {
+            icon_w,
+            mark_w,
+            prefix_w,
+            name_w: cw.saturating_sub(fixed).max(4),
+            show_share,
+            show_modified: false,
+        },
+        last_used,
+        created: created_on,
     }
 }
 
@@ -317,7 +349,7 @@ fn filter_line(app: &App, width: usize) -> TextLine<'static> {
 }
 
 /// Column titles: the sorted one is white with an arrow, the others gray.
-fn header_line(sort: DSort, c: &Cols, g: &Glyphs) -> TextLine<'static> {
+fn header_line(sort: DSort, c: &DCols, g: &Glyphs) -> TextLine<'static> {
     let label = |by: DSort, text: &str, w: usize| -> Span<'static> {
         let arrow = if sort == by {
             format!(
@@ -362,11 +394,15 @@ fn header_line(sort: DSort, c: &Cols, g: &Glyphs) -> TextLine<'static> {
         label(DSort::Size, "Size", NUM_W),
         Span::raw(" "),
         label(DSort::Frees, "Frees", NUM_W),
-        Span::raw(" "),
-        label(DSort::LastUsed, "Last used", LAST_USED_W),
-        Span::raw(" "),
-        label(DSort::Created, "Created", NUM_W),
     ];
+    if c.last_used {
+        header.push(Span::raw(" "));
+        header.push(label(DSort::LastUsed, "Last used", LAST_USED_W));
+    }
+    if c.created {
+        header.push(Span::raw(" "));
+        header.push(label(DSort::Created, "Created", NUM_W));
+    }
     if c.show_share {
         header.push(Span::styled(" Share", Style::default().fg(DIM)));
     }
@@ -525,7 +561,7 @@ fn row_line(
     app: &App,
     query: &Query,
     idx: usize,
-    c: &Cols,
+    c: &DCols,
     section_total: u64,
     now: i64,
 ) -> TextLine<'static> {
@@ -734,26 +770,30 @@ fn row_line(
         NUM_W,
         sort == DSort::Frees,
     ));
-    spans.push(num(
-        match last_used {
-            Some((t, proxy)) => {
-                let text = ago(now, t);
-                if proxy && text != "-" {
-                    format!("~{text}")
-                } else {
-                    text
+    if c.last_used {
+        spans.push(num(
+            match last_used {
+                Some((t, proxy)) => {
+                    let text = ago(now, t);
+                    if proxy && text != "-" {
+                        format!("~{text}")
+                    } else {
+                        text
+                    }
                 }
-            }
-            None => "-".to_string(),
-        },
-        LAST_USED_W,
-        sort == DSort::LastUsed,
-    ));
-    spans.push(num(
-        created.map_or_else(|| "-".to_string(), |t| ago(now, t)),
-        NUM_W,
-        sort == DSort::Created,
-    ));
+                None => "-".to_string(),
+            },
+            LAST_USED_W,
+            sort == DSort::LastUsed,
+        ));
+    }
+    if c.created {
+        spans.push(num(
+            created.map_or_else(|| "-".to_string(), |t| ago(now, t)),
+            NUM_W,
+            sort == DSort::Created,
+        ));
+    }
     if c.show_share {
         let bar = match size {
             Some(s) if !is_layer && section_total > 0 => {

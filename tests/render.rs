@@ -2711,7 +2711,7 @@ fn docker_review_shows_what_blocks_it() {
         !t.contains("Move, then run") && !t.contains("Run the commands"),
         "{t}"
     );
-    assert!(t.contains("docker --context=desktop-linux image rm"), "{t}");
+    assert!(t.contains("docker image rm"), "{t}");
 }
 
 #[test]
@@ -2854,4 +2854,50 @@ fn explorer_shows_modified_when_there_is_room_for_it() {
     let t = render(&mut e.app, 170, 30);
     assert!(t.contains("Modified"), "{t}");
     assert!(t.contains("small.txt"), "{t}");
+}
+
+#[test]
+fn docker_review_shows_the_whole_target_of_a_removal() {
+    let long = "a-volume-with-quite-a-long-name-for-the-review-dialog-to-show-in-full";
+    let df = DOCKER_DF.replace("unmeasured", long);
+    let mut e = docker_screen_with(GlyphMode::Nerd, &df, true, false);
+    docker_cursor(&mut e, &format!("volume:{long}"));
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains(&format!("docker volume rm {long}")), "{t}");
+    assert!(
+        !t.contains("--context"),
+        "the flag is noise in the review:\n{t}"
+    );
+}
+
+#[test]
+fn docker_page_keeps_names_readable_on_a_narrow_terminal() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 100, 40);
+    // The name must be in the list row itself (left of its size), not only in
+    // the graph or Details panes on the right.
+    assert!(
+        t.lines().any(|l| matches!(
+            (l.find("web:latest"), l.find("1.0 KB")),
+            (Some(n), Some(s)) if n < s
+        )),
+        "the tag is not squeezed to an ellipsis:\n{t}"
+    );
+    assert!(!t.contains("Created"), "Created gives way first:\n{t}");
+    let wide = render(&mut e.app, 170, 40);
+    assert!(
+        wide.contains("Created") && wide.contains("Last used"),
+        "{wide}"
+    );
+    assert!(wide.contains("web:latest"));
+}
+
+#[test]
+fn docker_page_at_the_narrowest_keeps_size_and_frees() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 70, 30);
+    assert!(t.contains("Size") && t.contains("Frees"), "{t}");
+    assert!(!t.contains("Last used") && !t.contains("Created"), "{t}");
 }

@@ -289,10 +289,12 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
             Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
         )));
         for c in r.commands.iter().take(lay.shown_commands) {
+            // The whole command: what it will do must be readable before it
+            // is confirmed. Which tool, how much and where from go below.
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", g.dot()), Style::default().fg(DANGER)),
                 Span::styled(
-                    fit(&c.line, 40, g),
+                    fit(&c.line, (inner.width as usize).saturating_sub(4), g),
                     // A forced command is drawn in red: it skips a safety check.
                     if c.force {
                         Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
@@ -300,16 +302,18 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
                         Style::default().add_modifier(Modifier::BOLD)
                     },
                 ),
-                Span::styled(
-                    format!("  {}  up to {}", c.tool, human_size(c.up_to)),
-                    Style::default().fg(DIM),
-                ),
             ]));
             if !lay.compact {
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "    via {}",
-                        fit_start(&c.spec.program, (inner.width as usize).saturating_sub(8), g)
+                        "    {}  up to {}  via {}",
+                        c.tool,
+                        human_size(c.up_to),
+                        fit_start(
+                            &c.spec.program,
+                            (inner.width as usize).saturating_sub(40),
+                            g
+                        )
                     ),
                     Style::default().fg(DIM),
                 )));
