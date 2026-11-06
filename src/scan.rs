@@ -1589,7 +1589,7 @@ mod tests {
         let (s, root) = three_holders(r);
         let node = |n: &str| root.subdir(&r.join(n)).unwrap();
         let (store, a, b) = (node("store"), node("a"), node("b"));
-        assert_eq!(s.space_of_set(&[a.clone()]).frees_all(), 0);
+        assert_eq!(s.space_of_set(std::slice::from_ref(&a)).frees_all(), 0);
         assert_eq!(s.space_of_set(&[a.clone(), b.clone()]).frees_all(), 0);
         assert_eq!(s.space_of_set(&[store.clone(), a.clone()]).frees_all(), 0);
         let all = s.space_of_set(&[store, a, b]);
