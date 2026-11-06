@@ -2295,3 +2295,58 @@ fn the_command_dialogs_are_ascii_in_ascii_mode() {
     }
     e.app.update(Action::Cancel);
 }
+
+#[test]
+fn filtering_by_a_project_shows_its_caches_and_marks_why_the_group_matched() {
+    use ratatui::style::Color;
+    let mut e = targets_screen(GlyphMode::Nerd);
+    e.app.focus = maccleanup::app::Focus::Main;
+    e.app.update(Action::FilterOpen);
+    for c in "shop".chars() {
+        e.app.update(Action::FilterChar(c));
+    }
+    e.app.update(Action::FilterAccept);
+    let mut term = Terminal::new(TestBackend::new(170, 40)).unwrap();
+    term.draw(|f| ui::draw(f, &mut e.app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let text: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect();
+    assert!(
+        text.contains("~/shop") && text.contains("node_modules") && text.contains(".next"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("~/api") && !text.contains("Spotify"),
+        "{text}"
+    );
+    // The letters that matched "shop" in the group's name are highlighted.
+    let y = (0..buf.area.height)
+        .find(|&y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .contains("~/shop")
+        })
+        .unwrap();
+    let line: Vec<String> = (0..buf.area.width)
+        .map(|x| buf[(x, y)].symbol().to_string())
+        .collect();
+    let at = line.join("").find("shop").unwrap();
+    // Count cells (the border glyphs are single-width, so columns match).
+    let col = line.join("")[..at].chars().count() as u16;
+    for i in 0..4 {
+        assert_eq!(
+            buf[(col + i, y)].fg,
+            Color::Yellow,
+            "letter {i} of the match"
+        );
+    }
+    // The graph shows only the matching project.
+    assert_eq!(e.app.graph_hits.len(), 1);
+}

@@ -5478,4 +5478,51 @@ mod tests {
         });
         assert!(e.app.targets.find(&bin).is_none() || !bin.exists());
     }
+
+    // --- the filter works on projects and tools, not only on items ----------
+
+    fn filtered_names(app: &mut App, query: &str) -> Vec<String> {
+        app.focus = Focus::Main;
+        app.update(Action::FilterClear);
+        app.update(Action::FilterOpen);
+        for c in query.chars() {
+            app.update(Action::FilterChar(c));
+        }
+        let mut v = line_names(app);
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn typing_a_project_name_shows_the_project_and_all_its_caches() {
+        let mut e = targets_app();
+        let got = filtered_names(&mut e.app, "shop");
+        assert_eq!(got, [".next", "PROJECTS", "node_modules", "~/shop"]);
+        // Several words: a project and a kind of cache in it.
+        let got = filtered_names(&mut e.app, "shop next");
+        assert_eq!(got, [".next", "PROJECTS", "~/shop"]);
+    }
+
+    #[test]
+    fn typing_a_tool_name_shows_the_tools_group_and_all_its_items() {
+        let mut e = targets_app();
+        let got = filtered_names(&mut e.app, "app caches");
+        assert_eq!(got, ["App caches", "Spotify", "TOOLS"]);
+    }
+
+    #[test]
+    fn the_graph_follows_the_filtered_groups() {
+        let mut e = targets_app();
+        let _ = filtered_names(&mut e.app, "api");
+        let shown: Vec<_> = e
+            .app
+            .tlines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Group(g) => Some(e.app.targets.groups[*g].label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, ["api"]);
+    }
 }

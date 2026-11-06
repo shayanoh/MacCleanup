@@ -387,17 +387,31 @@ fn group_line(app: &App, gi: usize, c: &Cols) -> TextLine<'static> {
     if marked > 0 {
         title.push_str(&format!("  {marked}/{} marked", grp.rows.len()));
     }
-    let name_cell = format!(
-        "{}{}",
-        " ".repeat(c.prefix_w.saturating_sub(2)),
-        fit_pad(&title, c.name_w + 2, g)
+    // Where the filter matched the group's name (its folder name or tool).
+    let query = filter::parse(&app.filter.query);
+    let lead = c.prefix_w.saturating_sub(2);
+    let positions: Vec<usize> = if query.is_empty() || !grp.title.ends_with(&grp.label) {
+        Vec::new()
+    } else {
+        // The name is the end of the title: "v " + "~/dev/" + <label>.
+        let shift = lead + 2 + grp.title.chars().count() - grp.label.chars().count();
+        query
+            .matches(&grp.label)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p + shift)
+            .collect()
+    };
+    let name_cell = format!("{}{}", " ".repeat(lead), fit_pad(&title, c.name_w + 2, g));
+    let base = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = highlight(
+        &fit_pad(&name_cell, c.prefix_w + c.name_w, g),
+        &positions,
+        base,
+        base.fg(Color::Yellow),
     );
-    let mut spans = vec![Span::styled(
-        fit_pad(&name_cell, c.prefix_w + c.name_w, g),
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )];
     spans.extend(number_spans(&grp.as_row(), false, app.sort, None, g));
     TextLine::from(spans)
 }

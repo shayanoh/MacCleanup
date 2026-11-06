@@ -447,11 +447,20 @@ impl Targets {
     }
 
     /// The visible lines: section bands, group headers, and the rows of open
-    /// groups. An active filter shows only matching rows (and their groups)
-    /// whatever the folds say.
+    /// groups.
+    ///
+    /// A filter works on groups as well as items, whatever the folds say:
+    /// - a group whose *name* matches (`uv`, a project's folder name) is shown
+    ///   with all its items;
+    /// - otherwise only its items that match are shown, and a group with none
+    ///   is hidden;
+    /// - several terms may be spread over the group name and the item name
+    ///   (`mac node_modules`).
+    ///
+    /// Only the name is matched, not the group's path, so `dev` does not pick
+    /// up every project below `~/dev`.
     pub fn lines(&self, filter: &Query) -> Vec<Line> {
         let filtering = !filter.is_empty();
-        let matches = |r: &TRow| filter.matches(&r.row.name.to_string_lossy()).is_some();
         let mut out = Vec::new();
         for section in [SectionKind::Projects, SectionKind::Tools] {
             let mut body = Vec::new();
@@ -461,11 +470,20 @@ impl Targets {
                 .enumerate()
                 .filter(|(_, g)| g.section == section)
             {
+                // Each term matches the group's name or the item's name, so a
+                // group whose name matches shows all its items, and an
+                // exclusion (`!next`) still hides the items it names.
                 let hits: Vec<usize> = g
                     .rows
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| !filtering || matches(r))
+                    .filter(|(_, r)| {
+                        !filtering
+                            || filter.matches_fields(&[
+                                g.label.as_str(),
+                                r.row.name.to_string_lossy().as_ref(),
+                            ])
+                    })
                     .map(|(i, _)| i)
                     .collect();
                 if filtering && hits.is_empty() {
@@ -1027,6 +1045,151 @@ mod tests {
             1,
             "the filter overrides the fold and shows .next"
         );
+    }
+
+    /// The rows `lines` shows for a filter, as `group title / row name`.
+    fn shown(t: &Targets, q: &str) -> Vec<String> {
+        t.lines(&filter::parse(q))
+            .iter()
+            .filter_map(|l| match *l {
+                Line::Row { group, row } => Some(format!(
+                    "{}/{}",
+                    t.groups[group].title,
+                    t.row(group, row).row.name.to_string_lossy()
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_filter_that_matches_a_group_shows_all_its_items() {
+        let s = sandbox(|h| {
+            project(h);
+            write(&h.join("other/package.json"), 10);
+            write(&h.join("other/node_modules/a"), 5_000);
+        });
+        let t = build(&s, &[]);
+        let mut got = shown(&t, "shop");
+        got.sort();
+        assert_eq!(
+            got,
+            ["~/shop/.next", "~/shop/node_modules"],
+            "both of shop's items, though neither is named shop"
+        );
+        // Another group's items are not dragged in.
+        assert!(!shown(&t, "shop").iter().any(|r| r.contains("other")));
+    }
+
+    #[test]
+    fn a_tools_name_shows_that_tools_caches() {
+        let s = sandbox(|h| {
+            project(h);
+            write(&h.join("Library/Caches/Spotify/blob"), 10_000);
+            write(&h.join(".cache/uv/wheels/x"), 5_000);
+            write(&h.join("Library/Caches/pip/y"), 4_000);
+        });
+        let mut uv = entry(&s.home, "uv", "uv", ".cache/uv", Mode::Folder);
+        uv.label = "cache".to_string();
+        let mut pip = entry(&s.home, "pip", "pip", "Library/Caches/pip", Mode::Folder);
+        pip.label = "cache".to_string();
+        let spot = entry(
+            &s.home,
+            "spot",
+            "App caches",
+            "Library/Caches/Spotify",
+            Mode::Folder,
+        );
+        let t = build(&s, &[uv, pip, spot]);
+        assert_eq!(shown(&t, "uv"), ["uv/cache"], "only uv's caches");
+        assert_eq!(shown(&t, "pip"), ["pip/cache"]);
+    }
+
+    #[test]
+    fn an_item_name_still_shows_just_the_matching_items_of_other_groups() {
+        let s = sandbox(project);
+        let t = build(&s, &[]);
+        assert_eq!(shown(&t, "next"), ["~/shop/.next"]);
+        assert_eq!(shown(&t, "node_modules"), ["~/shop/node_modules"]);
+    }
+
+    #[test]
+    fn terms_combine_across_the_group_and_its_items() {
+        let s = sandbox(|h| {
+            project(h);
+            write(&h.join("other/package.json"), 10);
+            write(&h.join("other/node_modules/a"), 5_000);
+            write(&h.join("other/.next/a"), 5_000);
+        });
+        let t = build(&s, &[]);
+        assert_eq!(shown(&t, "shop next"), ["~/shop/.next"]);
+        assert_eq!(shown(&t, "other node_modules"), ["~/other/node_modules"]);
+        assert!(shown(&t, "shop nothingelse").is_empty());
+    }
+
+    #[test]
+    fn an_exclusion_still_hides_the_items_it_names_inside_a_matching_group() {
+        let s = sandbox(project);
+        let t = build(&s, &[]);
+        assert_eq!(shown(&t, "shop !next"), ["~/shop/node_modules"]);
+        assert!(
+            shown(&t, "!shop").is_empty() || !shown(&t, "!shop").iter().any(|r| r.contains("shop"))
+        );
+    }
+
+    #[test]
+    fn a_letters_cannot_be_borrowed_from_the_group_and_the_item_for_one_term() {
+        let s = sandbox(|h| {
+            project(h);
+            write(&h.join("Library/Caches/Spotify/blob"), 10_000);
+        });
+        let e = entry(
+            &s.home,
+            "spot",
+            "App caches",
+            "Library/Caches/Spotify",
+            Mode::Folder,
+        );
+        let t = build(&s, &[e]);
+        // "api" is not in "App caches" nor in "Spotify" on its own.
+        assert!(
+            shown(&t, "api").iter().all(|r| !r.contains("App caches")),
+            "{:?}",
+            shown(&t, "api")
+        );
+    }
+
+    #[test]
+    fn a_matching_group_is_shown_open_even_if_it_was_folded() {
+        let s = sandbox(project);
+        let closed: HashSet<String> = [format!("{:?}:~/shop", SectionKind::Projects)].into();
+        let t = Targets::build(&source(&s, &[], closed), &Work::new());
+        assert!(!t.groups.iter().find(|g| g.title == "~/shop").unwrap().open);
+        assert_eq!(shown(&t, "shop").len(), 2);
+    }
+
+    #[test]
+    fn a_groups_path_does_not_match_only_its_name() {
+        let s = sandbox(|h| {
+            write(&h.join("dev/zzz/package.json"), 10);
+            write(&h.join("dev/zzz/node_modules/a"), 5_000);
+        });
+        let t = build(&s, &[]);
+        assert!(
+            shown(&t, "dev").is_empty(),
+            "dev is in the path, not the name"
+        );
+        assert_eq!(shown(&t, "zzz").len(), 1);
+    }
+
+    #[test]
+    fn the_matching_group_header_stays_visible_with_its_section() {
+        let s = sandbox(project);
+        let t = build(&s, &[]);
+        let lines = t.lines(&filter::parse("shop"));
+        assert!(matches!(lines[0], Line::Section(SectionKind::Projects)));
+        assert!(matches!(lines[1], Line::Group(_)));
+        assert_eq!(lines.len(), 4, "section, group, two items: {lines:?}");
     }
 
     #[test]
