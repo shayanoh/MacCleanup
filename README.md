@@ -2,7 +2,7 @@
 
 A colorful, animated terminal app (Rust TUI) for macOS that shows where your disk space went and helps you free it safely. Open it, see your free space, clean up, and finish with a summary of exactly how much you got back.
 
-> **Status: milestone 1 is implemented.** The disk explorer, soft delete (ToBeDeleted folder), graphs and free-space accounting work today. The remaining features below are planned; see the design document for the full scope.
+> **Status: milestones 1 and 2 are implemented.** The disk explorer, soft delete (ToBeDeleted folder), graphs, free-space accounting, and the Caches & Projects screen work today. The remaining features below are planned; see the design document for the full scope.
 
 ## What works today
 
@@ -22,11 +22,14 @@ A colorful, animated terminal app (Rust TUI) for macOS that shows where your dis
 - **Honest accounting:** the finish screen reports space truly freed (the volume's free space now minus at the start), not just what was moved.
 - **Safety:** a hard-coded protected list, a review screen before every delete, and an extra explicit confirmation for anything irreversible (see below).
 
+- **Caches & Projects** (`4`): one list of things that come back by themselves. A blue **PROJECTS** section groups build output by project (`node_modules`, `.next`, `.turbo`, Rust `target`, `.dart_tool`, Flutter and Xcode `build`, `Pods`; only when the project's `package.json`, `Cargo.toml`, `pubspec.yaml`, `Podfile` or `.xcodeproj` sits next to it) and a purple **TOOLS & CACHES** section groups tool caches (pnpm, npm, Yarn, Go, uv, pip, Homebrew, Cargo, Dart/Flutter pub, Xcode DerivedData, Playwright, and every other folder in `~/Library/Caches` and `~/.cache`). It has the Explorer's columns, sort, filter, graph and keys. Because pnpm clones files into every project, one row's size lies: the footer shows **what everything you marked really frees, as a set**, recomputed in the background on every mark. The details pane names the other folders that hold the same data (with their mark state) and `m` marks them all, so you can keep one project's `node_modules` and clear the rest. Marks are shared with the Explorer: mark in either place, and `d` reviews everything.
+- **Tool commands:** caches that have their own clean command (pnpm, npm, Yarn, Go, uv, pip, Homebrew) are cleaned by that command, listed in the review with the exact install it runs. Each pnpm store version (`store/v10`, `store/v11`) is pruned by the pnpm that owns it; installs under fnm, nvm and volta, including corepack shims, are found, and commands run in your home folder with downloads and prompts disabled, so they cannot hang. A review that runs commands needs an explicit `y` (never `Enter`), and a failing command does not stop the others or undo the moves.
+
 ## Planned
 
 A Time Machine snapshots screen (list them with sizes, thin or delete them) is the next phase; for now the app only tells you how much they hold.
 
-App leftovers, app uninstaller, caches (npm, pnpm, cargo, Xcode, Playwright and more, cleaned through each tool's own command), project artifacts (`node_modules`, `.next`, `.turbo`, Rust `target`, Xcode `DerivedData`), a Docker panel, Time Machine snapshots, simulators, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed.
+App leftovers, app uninstaller, a Docker panel, Time Machine snapshots, simulators, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed.
 
 ## Build and run
 
@@ -64,12 +67,14 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `r` / `R` | Rescan the folder you are viewing / rescan everything (refused while a scan is running; on the ToBeDeleted screen `r` is restore) |
 | `s` | Cycle sort in header order: name, size, on-disk size (the default), frees. The sorted column is white with an arrow in the header |
 | `Tab` | Switch focus between the menu and the list (the menu has focus at startup: `j`/`k` choose a screen, `Enter` opens it) |
-| `1` `2` `3` | Home, Explorer, ToBeDeleted |
+| `1` `2` `3` `4` | Home, Explorer, ToBeDeleted, Caches & Projects |
+| `h` / `l` (Caches & Projects) | Fold / open the group; `l` or `Enter` on a row shows it in the Explorer |
+| `m` (Caches & Projects) | Mark the selected folder and every folder that shares its data |
 | `r` / `D` / `E` (ToBeDeleted screen) | Restore / delete for good / empty all |
 | `q`, `Esc` | Quit (`Esc` first clears an active filter, then goes up a folder; quitting asks first if ToBeDeleted still holds items) |
 | mouse | Click rows and menu entries, scroll with the wheel |
 
-In the review dialog: `Enter` moves items to ToBeDeleted, `x` offers "move, then empty now" (irreversible), `Esc` cancels. Irreversible actions need an explicit `y`; `Enter` never confirms them.
+In the review dialog: `Enter` moves items to ToBeDeleted, `x` offers "move, then empty now" (irreversible), `Esc` cancels. Irreversible actions need an explicit `y`; `Enter` never confirms them. When the review contains tool commands, only `y` runs it.
 
 ## Safety
 
@@ -93,5 +98,6 @@ The smoke script drives the real binary in a throwaway `HOME` (mark, review, sof
 ## Documentation
 
 - Design: [`docs/superpowers/specs/2026-11-06-maccleanup-design.md`](docs/superpowers/specs/2026-11-06-maccleanup-design.md)
+- Caches & Projects design: [`docs/superpowers/specs/2026-11-06-caches-projects-design.md`](docs/superpowers/specs/2026-11-06-caches-projects-design.md) and plan: [`docs/superpowers/plans/2026-11-06-caches-projects.md`](docs/superpowers/plans/2026-11-06-caches-projects.md)
 - Milestone 1 plan: [`docs/superpowers/plans/2026-11-06-maccleanup-milestone-1.md`](docs/superpowers/plans/2026-11-06-maccleanup-milestone-1.md)
 - Contributor and AI-assistant guidance: [`CLAUDE.md`](CLAUDE.md)
