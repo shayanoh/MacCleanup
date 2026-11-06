@@ -1,0 +1,7 @@
+[
+  {"Id": "sha256:aaa1", "Created": 1792000000, "CreatedBy": "CMD [\"node\"]", "Size": 0, "Comment": "", "Tags": ["web:latest"]},
+  {"Id": "<missing>", "Created": 1791999990, "CreatedBy": "RUN /bin/sh -c pnpm install # buildkit", "Size": 600, "Comment": "", "Tags": null},
+  {"Id": "<missing>", "Created": 1791999980, "CreatedBy": "WORKDIR /app", "Size": 0, "Comment": "", "Tags": null},
+  {"Id": "<missing>", "Created": 1791999970, "CreatedBy": "COPY package.json ./ # buildkit", "Size": 4096, "Comment": "", "Tags": null},
+  {"Id": "<missing>", "Created": 1791999960, "CreatedBy": "ADD alpine-minirootfs.tar.gz / # buildkit", "Size": 7000000, "Comment": "", "Tags": null}
+]

@@ -1,0 +1,1 @@
+[{"Name": "desktop-linux", "Metadata": {}, "Endpoints": {"docker": {"Host": "unix:///Users/someone/.docker/run/docker.sock", "SkipTLSVerify": false}}, "TLSMaterial": {}, "Storage": {"MetadataPath": "x", "TLSPath": "y"}}]
