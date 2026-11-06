@@ -21,6 +21,53 @@ pub fn is_docker_id(id: &str) -> bool {
         .any(|p| id.starts_with(p))
 }
 
+/// More than this many removals of one kind (containers, images, build-cache
+/// records) are shown as a single review row: the review cannot scroll its
+/// commands, and fifty rows would make it impossible to confirm. Volumes are
+/// never folded together: each can hold data, so each is named.
+const COLLAPSE_ABOVE: usize = 4;
+
+/// Fold long runs of the same kind of removal into one row that still runs
+/// every command (`ReviewCommand::group`).
+fn collapse_bulk(items: Vec<(ItemKind, ReviewCommand, String)>) -> Vec<ReviewCommand> {
+    let mut out: Vec<ReviewCommand> = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let kind = items[i].0;
+        let run: Vec<&(ItemKind, ReviewCommand, String)> = items[i..]
+            .iter()
+            .take_while(|(k, _, _)| *k == kind)
+            .collect();
+        i += run.len();
+        let n = run.len();
+        let foldable = matches!(
+            kind,
+            ItemKind::Container | ItemKind::Image | ItemKind::CacheRecord
+        );
+        if !foldable || n <= COLLAPSE_ABOVE {
+            out.extend(run.iter().map(|(_, c, _)| c.clone()));
+            continue;
+        }
+        let mut head = run[0].1.clone();
+        head.up_to = run.iter().map(|(_, c, _)| c.up_to).sum();
+        head.group = run[1..]
+            .iter()
+            .map(|(_, c, _)| (c.id.clone(), c.spec.clone()))
+            .collect();
+        let names = {
+            let first: Vec<&str> = run.iter().take(3).map(|(_, _, n)| n.as_str()).collect();
+            format!("{}{}", first.join(", "), if n > 3 { ", ..." } else { "" })
+        };
+        head.line = match kind {
+            ItemKind::Container => format!("docker container rm: {n} containers ({names})"),
+            ItemKind::Image => format!("docker image rm: {n} images ({names})"),
+            _ => format!("docker builder prune: {n} build-cache records"),
+        };
+        out.push(head);
+    }
+    out
+}
+
 /// A Docker command as the review shows it: without the context flag
 /// (noise) and with long image ids shortened. Only for display: what runs is
 /// the spec itself.
@@ -66,6 +113,7 @@ impl App {
             match self.docker.job.value.take() {
                 Some(Ok(load)) => {
                     self.docker.accept(load);
+                    self.docker_check_removals();
                     // Things that no longer exist cannot stay marked.
                     let analysis = &self.docker.analysis;
                     self.tool_marks.retain(|id| {
@@ -92,6 +140,32 @@ impl App {
         }
         if self.docker.stale && !self.docker.job.pending {
             self.reload_docker();
+        }
+    }
+
+    /// After a cleanup: if Docker still lists something it was asked to
+    /// remove, say so instead of letting "ok" stand (a prune filter that
+    /// matched nothing, a record an image still holds...).
+    fn docker_check_removals(&mut self) {
+        self.docker.warning = None;
+        let expected = std::mem::take(&mut self.docker_check_gone);
+        let a = &self.docker.analysis;
+        let still: Vec<String> = expected
+            .into_iter()
+            .filter_map(|id| a.items.get(&id).map(|f| f.name.clone()))
+            .collect();
+        if !still.is_empty() {
+            let names: Vec<String> = still
+                .iter()
+                .take(3)
+                .map(|n| crate::ui::docker::tidy_command(n))
+                .collect();
+            self.docker.warning = Some(format!(
+                "Docker still lists {} item(s) it was asked to remove: {}{}",
+                still.len(),
+                names.join(", "),
+                if still.len() > 3 { ", ..." } else { "" }
+            ));
         }
     }
 
@@ -329,17 +403,45 @@ impl App {
             path: PathBuf::new(),
             can_force: false,
             force: false,
+            group: Vec::new(),
         };
-        let mut out = Vec::new();
+        let mut out: Vec<(ItemKind, ReviewCommand, String)> = Vec::new();
         let mut trim = false;
         for id in removal_order(a, &marked) {
             if id == TRIM_ITEM {
                 trim = true;
-            } else if let Some(spec) = crate::docker::remove::removal_spec(&load.cli, data, &id) {
-                let up_to = a.items.get(&id).map_or(0, |f| f.frees_alone);
-                out.push(command(id, spec, up_to));
+                continue;
             }
+            let (Some(spec), Some(facts)) = (
+                crate::docker::remove::removal_spec(&load.cli, data, &id),
+                a.items.get(&id),
+            ) else {
+                continue;
+            };
+            let mut c = command(id.clone(), spec, facts.frees_alone);
+            // Say which one it is: a name or a step, not only an id.
+            let short: String = id
+                .rsplit(':')
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(12)
+                .collect();
+            match facts.kind {
+                ItemKind::Container => {
+                    c.line = format!("docker container rm {} ({short})", facts.name);
+                }
+                ItemKind::CacheRecord => {
+                    c.line = format!(
+                        "docker builder prune: {} ({short})",
+                        crate::ui::docker::tidy_command(&facts.name)
+                    );
+                }
+                _ => {}
+            }
+            out.push((facts.kind, c, facts.name.clone()));
         }
+        let mut out = collapse_bulk(out);
         if trim {
             if !load.vm_tools {
                 out.push(command(
@@ -387,12 +489,24 @@ impl App {
         };
     }
 
+    /// Remember which Docker items the review is about to remove, so the
+    /// next read can say if Docker still lists any of them.
+    pub(super) fn docker_note_expected_gone(&mut self, commands: &[ReviewCommand]) {
+        self.docker_expect_gone = commands
+            .iter()
+            .flat_map(|c| std::iter::once(&c.id).chain(c.group.iter().map(|(id, _)| id)))
+            .filter(|id| is_docker_id(id) && !id.starts_with("vm:"))
+            .cloned()
+            .collect();
+    }
+
     /// After Docker commands ran: the VM disk file before and after, and a
     /// fresh read of Docker.
     pub(super) fn docker_after_commands(&mut self, ran: bool) -> Option<(u64, u64)> {
         if !ran {
             return None;
         }
+        self.docker_check_gone = std::mem::take(&mut self.docker_expect_gone);
         self.reload_docker();
         let before = self.docker_vm_before.take()?;
         Some((before, vm_disk_allocated(self.policy.home()).unwrap_or(0)))
@@ -848,7 +962,7 @@ mod tests {
         e.app.update(Action::OpenReview);
         let lines = review_lines(&e.app);
         let want = [
-            "container rm c0ffee2".to_string(),
+            "container rm old (c0ffee2)".to_string(),
             "image rm sha256:bbb2".to_string(),
             "volume rm unmeasured".to_string(),
             BUILD.to_string(),
@@ -865,8 +979,173 @@ mod tests {
         mark(&mut e.app, "container:c0ffee2");
         e.app.update(Action::OpenReview);
         let lines = review_lines(&e.app);
-        assert_eq!(lines[0], "docker container rm c0ffee2");
+        assert_eq!(
+            lines[0], "docker container rm old (c0ffee2)",
+            "the container's name, then its id"
+        );
         assert!(lines.iter().all(|l| !l.contains("--context")), "{lines:?}");
+    }
+
+    #[test]
+    fn a_cache_record_is_shown_by_its_step_not_only_its_id() {
+        let mut e = loaded_app();
+        mark(&mut e.app, "cache:child1");
+        e.app.update(Action::OpenReview);
+        let lines = review_lines(&e.app);
+        assert!(
+            lines[0].contains("apt-get update") && lines[0].contains("(child1)"),
+            "{lines:?}"
+        );
+    }
+
+    /// A Docker whose build cache holds `n` unused records.
+    fn many_records(n: usize) -> Arc<FakeRunner> {
+        let recs: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{"ID":"rec{i:02}","Type":"regular","Description":"step {i}","InUse":false,"Shared":false,"Size":1000,"CreatedAt":"2026-10-23T14:51:03Z","LastUsedAt":"2026-10-23T15:00:23Z","UsageCount":1}}"#
+                )
+            })
+            .collect();
+        let df = format!(
+            r#"{{"LayersSize":0,"Images":[],"Volumes":[],"BuildCache":[{}]}}"#,
+            recs.join(",")
+        );
+        Arc::new(FakeRunner::new(&["docker"]).answering(&[
+            ("context inspect", CONTEXT),
+            ("/_ping", "OK"),
+            ("/system/df", Box::leak(df.into_boxed_str())),
+            ("/containers/json?all=1", "[]"),
+        ]))
+    }
+
+    #[test]
+    fn a_bulk_mark_of_many_records_is_one_reviewable_row_that_runs_every_removal() {
+        let fake = many_records(12);
+        let mut e = loaded_with(fake.clone());
+        cursor_on(&mut e.app, "section:cache");
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::OpenReview);
+        let r = review_of(&e.app);
+        // The records, plus the helper build and the trim: three rows, not fourteen.
+        assert!(r.commands.len() <= 3, "{:?}", review_lines(&e.app));
+        assert!(
+            r.commands[0].line.contains("12 build-cache records"),
+            "{}",
+            r.commands[0].line
+        );
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        let ran: Vec<String> = fake.calls().iter().map(|c| c.display()).collect();
+        for i in 0..12 {
+            let want = format!("--filter id=rec{i:02}");
+            assert!(ran.iter().any(|c| c.contains(&want)), "{want} in {ran:?}");
+        }
+        assert_eq!(ran.len(), 14, "twelve prunes, the build, the trim");
+        assert_eq!(finish_of(&e.app).commands.len(), 14, "every one reported");
+        assert!(e.app.tool_marks.is_empty());
+    }
+
+    #[test]
+    fn a_few_records_are_still_listed_one_by_one() {
+        let mut e = loaded_with(many_records(3));
+        cursor_on(&mut e.app, "section:cache");
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::OpenReview);
+        let lines = review_lines(&e.app);
+        assert_eq!(
+            lines.iter().filter(|l| l.contains("builder prune")).count(),
+            3,
+            "{lines:?}"
+        );
+    }
+
+    /// A Docker that really loses a container once a command has run.
+    struct Vanishing {
+        removed: std::sync::atomic::AtomicBool,
+        really: bool,
+    }
+
+    impl crate::catalog::CommandRunner for Vanishing {
+        fn run(
+            &self,
+            _: &crate::catalog::CommandSpec,
+            _: &crate::catalog::RunControl,
+        ) -> crate::catalog::CommandResult {
+            self.removed
+                .store(self.really, std::sync::atomic::Ordering::SeqCst);
+            crate::catalog::CommandResult {
+                ok: true,
+                cancelled: false,
+                output_tail: String::new(),
+            }
+        }
+        fn query(&self, spec: &crate::catalog::CommandSpec) -> Option<String> {
+            let full = spec.full();
+            let gone = self.removed.load(std::sync::atomic::Ordering::SeqCst);
+            let containers = if gone {
+                "[]"
+            } else {
+                r#"[{"Id":"old1","Names":["/old"],"ImageID":"sha256:bbb2","State":"exited","Created":1,"Mounts":[]}]"#
+            };
+            let df = r#"{"LayersSize":0,"Images":[],"Volumes":[],"BuildCache":[]}"#;
+            if full.contains("context inspect") {
+                Some(CONTEXT.to_string())
+            } else if full.contains("/_ping") {
+                Some("OK".to_string())
+            } else if full.contains("/system/df") {
+                Some(df.to_string())
+            } else if full.contains("/containers/json?all=1") {
+                Some(containers.to_string())
+            } else if full.contains("/containers/old1/json") {
+                Some("{}".to_string())
+            } else {
+                None
+            }
+        }
+        fn available(&self, program: &str) -> bool {
+            program.ends_with("docker")
+        }
+    }
+
+    fn removal_run(really: bool) -> App {
+        let mut e = env(&[("a.txt", 10)]);
+        e.app.runner = Arc::new(Vanishing {
+            removed: std::sync::atomic::AtomicBool::new(false),
+            really,
+        });
+        e.app.update(Action::GoTo(Screen::Docker));
+        wait_docker(&mut e.app);
+        mark(&mut e.app, "container:old1");
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        wait_docker(&mut e.app);
+        // Keep the tempdir alive until here by leaking the Env's drop order.
+        std::mem::forget(e._dir);
+        e.app
+    }
+
+    #[test]
+    fn a_removal_docker_ignored_is_reported_not_called_ok() {
+        let app = removal_run(false);
+        let note = app.docker.warning.clone().unwrap_or_default();
+        assert!(note.contains("still lists"), "{note:?}");
+        assert!(note.contains("old"), "{note:?}");
+    }
+
+    #[test]
+    fn a_removal_that_really_happened_raises_no_alarm() {
+        let app = removal_run(true);
+        assert!(
+            !app.docker
+                .warning
+                .clone()
+                .unwrap_or_default()
+                .contains("still lists"),
+            "{:?}",
+            app.docker.warning
+        );
     }
 
     #[test]

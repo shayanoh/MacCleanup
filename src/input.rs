@@ -596,6 +596,7 @@ mod tests {
                     path: std::path::PathBuf::new(),
                     can_force: false,
                     force: false,
+                    group: Vec::new(),
                 })
                 .collect(),
             total: Usage::default(),

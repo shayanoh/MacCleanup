@@ -2901,3 +2901,45 @@ fn docker_page_at_the_narrowest_keeps_size_and_frees() {
     assert!(t.contains("Size") && t.contains("Frees"), "{t}");
     assert!(!t.contains("Last used") && !t.contains("Created"), "{t}");
 }
+
+#[test]
+fn docker_file_browser_status_line_cleans_folder_names_from_inside_a_volume() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    e.app.docker.browse.as_mut().unwrap().dir = "/evil\u{1b}[31mdir".to_string();
+    let cells = render_cells(&mut e.app, 120, 30);
+    assert!(
+        cells.iter().all(|c| !c.contains('\u{1b}')),
+        "an escape sequence from a file name reached the screen"
+    );
+}
+
+#[test]
+fn the_finish_screen_summarises_a_long_list_of_command_results() {
+    use maccleanup::app::{CommandOutcome, FinishInfo};
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let outcomes: Vec<CommandOutcome> = (0..40)
+        .map(|i| CommandOutcome {
+            line: format!("docker builder prune -f --filter id=rec{i:02}"),
+            ok: i != 7,
+            cancelled: false,
+            note: "refused".to_string(),
+            lock_wait: false,
+        })
+        .collect();
+    e.app.dialog = Some(Dialog::Finish(FinishInfo {
+        moved: Default::default(),
+        emptied: Default::default(),
+        free_before: 0,
+        free_after: 0,
+        failures: 0,
+        first_failure: None,
+        commands: outcomes,
+        retry: Vec::new(),
+        started_tick: 0,
+        vm_disk: None,
+    }));
+    let t = render(&mut e.app, 150, 50);
+    assert!(t.contains("rec07"), "the failed one is always listed:\n{t}");
+    assert!(t.contains("and 32 more"), "{t}");
+    assert!(!t.contains("rec39"), "the rest are summarised:\n{t}");
+}

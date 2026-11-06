@@ -696,7 +696,34 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
             Style::default().fg(DANGER),
         )));
     }
-    for c in &f.commands {
+    // A long list is summarised: every failure is shown (up to the cap),
+    // then the first of the rest, and a line says how many are hidden.
+    const SHOWN: usize = 8;
+    let mut shown: Vec<usize> = f
+        .commands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.ok)
+        .map(|(i, _)| i)
+        .take(SHOWN)
+        .collect();
+    for i in 0..f.commands.len() {
+        if shown.len() >= SHOWN {
+            break;
+        }
+        if !shown.contains(&i) {
+            shown.push(i);
+        }
+    }
+    shown.sort_unstable();
+    let hidden = f.commands.len() - shown.len();
+    let hidden_failed = f
+        .commands
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| !c.ok && !shown.contains(i))
+        .count();
+    for c in shown.iter().map(|&i| &f.commands[i]) {
         let (mark, color) = if c.ok {
             (g.check(), SAFE)
         } else if c.cancelled {
@@ -725,6 +752,20 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
                 Style::default().fg(CAUTION),
             )));
         }
+    }
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} and {hidden} more ({})",
+                g.ellipsis(),
+                if hidden_failed == 0 {
+                    "all ok".to_string()
+                } else {
+                    format!("{hidden_failed} failed")
+                }
+            ),
+            Style::default().fg(DIM),
+        )));
     }
     if let Some((before, after)) = f.vm_disk {
         let change = match after.cmp(&before) {
@@ -893,6 +934,7 @@ mod review_layout_tests {
                     path: std::path::PathBuf::new(),
                     can_force: false,
                     force: false,
+                    group: Vec::new(),
                 })
                 .collect(),
             total: Usage::default(),

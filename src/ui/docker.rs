@@ -266,6 +266,11 @@ fn status_line(app: &App, width: usize) -> TextLine<'static> {
             format!("{} {}", g.warn(), e.message()),
             Style::default().fg(Color::Yellow),
         ));
+    } else if let Some(w) = &app.docker.warning {
+        spans.push(Span::styled(
+            format!("{} {w}", g.warn()),
+            Style::default().fg(Color::Yellow),
+        ));
     } else {
         spans.push(Span::styled(
             g.check().to_string(),

@@ -190,7 +190,10 @@ fn status_line(app: &App, b: &BrowseState, width: usize) -> TextLine<'static> {
             g.check().to_string(),
             Style::default().fg(Color::Green),
         ));
-        spans.push(Span::raw(format!(" {}", b.dir)));
+        spans.push(Span::raw(format!(
+            " {}",
+            fit_start(&b.dir, width.saturating_sub(4), g)
+        )));
     }
     let used: usize = spans.iter().map(|s| text_width(&s.content)).sum();
     if used > width {

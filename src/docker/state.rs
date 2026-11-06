@@ -44,6 +44,9 @@ pub struct DockerState {
     /// the last one); the user marked it themselves; or they took it off
     /// while removals were marked (then marking more does not bring it back).
     pub browse: Option<crate::docker::browse::BrowseState>,
+    /// Something to tell the user after a cleanup (Docker still lists what
+    /// it was asked to remove); cleared by the next read.
+    pub warning: Option<String>,
     pub trim_auto: bool,
     pub trim_declined: bool,
     pub detail_scroll: usize,
@@ -73,6 +76,7 @@ impl DockerState {
             stale: false,
             read_once: false,
             browse: None,
+            warning: None,
             trim_auto: false,
             trim_declined: false,
             detail_scroll: 0,

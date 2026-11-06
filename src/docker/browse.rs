@@ -1,8 +1,9 @@
 //! Looking inside an image or volume, read-only. A volume is listed by a
 //! throwaway container of our helper image with the volume mounted
-//! read-only and no network; an image by running only `ls` from it, also
+//! read-only and no network; an image by running only its own `sh` with our listing script, also
 //! without network and with a read-only root. Nothing here can change what
-//! it looks at. A folder's size is the total of everything below it, as in
+//! it looks at. The first time a volume is opened the helper image is built
+//! (Docker pulls busybox once if it is not there). A folder's size is the total of everything below it, as in
 //! the Explorer.
 
 use crate::bg::Latest;
@@ -143,7 +144,7 @@ impl BrowseState {
                 let done = cli.runner().run(&build, &RunControl::new());
                 if !done.ok {
                     return Err(
-                        "could not build the helper image (is Docker able to pull alpine?)"
+                        "could not build the helper image (Docker needs to pull busybox once)"
                             .to_string(),
                     );
                 }

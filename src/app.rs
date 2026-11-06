@@ -204,6 +204,10 @@ pub struct ReviewCommand {
     pub can_force: bool,
     /// The user chose the forced form for this run.
     pub force: bool,
+    /// More commands of the same kind that run right after this one and are
+    /// shown as part of this row (`(id, spec)`): a bulk mark of fifty build
+    /// cache records is one reviewable row, not fifty.
+    pub group: Vec<(String, CommandSpec)>,
 }
 
 impl ReviewCommand {
@@ -506,6 +510,10 @@ pub struct App {
     quit_after_job: bool,
     /// What the Docker VM disk file took on the Mac before Docker commands ran.
     docker_vm_before: Option<u64>,
+    /// Docker items the running review removes, and (once its commands are
+    /// done) the ones the next read must no longer list.
+    docker_expect_gone: Vec<String>,
+    docker_check_gone: Vec<String>,
 }
 
 /// The order the explorer (and every screen like it) puts rows in: biggest
@@ -626,6 +634,8 @@ impl App {
             tool_marks: BTreeSet::new(),
             docker: crate::docker::state::DockerState::new(),
             docker_vm_before: None,
+            docker_expect_gone: Vec::new(),
+            docker_check_gone: Vec::new(),
             set_space: Latest::new(),
             set_exact: true,
             holders: Latest::new(),
@@ -1839,6 +1849,7 @@ impl App {
                         path: r.row.path.clone(),
                         can_force: spec.can_force(),
                         force: false,
+                        group: Vec::new(),
                     })
                 }
                 _ => None,
@@ -2230,11 +2241,14 @@ impl App {
         self.pending_commands = review
             .commands
             .iter()
-            .map(|c| (c.id.clone(), c.effective_spec()))
+            .flat_map(|c| {
+                std::iter::once((c.id.clone(), c.effective_spec())).chain(c.group.iter().cloned())
+            })
             .collect();
         self.pending_meta = review.commands.clone();
         let ids: Vec<String> = review.commands.iter().map(|c| c.id.clone()).collect();
         self.docker_note_vm_before(&ids);
+        self.docker_note_expected_gone(&review.commands);
         if items.is_empty() {
             self.start_commands();
             return;
