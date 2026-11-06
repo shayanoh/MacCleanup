@@ -811,6 +811,39 @@ impl Scanner {
         }
     }
 
+    /// Take a subtree's bytes out of every total: the ancestors' counters,
+    /// the scan counters, the link and clone tables and the denied list.
+    fn forget_totals(&self, node: &Arc<Node>, parent: &Arc<Node>, old: &Tally) {
+        sub_up(parent, old);
+        for (counter, by) in [
+            (&self.shared.files_seen, old.files),
+            (&self.shared.bytes_seen, old.size),
+            (&self.shared.disk_seen, old.disk),
+        ] {
+            let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(by))
+            });
+        }
+        self.forget_links_under(node, parent);
+        self.shared.clones.forget_under(&node.path);
+        lock(&self.shared.denied).retain(|p| !p.starts_with(&node.path));
+    }
+
+    /// A folder that no longer exists (it was moved away or deleted): drop it
+    /// from the tree and from every total, without scanning anything. Returns
+    /// false while a scan runs, and for the root (it has no parent to leave).
+    pub fn forget_dir(&self, node: &Arc<Node>) -> bool {
+        if !self.is_idle() {
+            return false;
+        }
+        let Some(parent) = node.parent.upgrade() else {
+            return false;
+        };
+        self.forget_totals(node, &parent, &node.tally());
+        lock(&parent.subdirs).retain(|n| n.path != node.path);
+        true
+    }
+
     /// Start over: scan `path` again from scratch with fresh counters.
     /// Returns `None` while a scan is still running.
     pub fn rescan_all(&self, path: &Path) -> Option<Arc<Node>> {
@@ -842,21 +875,7 @@ impl Scanner {
         };
         refresh_local_snapshots();
         let old = node.tally();
-
-        // Forget what the old subtree contributed.
-        sub_up(&parent, &old);
-        for (counter, by) in [
-            (&self.shared.files_seen, old.files),
-            (&self.shared.bytes_seen, old.size),
-            (&self.shared.disk_seen, old.disk),
-        ] {
-            let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(by))
-            });
-        }
-        self.forget_links_under(node, &parent);
-        self.shared.clones.forget_under(&node.path);
-        lock(&self.shared.denied).retain(|p| !p.starts_with(&node.path));
+        self.forget_totals(node, &parent, &old);
 
         // Swap in a fresh node and mark every ancestor unfinished until the
         // new subtree completes.
@@ -1700,6 +1719,51 @@ mod tests {
         write(&r.join("lonely/z"), 100);
         let (s2, root2) = scan(&r.join("lonely"), 2);
         assert!(s2.view().sharers(&root2).is_empty());
+    }
+
+    #[test]
+    fn forgetting_a_folder_removes_it_and_its_bytes_from_every_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/f1"), 8192);
+        write(&r.join("b/f2"), 4096);
+        let (s, root) = scan(r, 2);
+        assert_eq!((root.size(), root.files()), (12288, 2));
+        let b = root.subdir(&r.join("b")).unwrap();
+        assert!(s.forget_dir(&b));
+        assert_eq!((root.size(), root.files()), (8192, 1));
+        assert!(root.subdir(&r.join("b")).is_none());
+        assert_eq!(s.stats().files, 1);
+        assert_eq!(s.stats().bytes, 8192);
+    }
+
+    #[test]
+    fn forgetting_is_refused_while_a_scan_runs_and_for_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/f1"), 100);
+        let (s, root) = scan(r, 2);
+        let a = root.subdir(&r.join("a")).unwrap();
+        s.set_busy(true);
+        assert!(!s.forget_dir(&a));
+        s.set_busy(false);
+        assert!(!s.forget_dir(&root), "the root has no parent to leave");
+        assert!(root.subdir(&r.join("a")).is_some());
+    }
+
+    #[test]
+    fn a_forgotten_folder_no_longer_counts_as_a_holder_of_shared_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let (s, root) = three_holders(r);
+        let (a, b) = (
+            root.subdir(&r.join("a")).unwrap(),
+            root.subdir(&r.join("b")).unwrap(),
+        );
+        assert!(s.view().sharers(&b).contains(&r.join("a")));
+        assert!(s.forget_dir(&a));
+        assert!(!s.view().sharers(&b).contains(&r.join("a")));
+        assert!(s.view().sharers(&b).contains(&r.join("store")));
     }
 
     #[test]

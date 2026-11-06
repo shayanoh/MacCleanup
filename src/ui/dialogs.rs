@@ -863,6 +863,7 @@ mod review_layout_tests {
                     line: format!("tool{i} clean"),
                     spec: CommandSpec::new("tool", &["clean"]),
                     up_to: 0,
+                    path: std::path::PathBuf::new(),
                     can_force: false,
                     force: false,
                 })

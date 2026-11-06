@@ -581,6 +581,7 @@ mod tests {
                     line: "tool clean".to_string(),
                     spec: CommandSpec::new("tool", &["clean"]),
                     up_to: 0,
+                    path: std::path::PathBuf::new(),
                     can_force: false,
                     force: false,
                 })

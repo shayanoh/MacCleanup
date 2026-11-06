@@ -185,6 +185,8 @@ pub struct ReviewCommand {
     pub spec: CommandSpec,
     /// The most it might free (what deleting its folder alone would).
     pub up_to: u64,
+    /// The folder this command cleans (its numbers are refreshed afterwards).
+    pub path: PathBuf,
     /// The command has a `--force` variant (uv's in-use check can be skipped).
     pub can_force: bool,
     /// The user chose the forced form for this run.
@@ -324,6 +326,15 @@ pub struct Detail {
     pub complete: bool,
 }
 
+/// Something that changed on disk after a cleanup, to be reflected in the scan.
+#[derive(Clone, Debug)]
+enum Refresh {
+    /// Moved away or deleted: drop it from the tree and every total.
+    Gone(PathBuf),
+    /// Still there but its contents changed (a command ran): scan it again.
+    Changed(PathBuf),
+}
+
 /// A running tool command as the Working dialog shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandStatus {
@@ -438,7 +449,10 @@ pub struct App {
     closed_groups: HashSet<String>,
     targets_synced: bool,
     /// The list being built on a thread (a full walk of the scan tree).
-    targets_job: Latest<(Targets, bool)>,
+    targets_job: Latest<(Targets, bool, u64)>,
+    /// Bumped whenever the scan data changes under the list (a cleanup was
+    /// reflected in the tree); a build from before that is not up to date.
+    scan_epoch: u64,
     /// Something changed while a build ran: build once more when it lands.
     targets_stale: bool,
     /// What the list build and the tool lookup are doing (for progress bars).
@@ -459,6 +473,8 @@ pub struct App {
     cmd_ctl: Option<Arc<RunControl>>,
     /// What the commands in `pending_commands` were in the review.
     pending_meta: Vec<ReviewCommand>,
+    /// Cleanups waiting to be reflected in the scan, one at a time.
+    refresh_queue: std::collections::VecDeque<Refresh>,
     /// Ids and commands waiting to run (or running) after the moves.
     pending_commands: Vec<(String, CommandSpec)>,
     cmd_outcomes: Vec<CommandOutcome>,
@@ -575,6 +591,7 @@ impl App {
             closed_groups: HashSet::new(),
             targets_synced: false,
             targets_job: Latest::new(),
+            scan_epoch: 0,
             targets_stale: false,
             build_work: Work::new(),
             tools_work: Work::new(),
@@ -588,6 +605,7 @@ impl App {
             cmd_job: None,
             cmd_ctl: None,
             pending_meta: Vec::new(),
+            refresh_queue: std::collections::VecDeque::new(),
             pending_commands: Vec::new(),
             cmd_outcomes: Vec::new(),
             last_moves: (Usage::default(), Usage::default(), 0),
@@ -963,6 +981,71 @@ impl App {
         }
     }
 
+    /// Reflect finished cleanups in the scan, one step per tick: what is gone
+    /// leaves the tree at once; what changed is scanned again (one folder at a
+    /// time, since a scan is running while it happens).
+    fn process_refresh(&mut self) {
+        if self.refresh_queue.is_empty() || !self.scanner.is_idle() {
+            return;
+        }
+        let mut changed = false;
+        while let Some(item) = self.refresh_queue.pop_front() {
+            match item {
+                Refresh::Gone(p) => changed |= self.forget_path(&p),
+                Refresh::Changed(p) => {
+                    if std::fs::symlink_metadata(&p).is_err() {
+                        changed |= self.forget_path(&p);
+                        continue;
+                    }
+                    let Some(node) = locate(&self.stack[0], &p) else {
+                        continue;
+                    };
+                    if node.path == self.stack[0].path {
+                        continue; // the whole scan root: that is a rescan (R)
+                    }
+                    if let Some(fresh) = self.scanner.rescan_dir(&node) {
+                        // Anyone looking inside the old subtree sees the new one.
+                        if let Some(i) = self.stack.iter().position(|n| n.path == fresh.path) {
+                            self.stack[i] = Arc::clone(&fresh);
+                            self.stack.truncate(i + 1);
+                        }
+                        changed = true;
+                        break; // a scan is running now; the rest waits for it
+                    }
+                }
+            }
+        }
+        if changed {
+            self.scan_epoch += 1;
+            self.targets_synced = false;
+            self.holders_key = None;
+            self.refresh_rows();
+            self.marks_changed();
+        }
+    }
+
+    /// A path that is gone: leave the tree. A file is not in the tree, so its
+    /// folder is counted again instead.
+    fn forget_path(&mut self, path: &Path) -> bool {
+        if let Some(node) = locate(&self.stack[0], path) {
+            if node.path == self.stack[0].path {
+                return false;
+            }
+            // Someone inside the folder is moved out to its parent.
+            if let Some(i) = self.stack.iter().position(|n| n.path == node.path) {
+                self.stack.truncate(i);
+            }
+            return self.scanner.forget_dir(&node);
+        }
+        if let Some(parent) = path.parent()
+            && locate(&self.stack[0], parent).is_some()
+        {
+            self.refresh_queue
+                .push_back(Refresh::Changed(parent.to_path_buf()));
+        }
+        false
+    }
+
     /// Scroll the review's item list (never past the last full page).
     fn scroll_review(&mut self, action: Action) {
         let Some(Dialog::Review(r)) = &self.dialog else {
@@ -1031,6 +1114,7 @@ impl App {
             self.refresh_free();
         }
         self.poll_discovery();
+        self.process_refresh();
         self.poll_targets();
         if self.set_space.poll() || !self.set_space.pending {
             // A review opened while the numbers were being worked out.
@@ -1643,6 +1727,7 @@ impl App {
                         line: spec.display(),
                         spec: spec.clone(),
                         up_to: r.row.frees.unwrap_or(0),
+                        path: r.row.path.clone(),
                         can_force: spec.can_force(),
                         force: false,
                     })
@@ -1810,9 +1895,10 @@ impl App {
         };
         let work = Arc::clone(&self.build_work);
         work.begin("starting", 3);
+        let epoch = self.scan_epoch;
         self.targets_job.spawn(move || {
             let idle = src.scan_idle;
-            (Targets::build(&src, &work), idle)
+            (Targets::build(&src, &work), idle, epoch)
         });
     }
 
@@ -1825,7 +1911,7 @@ impl App {
         if !landed {
             return;
         }
-        let Some((mut built, idle)) = self.targets_job.value.take() else {
+        let Some((mut built, idle, epoch)) = self.targets_job.value.take() else {
             return;
         };
         let keep = self.sel_of(self.tcursor);
@@ -1835,7 +1921,8 @@ impl App {
         }
         built.sort(self.sort);
         self.targets = built;
-        self.targets_synced = idle;
+        // Current only if the scan was finished and nothing changed since.
+        self.targets_synced = idle && epoch == self.scan_epoch;
         self.rebuild_tlines(keep);
     }
 
@@ -2155,8 +2242,17 @@ impl App {
             self.accounting.record_emptied(emptied);
         }
         // Marks of items that no longer exist were moved; failed ones stay.
+        // What moved leaves the scan too, so no row keeps showing it.
+        let gone: Vec<PathBuf> = self
+            .marks
+            .keys()
+            .filter(|p| std::fs::symlink_metadata(p).is_err())
+            .cloned()
+            .collect();
         self.marks
             .retain(|p, _| std::fs::symlink_metadata(p).is_ok());
+        self.refresh_queue
+            .extend(gone.into_iter().map(Refresh::Gone));
         self.marks_changed();
         self.refresh_free();
         self.refresh_held();
@@ -2237,6 +2333,10 @@ impl App {
         for (id, _) in std::mem::take(&mut self.pending_commands) {
             self.tool_marks.remove(&id);
         }
+        // The folders the commands cleaned changed on disk: scan them again.
+        let changed: Vec<PathBuf> = self.pending_meta.iter().map(|m| m.path.clone()).collect();
+        self.refresh_queue
+            .extend(changed.into_iter().map(Refresh::Changed));
         // Commands that failed only because a lock was held, and that have a
         // force variant, can be offered again in their forced form.
         let outcomes = std::mem::take(&mut self.cmd_outcomes);
@@ -5290,5 +5390,92 @@ mod tests {
         start_review(&mut e.app);
         settle(&mut e.app);
         assert!(finish_of(&e.app).retry.is_empty());
+    }
+
+    // --- the numbers follow what a cleanup really did ---------------------
+
+    /// A runner whose commands delete `target` (a folder or a file) when run,
+    /// like a real cleanup command would.
+    fn deleting_runner(target: &Arc<std::sync::Mutex<Option<PathBuf>>>) -> Arc<FakeRunner> {
+        let cell = Arc::clone(target);
+        Arc::new(FakeRunner::new(&[]).probing(move |_| {
+            if let Some(p) = cell.lock().unwrap().as_ref() {
+                if p.is_dir() {
+                    let _ = std::fs::remove_dir_all(p);
+                } else {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }))
+    }
+
+    #[test]
+    fn a_command_that_removes_its_folder_takes_the_row_and_its_bytes_out() {
+        let cell = Arc::new(std::sync::Mutex::new(None));
+        let mut e = command_app(deleting_runner(&cell));
+        let store = e.home.join("Library/Caches/Store");
+        *cell.lock().unwrap() = Some(store.clone());
+        let before = e.app.stack[0].size();
+        assert!(e.app.targets.find(&store).is_some());
+        mark_target(&mut e.app, &store);
+        start_review(&mut e.app);
+        settle(&mut e.app);
+        tick_until(&mut e.app, "the row to go", |a| {
+            a.targets.find(&store).is_none() && a.scanner.is_idle() && !a.targets_building()
+        });
+        assert_eq!(e.app.stack[0].size(), before - 200_000, "the totals follow");
+    }
+
+    #[test]
+    fn a_command_that_empties_a_folder_updates_the_rows_size_after_a_rescan() {
+        let cell = Arc::new(std::sync::Mutex::new(None));
+        let mut e = command_app(deleting_runner(&cell));
+        let other = e.home.join("Library/Caches/Other");
+        // The command removes the file inside, leaving the folder.
+        *cell.lock().unwrap() = Some(other.join("f"));
+        let (g, r) = e.app.targets.find(&other).unwrap();
+        assert_eq!(e.app.targets.row(g, r).row.size, 100_000);
+        mark_target(&mut e.app, &other);
+        start_review(&mut e.app);
+        settle(&mut e.app);
+        tick_until(&mut e.app, "the new size", |a| {
+            a.scanner.is_idle()
+                && !a.targets_building()
+                && a.targets
+                    .find(&other)
+                    .is_some_and(|(g, r)| a.targets.row(g, r).row.size == 0)
+        });
+    }
+
+    #[test]
+    fn moved_folders_leave_the_list_and_the_totals_without_a_rescan() {
+        let mut e = command_app(Arc::new(FakeRunner::new(&[])));
+        let nm = e.home.join("p1/node_modules");
+        let before = e.app.stack[0].size();
+        assert!(e.app.targets.find(&nm).is_some());
+        mark_target(&mut e.app, &nm);
+        start_review(&mut e.app);
+        settle(&mut e.app);
+        tick_until(&mut e.app, "the moved row to go", |a| {
+            a.targets.find(&nm).is_none() && a.scanner.is_idle() && !a.targets_building()
+        });
+        assert_eq!(e.app.stack[0].size(), before - 50_000);
+        assert!(e.app.marks.is_empty());
+    }
+
+    #[test]
+    fn a_moved_file_updates_its_folders_size() {
+        let mut e = rust_app();
+        let release = e.home.join("api/target/release");
+        let bin = release.join("myapp");
+        let size = |a: &App| crate::scan::locate(&a.stack[0], &release).unwrap().size();
+        assert_eq!(size(&e.app), 30_000 + 9_000);
+        mark_target(&mut e.app, &bin);
+        start_review(&mut e.app);
+        settle(&mut e.app);
+        tick_until(&mut e.app, "the folder to be counted again", |a| {
+            a.scanner.is_idle() && size(a) == 30_000
+        });
+        assert!(e.app.targets.find(&bin).is_none() || !bin.exists());
     }
 }

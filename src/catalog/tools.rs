@@ -233,7 +233,9 @@ pub(crate) fn discover_with(
     // One question per install: that is the length of the slow part.
     work.begin(
         "asking pnpm and npm where their caches are",
-        pnpms.len() + npms.len(),
+        // one question per install for pnpm; two per npm (its cache folder, and
+        // whether it has the npx cache commands)
+        pnpms.len() + 2 * npms.len(),
     );
     out.extend(pnpm_stores(home, runner, &pnpms, work));
     out.extend(npm_caches(home, runner, &npms, work));
@@ -322,7 +324,20 @@ fn pnpm_stores(
         .collect()
 }
 
-/// The npm cache folder(s): what each npm reports, or `~/.npm` by default.
+/// Does this npm have `npm cache npx rm` (npx's own cache commands)?
+fn has_npx_commands(home: &Path, runner: &dyn CommandRunner, exe: &Path, work: &Work) -> bool {
+    let answer = runner.query(&pinned(home, exe, &["cache", "--help"]));
+    work.step();
+    answer.is_some_and(|text| text.contains("npm cache npx rm"))
+}
+
+/// npm keeps two caches in its cache folder, and each needs its own command,
+/// so each is its own item (counted and selected separately):
+/// - `_cacache`, the package cache: `npm cache clean --force`
+/// - `_npx`, what `npx` downloaded to run programs: `npm cache npx rm --force`
+///
+/// The folder is what each npm reports (`npm config get cache`), or `~/.npm`
+/// by default. A part that is not there (already cleaned) is not listed.
 fn npm_caches(
     home: &Path,
     runner: &dyn CommandRunner,
@@ -346,27 +361,52 @@ fn npm_caches(
             found.push((default, npms.first().cloned()));
         }
     }
-    found
-        .into_iter()
-        .map(|(dir, exe)| {
-            let rel = dir
-                .strip_prefix(home)
-                .unwrap_or(&dir)
-                .to_string_lossy()
-                .into_owned();
-            ToolEntry {
+    let mut out = Vec::new();
+    for (dir, exe) in found {
+        let rel = dir
+            .strip_prefix(home)
+            .unwrap_or(&dir)
+            .to_string_lossy()
+            .into_owned();
+        let npx_commands = exe
+            .as_deref()
+            .is_some_and(|e| has_npx_commands(home, runner, e, work));
+        let packages = dir.join("_cacache");
+        if packages.is_dir() {
+            out.push(ToolEntry {
                 id: format!("npm-cache:{rel}"),
                 tool: "npm".to_string(),
-                label: "cache".to_string(),
-                path: dir,
+                label: "package cache".to_string(),
+                path: packages,
                 regen: "downloaded again when needed".to_string(),
-                mode: exe.map_or(Mode::Folder, |e| {
-                    Mode::Command(pinned(home, &e, &["cache", "clean", "--force"]))
+                mode: exe.as_deref().map_or(Mode::Folder, |e| {
+                    Mode::Command(pinned(home, e, &["cache", "clean", "--force"]))
                 }),
                 note: None,
-            }
-        })
-        .collect()
+            });
+        }
+        let npx = dir.join("_npx");
+        if npx.is_dir() {
+            let mode = match exe.as_deref() {
+                Some(e) if npx_commands => {
+                    Mode::Command(pinned(home, e, &["cache", "npx", "rm", "--force"]))
+                }
+                _ => Mode::Folder,
+            };
+            out.push(ToolEntry {
+                id: format!("npm-npx:{rel}"),
+                tool: "npm".to_string(),
+                label: "npx cache".to_string(),
+                path: npx,
+                regen: "npx programs download again the next time they run; restart any that are running now (MCP servers started with npx, for example)".to_string(),
+                note: matches!(mode, Mode::Folder).then(|| {
+                    "this npm has no command for the npx cache, so the folder is moved instead".to_string()
+                }),
+                mode,
+            });
+        }
+    }
+    out
 }
 
 /// Every other folder in `~/Library/Caches` and `~/.cache`, one entry each.
@@ -641,31 +681,132 @@ mod tests {
         assert!(entries.iter().all(|e| e.path.starts_with(&h.home)));
     }
 
-    #[test]
-    fn the_npm_cache_folder_comes_from_npm_and_one_outside_home_is_ignored() {
-        let h = home();
-        dir(&h.home.join(".npm"));
-        dir(&h.home.join("elsewhere/npm-cache"));
-        let n = fnm_bin(&h.home, "v22.0.0", "npm");
-        exe(&n);
-        let runner = FakeRunner::new(&[]).answering(&[(
-            "npm config get cache",
-            h.home.join("elsewhere/npm-cache").to_str().unwrap(),
-        )]);
-        let entries = find(&h, &runner);
-        let npm: Vec<_> = entries.iter().filter(|e| e.tool == "npm").collect();
-        assert_eq!(npm.len(), 1);
-        assert_eq!(npm[0].path, h.home.join("elsewhere/npm-cache"));
-        match &npm[0].mode {
-            Mode::Command(s) => assert_eq!(s.display(), "npm cache clean --force"),
-            other => panic!("{other:?}"),
+    const NPX_HELP: &str =
+        "npm cache clean [<key>]\nnpm cache npx ls\nnpm cache npx rm [<key>...]\n";
+
+    fn npm_entries(entries: &[ToolEntry]) -> Vec<&ToolEntry> {
+        entries.iter().filter(|e| e.tool == "npm").collect()
+    }
+
+    fn command_of(e: &ToolEntry) -> String {
+        match &e.mode {
+            Mode::Command(s) => s.display(),
+            Mode::Folder => "(folder)".to_string(),
         }
-        // Reported outside home: dropped, the default ~/.npm is used instead.
-        let runner = FakeRunner::new(&[]).answering(&[("npm config get cache", "/Volumes/x/npm")]);
+    }
+
+    #[test]
+    fn npms_package_cache_and_npx_cache_are_two_items_with_their_own_commands() {
+        let h = home();
+        dir(&h.home.join("elsewhere/npm-cache/_cacache"));
+        dir(&h.home.join("elsewhere/npm-cache/_npx"));
+        exe(&fnm_bin(&h.home, "v22.0.0", "npm"));
+        let runner = FakeRunner::new(&[]).answering(&[
+            (
+                "npm config get cache",
+                h.home.join("elsewhere/npm-cache").to_str().unwrap(),
+            ),
+            ("npm cache --help", NPX_HELP),
+        ]);
         let entries = find(&h, &runner);
-        let npm: Vec<_> = entries.iter().filter(|e| e.tool == "npm").collect();
+        let npm = npm_entries(&entries);
+        assert_eq!(
+            npm.len(),
+            2,
+            "{:?}",
+            npm.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        let pkg = npm.iter().find(|e| e.label == "package cache").unwrap();
+        let npx = npm.iter().find(|e| e.label == "npx cache").unwrap();
+        assert_eq!(pkg.path, h.home.join("elsewhere/npm-cache/_cacache"));
+        assert_eq!(npx.path, h.home.join("elsewhere/npm-cache/_npx"));
+        assert_eq!(command_of(pkg), "npm cache clean --force");
+        assert_eq!(command_of(npx), "npm cache npx rm --force");
+        assert_ne!(pkg.id, npx.id, "they are selected separately");
+    }
+
+    #[test]
+    fn an_npm_without_the_npx_commands_gets_a_plain_folder_item_for_it() {
+        let h = home();
+        dir(&h.home.join(".npm/_cacache"));
+        dir(&h.home.join(".npm/_npx"));
+        exe(&fnm_bin(&h.home, "v14.0.0", "npm"));
+        let runner = FakeRunner::new(&[]).answering(&[
+            (
+                "npm config get cache",
+                h.home.join(".npm").to_str().unwrap(),
+            ),
+            (
+                "npm cache --help",
+                "npm cache clean [<key>]\nnpm cache ls\n",
+            ),
+        ]);
+        let entries = find(&h, &runner);
+        let npm = npm_entries(&entries);
+        let pkg = npm.iter().find(|e| e.label == "package cache").unwrap();
+        let npx = npm.iter().find(|e| e.label == "npx cache").unwrap();
+        assert_eq!(command_of(pkg), "npm cache clean --force");
+        assert!(matches!(npx.mode, Mode::Folder), "{:?}", npx.mode);
+    }
+
+    #[test]
+    fn a_part_that_is_not_there_is_not_listed() {
+        let h = home();
+        // Already cleaned: only the npx cache is left.
+        dir(&h.home.join(".npm/_npx"));
+        exe(&fnm_bin(&h.home, "v22.0.0", "npm"));
+        let runner = FakeRunner::new(&[]).answering(&[
+            (
+                "npm config get cache",
+                h.home.join(".npm").to_str().unwrap(),
+            ),
+            ("npm cache --help", NPX_HELP),
+        ]);
+        let entries = find(&h, &runner);
+        let npm = npm_entries(&entries);
         assert_eq!(npm.len(), 1);
-        assert_eq!(npm[0].path, h.home.join(".npm"));
+        assert_eq!(npm[0].label, "npx cache");
+        // Nothing at all in the cache folder: no npm items.
+        let h2 = home();
+        dir(&h2.home.join(".npm/_logs"));
+        let entries = find(&h2, &FakeRunner::new(&[]));
+        assert!(npm_entries(&entries).is_empty());
+    }
+
+    #[test]
+    fn a_cache_folder_npm_reports_outside_home_is_ignored_for_the_default() {
+        let h = home();
+        dir(&h.home.join(".npm/_cacache"));
+        exe(&fnm_bin(&h.home, "v22.0.0", "npm"));
+        let runner = FakeRunner::new(&[]).answering(&[
+            ("npm config get cache", "/Volumes/x/npm"),
+            ("npm cache --help", NPX_HELP),
+        ]);
+        let entries = find(&h, &runner);
+        let npm = npm_entries(&entries);
+        assert_eq!(npm.len(), 1);
+        assert_eq!(npm[0].path, h.home.join(".npm/_cacache"));
+    }
+
+    #[test]
+    fn without_any_npm_the_default_folders_are_plain_items() {
+        let h = home();
+        dir(&h.home.join(".npm/_cacache"));
+        dir(&h.home.join(".npm/_npx"));
+        let entries = find(&h, &FakeRunner::new(&[]));
+        let npm = npm_entries(&entries);
+        assert_eq!(npm.len(), 2);
+        assert!(npm.iter().all(|e| matches!(e.mode, Mode::Folder)));
+    }
+
+    #[test]
+    fn the_npx_item_warns_that_running_npx_programs_download_again() {
+        let h = home();
+        dir(&h.home.join(".npm/_npx"));
+        let entries = find(&h, &FakeRunner::new(&[]));
+        let npx = npm_entries(&entries)[0].clone();
+        assert!(npx.regen.contains("npx"), "{}", npx.regen);
+        assert!(npx.regen.contains("restart"), "{}", npx.regen);
     }
 
     #[test]
