@@ -401,7 +401,17 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
             )));
         }
     }
-    if r.commands.is_empty() {
+    if let Some(problem) = r.problems.first() {
+        // Docker would refuse part of it: nothing can run until it is fixed.
+        lines.push(Line::from(Span::styled(
+            format!("{} {}", g.warn(), problem),
+            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(key_line(
+            g,
+            &[("Esc", "Cancel (mark them, then review again)")],
+        ));
+    } else if r.commands.is_empty() {
         lines.push(key_line(
             g,
             &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],
@@ -712,6 +722,19 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
             )));
         }
     }
+    if let Some((before, after)) = f.vm_disk {
+        let change = match after.cmp(&before) {
+            std::cmp::Ordering::Less => format!("shrank by {}", human_size(before - after)),
+            std::cmp::Ordering::Equal => "unchanged".to_string(),
+            std::cmp::Ordering::Greater => format!("grew by {}", human_size(after - before)),
+        };
+        lines.push(Line::from(format!(
+            "Docker VM disk file on this Mac: {} {} {} ({change})",
+            human_size(before),
+            g.arrow(),
+            human_size(after)
+        )));
+    }
     lines.push(Line::from(format!(
         "Free space now {}   pending {}",
         human_size(app.free_now),
@@ -871,6 +894,7 @@ mod review_layout_tests {
             total: Usage::default(),
             space: Default::default(),
             space_ready: true,
+            problems: Vec::new(),
         }
     }
 

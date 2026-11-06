@@ -598,6 +598,7 @@ mod tests {
             total: Usage::default(),
             space_ready: true,
             space: Default::default(),
+            problems: Vec::new(),
         })
     }
 
@@ -832,6 +833,7 @@ mod tests {
             commands: Vec::new(),
             retry: Vec::new(),
             started_tick: 0,
+            vm_disk: None,
         };
         assert_eq!(
             dialog_key(KeyCode::Char('f'), &Dialog::Finish(f.clone())),

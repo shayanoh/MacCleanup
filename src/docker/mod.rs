@@ -6,6 +6,7 @@ pub mod analysis;
 pub mod api;
 pub mod cli;
 pub mod model;
+pub mod remove;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod testdata;

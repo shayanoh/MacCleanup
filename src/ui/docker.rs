@@ -752,8 +752,9 @@ fn row_line(
 /// One line under the list: how much is marked and what it frees in Docker.
 fn summary_line(app: &App, width: usize) -> TextLine<'static> {
     let g = &app.glyphs;
-    let marked = app.docker_marked().len();
-    if marked == 0 {
+    let trim = app.tool_marks.contains(crate::docker::analysis::TRIM_ITEM);
+    let marked = app.docker_marked().len() - usize::from(trim);
+    if marked == 0 && !trim {
         return TextLine::from(Span::styled(
             fit("nothing marked (space marks, d reviews)", width, g),
             Style::default().fg(DIM),
@@ -763,7 +764,10 @@ fn summary_line(app: &App, width: usize) -> TextLine<'static> {
         .docker_frees()
         .map_or_else(|| g.ellipsis().to_string(), human_size);
     let mut text = format!("marked {marked} {} frees {frees} in Docker", g.dot());
-    let elsewhere = app.marks.len() + app.tool_marks.len() - marked;
+    if trim {
+        text.push_str(&format!(" {} + VM disk trim", g.dot()));
+    }
+    let elsewhere = app.marks.len() + app.tool_marks.len() - marked - usize::from(trim);
     if elsewhere > 0 {
         text.push_str(&format!(" {} +{elsewhere} marked elsewhere", g.dot()));
     }

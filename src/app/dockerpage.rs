@@ -4,8 +4,10 @@
 use std::collections::BTreeSet;
 
 use super::*;
-use crate::docker::analysis::{ItemKind, Refusal, frees_of_set};
-use crate::docker::cli::DockerCli;
+use crate::docker::analysis::{
+    ItemKind, Refusal, TRIM_ITEM, blockers, frees_of_set, removal_order,
+};
+use crate::docker::cli::{DockerCli, vm_disk_allocated};
 use crate::docker::model::ItemId;
 use crate::docker::state::DockerLoad;
 use crate::docker::view::{DKind, DSection};
@@ -32,7 +34,12 @@ impl App {
         self.docker.job.spawn(move || {
             let cli = DockerCli::connect(runner, &home)?;
             let loaded = cli.load(&work)?;
-            Ok(DockerLoad { cli, loaded })
+            let vm_tools = crate::docker::vmtools::is_present(&cli);
+            Ok(DockerLoad {
+                cli,
+                loaded,
+                vm_tools,
+            })
         });
     }
 
@@ -49,6 +56,7 @@ impl App {
                             || analysis.items.contains_key(id)
                             || id == crate::docker::analysis::TRIM_ITEM
                     });
+                    self.docker_trim_housekeeping();
                     self.docker_refilter();
                     self.marks_changed();
                 }
@@ -209,8 +217,51 @@ impl App {
         }
     }
 
+    fn has_docker_removals(&self) -> bool {
+        self.docker_marked().iter().any(|id| id != TRIM_ITEM)
+    }
+
+    /// A removal was marked: the VM-disk trim comes along, unless the user
+    /// took it off.
+    fn docker_marks_added(&mut self) {
+        if !self.docker.trim_declined && !self.tool_marks.contains(TRIM_ITEM) {
+            self.tool_marks.insert(TRIM_ITEM.to_string());
+            self.docker.trim_auto = true;
+        }
+    }
+
+    /// With no removal left, a trim that only came along goes too, and the
+    /// user's earlier "no" is forgotten.
+    fn docker_trim_housekeeping(&mut self) {
+        if !self.has_docker_removals() {
+            if self.docker.trim_auto {
+                self.tool_marks.remove(TRIM_ITEM);
+            }
+            self.docker.trim_auto = false;
+            self.docker.trim_declined = false;
+        }
+    }
+
+    /// The VM-disk trim row, marked or unmarked by the user.
+    fn toggle_docker_trim(&mut self) {
+        if self.tool_marks.remove(TRIM_ITEM) {
+            self.docker.trim_declined = self.has_docker_removals();
+            self.docker.trim_auto = false;
+        } else {
+            self.tool_marks.insert(TRIM_ITEM.to_string());
+            self.docker.trim_auto = false;
+            self.docker.trim_declined = false;
+        }
+        self.marks_changed();
+    }
+
     fn toggle_docker_item(&mut self, key: &str) {
+        if key == TRIM_ITEM {
+            self.toggle_docker_trim();
+            return;
+        }
         if self.tool_marks.remove(key) {
+            self.docker_trim_housekeeping();
             self.marks_changed();
             return;
         }
@@ -232,7 +283,98 @@ impl App {
             }
         }
         self.tool_marks.insert(key.to_string());
+        self.docker_marks_added();
         self.marks_changed();
+    }
+
+    /// The commands that remove what is marked on the Docker page, in the
+    /// order they must run, then (when the trim is marked) the build of our
+    /// helper image if it is missing and the trim itself.
+    pub(super) fn docker_review_commands(&self) -> Vec<ReviewCommand> {
+        let Some(load) = &self.docker.load else {
+            return Vec::new();
+        };
+        let marked = self.docker_marked();
+        if marked.is_empty() {
+            return Vec::new();
+        }
+        let (a, data) = (&self.docker.analysis, &load.loaded.data);
+        let command = |id: String, spec: crate::catalog::CommandSpec, up_to: u64| ReviewCommand {
+            id,
+            tool: "Docker".to_string(),
+            line: spec.display(),
+            spec,
+            up_to,
+            path: PathBuf::new(),
+            can_force: false,
+            force: false,
+        };
+        let mut out = Vec::new();
+        let mut trim = false;
+        for id in removal_order(a, &marked) {
+            if id == TRIM_ITEM {
+                trim = true;
+            } else if let Some(spec) = crate::docker::remove::removal_spec(&load.cli, data, &id) {
+                let up_to = a.items.get(&id).map_or(0, |f| f.frees_alone);
+                out.push(command(id, spec, up_to));
+            }
+        }
+        if trim {
+            if !load.vm_tools {
+                out.push(command(
+                    "vm:build".to_string(),
+                    crate::docker::vmtools::build_spec(&load.cli),
+                    0,
+                ));
+            }
+            out.push(command(
+                TRIM_ITEM.to_string(),
+                crate::docker::vmtools::trim_spec(&load.cli),
+                data.vm_allocated.unwrap_or(0).saturating_sub(data.in_use()),
+            ));
+        }
+        out
+    }
+
+    /// What stops the marked Docker items from running: a removal Docker
+    /// would refuse because stopped containers hold the item.
+    pub(super) fn docker_problems(&self) -> Vec<String> {
+        let a = &self.docker.analysis;
+        blockers(a, &self.docker_marked())
+            .into_iter()
+            .map(|(item, missing)| {
+                let name = |id: &String| {
+                    a.items
+                        .get(id)
+                        .map_or_else(|| id.clone(), |f| f.name.clone())
+                };
+                format!(
+                    "{} is held by container(s) {} that are not marked (m marks them)",
+                    name(&item),
+                    missing.iter().map(name).collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect()
+    }
+
+    /// Remember what the VM disk file takes, just before Docker commands run.
+    pub(super) fn docker_note_vm_before(&mut self, ids: &[String]) {
+        self.docker_vm_before = if ids.iter().any(|id| is_docker_id(id)) {
+            vm_disk_allocated(self.policy.home())
+        } else {
+            None
+        };
+    }
+
+    /// After Docker commands ran: the VM disk file before and after, and a
+    /// fresh read of Docker.
+    pub(super) fn docker_after_commands(&mut self, ran: bool) -> Option<(u64, u64)> {
+        if !ran {
+            return None;
+        }
+        self.reload_docker();
+        let before = self.docker_vm_before.take()?;
+        Some((before, vm_disk_allocated(self.policy.home()).unwrap_or(0)))
     }
 
     /// Mark (or unmark) everything in a section that is safe to take in
@@ -261,8 +403,10 @@ impl App {
             for id in &ids {
                 self.tool_marks.remove(id);
             }
+            self.docker_trim_housekeeping();
         } else {
             self.tool_marks.extend(ids);
+            self.docker_marks_added();
         }
         self.marks_changed();
     }
@@ -408,7 +552,11 @@ mod tests {
         cursor_on(&mut e.app, "section:cache");
         e.app.update(Action::ToggleMark);
         let marked: Vec<&String> = e.app.tool_marks.iter().collect();
-        assert_eq!(marked, ["cache:child1", "cache:root1"], "nolast is in use");
+        assert_eq!(
+            marked,
+            ["cache:child1", "cache:root1", "vm:trim"],
+            "nolast is in use; the trim comes along"
+        );
         e.app.update(Action::ToggleMark);
         assert!(e.app.tool_marks.is_empty(), "again unmarks them");
     }
@@ -471,6 +619,255 @@ mod tests {
         );
         e.app.update(Action::MarkRelated);
         assert_eq!(e.app.notice.as_deref(), Some("Nothing more to mark here"));
+    }
+
+    // --- removing: review, order, trim, refusal, finish ----------------
+
+    use crate::app::{Dialog, FinishInfo, Review};
+    use crate::testutil::settle;
+
+    const CTX: &str = "docker --context=desktop-linux";
+    const TRIM: &str = "run --rm --pull=never --privileged --pid=host maccleanup/vm-tools";
+    const BUILD: &str = "build -q -t maccleanup/vm-tools -";
+
+    fn loaded_with(fake: Arc<FakeRunner>) -> crate::testutil::Env {
+        let mut e = env(&[("a.txt", 10)]);
+        e.app.runner = fake;
+        e.app.update(Action::GoTo(Screen::Docker));
+        wait_docker(&mut e.app);
+        e
+    }
+
+    fn mark(app: &mut App, key: &str) {
+        cursor_on(app, key);
+        app.update(Action::ToggleMark);
+    }
+
+    fn review_lines(app: &App) -> Vec<String> {
+        match &app.dialog {
+            Some(Dialog::Review(r)) => r.commands.iter().map(|c| c.line.clone()).collect(),
+            other => panic!("no review: {other:?}"),
+        }
+    }
+
+    fn review_of(app: &App) -> &Review {
+        match &app.dialog {
+            Some(Dialog::Review(r)) => r,
+            other => panic!("no review: {other:?}"),
+        }
+    }
+
+    fn finish_of(app: &App) -> &FinishInfo {
+        match &app.dialog {
+            Some(Dialog::Finish(f)) => f,
+            other => panic!("no finish: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_review_lists_removals_in_dependency_order_then_builds_and_trims() {
+        let mut e = loaded_app();
+        for key in [
+            "volume:unmeasured",
+            "image:sha256:bbb2",
+            "container:c0ffee2",
+        ] {
+            mark(&mut e.app, key);
+        }
+        e.app.update(Action::OpenReview);
+        let lines = review_lines(&e.app);
+        let want = [
+            "container rm c0ffee2".to_string(),
+            "image rm sha256:bbb2".to_string(),
+            "volume rm unmeasured".to_string(),
+            BUILD.to_string(),
+            TRIM.to_string(),
+        ];
+        let want: Vec<String> = want
+            .iter()
+            .map(|w| format!("docker --context=desktop-linux {w}"))
+            .collect();
+        assert_eq!(lines, want);
+        let _ = CTX;
+    }
+
+    #[test]
+    fn the_review_opens_from_the_docker_page_and_needs_y() {
+        let mut e = loaded_app();
+        mark(&mut e.app, "container:c0ffee2");
+        e.app.update(Action::OpenReview);
+        assert!(!review_of(&e.app).commands.is_empty());
+        assert!(review_of(&e.app).items.is_empty());
+    }
+
+    #[test]
+    fn an_existing_vm_tools_image_skips_the_build_step() {
+        let fake = Arc::new(FakeRunner::new(&["docker"]).answering(&[
+            ("context inspect", CONTEXT),
+            ("/_ping", "OK"),
+            ("/system/df", DF),
+            ("/containers/json?all=1", CONTAINERS),
+            ("image inspect", "1"),
+        ]));
+        let mut e = loaded_with(fake);
+        mark(&mut e.app, "container:c0ffee2");
+        e.app.update(Action::OpenReview);
+        let lines = review_lines(&e.app);
+        assert!(lines.iter().all(|l| !l.contains("build")), "{lines:?}");
+        assert!(lines.last().unwrap().contains("maccleanup/vm-tools"));
+    }
+
+    #[test]
+    fn the_trim_is_added_with_a_removal_and_leaves_with_the_last_one() {
+        let mut e = loaded_app();
+        mark(&mut e.app, "container:c0ffee2");
+        assert!(e.app.tool_marks.contains("vm:trim"));
+        mark(&mut e.app, "container:c0ffee2");
+        assert!(e.app.tool_marks.is_empty(), "{:?}", e.app.tool_marks);
+    }
+
+    #[test]
+    fn a_trim_the_user_unmarked_is_not_added_again() {
+        let mut e = loaded_app();
+        mark(&mut e.app, "container:c0ffee2");
+        e.app.toggle_docker_item("vm:trim");
+        assert!(!e.app.tool_marks.contains("vm:trim"));
+        mark(&mut e.app, "volume:unmeasured");
+        assert!(!e.app.tool_marks.contains("vm:trim"), "they said no");
+        e.app.update(Action::OpenReview);
+        assert!(review_lines(&e.app).iter().all(|l| !l.contains("vm-tools")));
+        e.app.update(Action::Cancel);
+        // With nothing left marked, the next removal starts over.
+        mark(&mut e.app, "container:c0ffee2");
+        mark(&mut e.app, "volume:unmeasured");
+        assert!(e.app.tool_marks.is_empty());
+        mark(&mut e.app, "container:c0ffee2");
+        assert!(e.app.tool_marks.contains("vm:trim"));
+    }
+
+    #[test]
+    fn the_trim_alone_is_reviewed_and_run_without_any_removal() {
+        let fake = healthy();
+        let mut e = loaded_with(fake.clone());
+        e.app.toggle_docker_item("vm:trim");
+        e.app.update(Action::OpenReview);
+        let lines = review_lines(&e.app);
+        assert_eq!(lines.len(), 2, "build, then trim: {lines:?}");
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
+    fn confirming_runs_the_docker_commands_in_order_and_clears_their_marks() {
+        let fake = healthy();
+        let mut e = loaded_with(fake.clone());
+        mark(&mut e.app, "image:sha256:bbb2");
+        mark(&mut e.app, "container:c0ffee2");
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        let ran: Vec<String> = fake.calls().iter().map(|c| c.display()).collect();
+        assert_eq!(ran.len(), 4, "{ran:?}");
+        assert!(ran[0].ends_with("container rm c0ffee2"), "{ran:?}");
+        assert!(ran[1].ends_with("image rm sha256:bbb2"), "{ran:?}");
+        assert!(ran[2].ends_with("-t maccleanup/vm-tools -"), "{ran:?}");
+        assert!(ran[3].ends_with("maccleanup/vm-tools"), "{ran:?}");
+        assert!(e.app.tool_marks.is_empty());
+        assert_eq!(finish_of(&e.app).commands.len(), 4);
+        assert_eq!(
+            fake.calls()[2].stdin.as_deref(),
+            Some(crate::docker::vmtools::DOCKERFILE)
+        );
+    }
+
+    #[test]
+    fn a_refused_removal_does_not_stop_the_rest() {
+        let fake = Arc::new(
+            FakeRunner::new(&["docker"])
+                .answering(&[
+                    ("context inspect", CONTEXT),
+                    ("/_ping", "OK"),
+                    ("/system/df", DF),
+                    ("/containers/json?all=1", CONTAINERS),
+                ])
+                .failing(&["docker --context=desktop-linux container rm c0ffee2"]),
+        );
+        let mut e = loaded_with(fake);
+        mark(&mut e.app, "container:c0ffee2");
+        mark(&mut e.app, "volume:unmeasured");
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        let oks: Vec<bool> = finish_of(&e.app).commands.iter().map(|c| c.ok).collect();
+        assert_eq!(
+            oks,
+            [false, true, true, true],
+            "container, volume, build, trim"
+        );
+    }
+
+    #[test]
+    fn an_image_whose_stopped_containers_are_not_marked_cannot_be_confirmed() {
+        let fake = healthy();
+        let mut e = loaded_with(fake.clone());
+        mark(&mut e.app, "image:sha256:bbb2");
+        e.app.update(Action::OpenReview);
+        assert_eq!(review_of(&e.app).problems.len(), 1);
+        assert!(
+            review_of(&e.app).problems[0].contains("old"),
+            "named by its name"
+        );
+        e.app.update(Action::Confirm);
+        assert!(
+            matches!(e.app.dialog, Some(Dialog::Review(_))),
+            "still open"
+        );
+        assert!(e.app.notice.is_some());
+        assert!(fake.calls().is_empty(), "nothing ran");
+        // Mark the container too and it goes through.
+        e.app.update(Action::Cancel);
+        mark(&mut e.app, "container:c0ffee2");
+        e.app.update(Action::OpenReview);
+        assert!(review_of(&e.app).problems.is_empty());
+    }
+
+    #[test]
+    fn the_docker_list_is_read_again_after_a_cleanup() {
+        let mut e = loaded_app();
+        let before = e.app.docker.job.spawned;
+        mark(&mut e.app, "container:c0ffee2");
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        wait_docker(&mut e.app);
+        assert!(e.app.docker.job.spawned > before);
+    }
+
+    #[test]
+    fn the_finish_report_says_what_the_vm_disk_file_took_before_and_after() {
+        let mut e = env(&[("a.txt", 10)]);
+        let raw = e
+            .home
+            .join("Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw");
+        std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        std::fs::write(&raw, vec![1u8; 8192]).unwrap();
+        e.app.runner = healthy();
+        e.app.update(Action::GoTo(Screen::Docker));
+        wait_docker(&mut e.app);
+        mark(&mut e.app, "container:c0ffee2");
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        let (before, after) = finish_of(&e.app).vm_disk.expect("a Docker command ran");
+        assert!(before >= 8192 && after >= 8192);
+        // A cleanup with no Docker command reports none.
+        e.app.update(Action::Cancel);
+        assert!(finish_of_none(&e.app));
+    }
+
+    fn finish_of_none(app: &App) -> bool {
+        !matches!(&app.dialog, Some(Dialog::Finish(f)) if f.vm_disk.is_some())
     }
 
     #[test]

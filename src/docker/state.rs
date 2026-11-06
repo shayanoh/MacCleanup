@@ -15,6 +15,9 @@ use crate::filter::Query;
 pub struct DockerLoad {
     pub cli: DockerCli,
     pub loaded: Loaded,
+    /// Our helper image exists at the current version (no build needed
+    /// before a trim).
+    pub vm_tools: bool,
 }
 
 pub struct DockerState {
@@ -37,6 +40,11 @@ pub struct DockerState {
     /// How many lines the details pane is scrolled down, how far it can go
     /// (written by the drawing code, which knows the pane's size), and which
     /// line the scroll belongs to (it starts over for another one).
+    /// The VM-disk trim was added by marking a removal (and goes away with
+    /// the last one); the user marked it themselves; or they took it off
+    /// while removals were marked (then marking more does not bring it back).
+    pub trim_auto: bool,
+    pub trim_declined: bool,
     pub detail_scroll: usize,
     pub detail_max: usize,
     pub detail_key: String,
@@ -63,6 +71,8 @@ impl DockerState {
             offset: 0,
             stale: false,
             read_once: false,
+            trim_auto: false,
+            trim_declined: false,
             detail_scroll: 0,
             detail_max: 0,
             detail_key: String::new(),

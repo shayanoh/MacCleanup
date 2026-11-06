@@ -239,6 +239,9 @@ pub struct Review {
     /// Where the marked items' disk space would go: freed now, held by
     /// snapshots, or shared with clones and hard links that stay.
     pub space: Space,
+    /// Things that stop it from running (Docker would refuse part of it);
+    /// while there are any, confirming only explains them.
+    pub problems: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -267,6 +270,9 @@ pub struct FinishInfo {
     pub retry: Vec<ReviewCommand>,
     /// App tick when the finish screen opened (drives the count-up).
     pub started_tick: u64,
+    /// What the Docker VM disk file took on the Mac before and after the
+    /// Docker commands (allocated bytes); `None` when none ran.
+    pub vm_disk: Option<(u64, u64)>,
 }
 
 /// What the quit warning tells the user is still waiting in ToBeDeleted.
@@ -492,6 +498,8 @@ pub struct App {
     job_free_before: u64,
     job_failure: Option<String>,
     quit_after_job: bool,
+    /// What the Docker VM disk file took on the Mac before Docker commands ran.
+    docker_vm_before: Option<u64>,
 }
 
 /// The order the explorer (and every screen like it) puts rows in: biggest
@@ -611,6 +619,7 @@ impl App {
             tools_work: Work::new(),
             tool_marks: BTreeSet::new(),
             docker: crate::docker::state::DockerState::new(),
+            docker_vm_before: None,
             set_space: Latest::new(),
             set_exact: true,
             holders: Latest::new(),
@@ -913,6 +922,7 @@ impl App {
                         total: Usage::default(),
                         space_ready: true,
                         space: Space::default(),
+                        problems: Vec::new(),
                     }));
                 }
             }
@@ -1197,6 +1207,11 @@ impl App {
     fn confirm(&mut self) {
         match self.dialog.take() {
             Some(Dialog::QuitWarning(_)) => self.should_quit = true,
+            Some(Dialog::Review(r)) if !r.problems.is_empty() => {
+                // Docker would refuse part of it: say why, run nothing.
+                self.notice = Some(r.problems[0].clone());
+                self.dialog = Some(Dialog::Review(r));
+            }
             Some(Dialog::Review(r)) => {
                 if !r.commands.is_empty() && self.layout.review_clipped {
                     // Never run a command the review could not show.
@@ -1725,7 +1740,10 @@ impl App {
     }
 
     fn open_review(&mut self) {
-        if !matches!(self.screen, Screen::Explorer | Screen::Targets) {
+        if !matches!(
+            self.screen,
+            Screen::Explorer | Screen::Targets | Screen::Docker
+        ) {
             return;
         }
         let commands = self.review_commands();
@@ -1757,12 +1775,14 @@ impl App {
             (false, Some(j)) => (j.base, true),
             _ => (Space::default(), false),
         };
+        let problems = self.docker_problems();
         self.dialog = Some(Dialog::Review(Review {
             items,
             commands,
             total,
             space_ready,
             space,
+            problems,
         }));
     }
 
@@ -1790,6 +1810,7 @@ impl App {
                 }
                 _ => None,
             })
+            .chain(self.docker_review_commands())
             .collect()
     }
 
@@ -2178,6 +2199,8 @@ impl App {
             .map(|c| (c.id.clone(), c.effective_spec()))
             .collect();
         self.pending_meta = review.commands.clone();
+        let ids: Vec<String> = review.commands.iter().map(|c| c.id.clone()).collect();
+        self.docker_note_vm_before(&ids);
         if items.is_empty() {
             self.start_commands();
             return;
@@ -2277,6 +2300,7 @@ impl App {
                 commands: Vec::new(),
                 retry: Vec::new(),
                 started_tick: self.tick,
+                vm_disk: None,
             }),
             DeleteMode::SoftOnly => {
                 let mut msg = format!(
@@ -2391,11 +2415,19 @@ impl App {
     fn commands_done(&mut self) {
         self.cmd_job = None;
         self.cmd_ctl = None;
+        let mut docker_ran = false;
         for (id, _) in std::mem::take(&mut self.pending_commands) {
+            docker_ran |= dockerpage::is_docker_id(&id);
             self.tool_marks.remove(&id);
         }
-        // The folders the commands cleaned changed on disk: scan them again.
-        let changed: Vec<PathBuf> = self.pending_meta.iter().map(|m| m.path.clone()).collect();
+        // The folders the commands cleaned changed on disk: scan them again
+        // (Docker's commands have no folder).
+        let changed: Vec<PathBuf> = self
+            .pending_meta
+            .iter()
+            .map(|m| m.path.clone())
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
         self.refresh_queue
             .extend(changed.into_iter().map(Refresh::Changed));
         // Commands that failed only because a lock was held, and that have a
@@ -2416,6 +2448,7 @@ impl App {
         self.refresh_held();
         self.refresh_rows();
         self.rebuild_targets();
+        let vm_disk = self.docker_after_commands(docker_ran);
         let (moved, emptied, failures) = self.last_moves;
         self.dialog = Some(Dialog::Finish(FinishInfo {
             moved,
@@ -2427,6 +2460,7 @@ impl App {
             commands: outcomes,
             retry,
             started_tick: self.tick,
+            vm_disk,
         }));
         if self.quit_after_job {
             self.quit_after_job = false;

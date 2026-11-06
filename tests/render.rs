@@ -2535,6 +2535,7 @@ fn docker_summary_line_shows_marks_and_what_they_free() {
     let t = render(&mut e.app, 150, 40);
     assert!(t.contains("marked 2"), "{t}");
     assert!(t.contains("frees 1.4 GB"), "{t}");
+    assert!(t.contains("VM disk trim"), "the trim comes along: {t}");
 }
 
 #[test]
@@ -2677,4 +2678,37 @@ fn docker_details_scroll_resets_when_the_selection_changes() {
     docker_cursor(&mut e, "cache:root1");
     render(&mut e.app, 150, 22);
     assert_eq!(e.app.docker.detail_scroll, 0);
+}
+
+#[test]
+fn docker_review_shows_what_blocks_it() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    docker_cursor(&mut e, "image:sha256:bbb2");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("is held by container(s) old"), "{t}");
+    assert!(
+        !t.contains("Move, then run") && !t.contains("Run the commands"),
+        "{t}"
+    );
+    assert!(t.contains("docker --context=desktop-linux image rm"), "{t}");
+}
+
+#[test]
+fn docker_finish_screen_reports_the_vm_disk_file() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, DOCKER_DF, true, true);
+    docker_cursor(&mut e, "container:c0ffee2");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..2000 {
+        e.app.update(Action::Tick);
+        if matches!(e.app.dialog, Some(Dialog::Finish(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("Docker VM disk file"), "{t}");
 }
