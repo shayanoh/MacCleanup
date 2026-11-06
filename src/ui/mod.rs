@@ -261,7 +261,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let hints: &[&str] = if app.focus == Focus::Sidebar {
-        &["j/k choose", "enter open", "tab back", "q quit"]
+        &[
+            "j/k choose",
+            "enter open",
+            "1/2/3 jump",
+            "tab focus list",
+            "q quit",
+        ]
     } else {
         match app.screen {
             Screen::Home => &[

@@ -684,3 +684,12 @@ fn shared_detail_is_ascii_in_ascii_mode() {
         assert!(c.is_ascii(), "non-ascii cell {c:?}");
     }
 }
+
+#[test]
+fn home_starts_with_menu_hints_and_a_focused_menu() {
+    let mut e = make_app(FILES, GlyphMode::Nerd);
+    assert_eq!(e.app.focus, maccleanup::app::Focus::Sidebar);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("j/k choose"), "{text}");
+    assert!(text.contains("enter open"), "{text}");
+}

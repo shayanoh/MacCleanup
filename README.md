@@ -53,7 +53,7 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `[` / `]` | Grow / shrink the graph panel |
 | `r` / `R` | Rescan the folder you are viewing / rescan everything (refused while a scan is running; on the ToBeDeleted screen `r` is restore) |
 | `s` | Cycle sort: on-disk size (default), size, name. The sorted column is white with an arrow in the header |
-| `Tab` | Focus the sidebar (then `j`/`k` switch screens) |
+| `Tab` | Switch focus between the menu and the list (the menu has focus at startup: `j`/`k` choose a screen, `Enter` opens it) |
 | `1` `2` `3` | Home, Explorer, ToBeDeleted |
 | `r` / `D` / `E` (ToBeDeleted screen) | Restore / delete for good / empty all |
 | `q`, `Esc` | Quit (`Esc` goes up a folder first) |

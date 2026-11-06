@@ -291,7 +291,8 @@ impl App {
         let total_space = volume::total_space(&root.path).unwrap_or(0);
         let mut app = App {
             screen: Screen::Home,
-            focus: Focus::Main,
+            // The menu starts focused so j/k and Enter work straight away.
+            focus: Focus::Sidebar,
             graph: GraphMode::Bars,
             graph_pct: 35,
             sort: SortBy::Disk,
@@ -463,7 +464,11 @@ impl App {
                     Focus::Main => Focus::Sidebar,
                 }
             }
-            Action::GoTo(screen) => self.goto(screen),
+            // Jumping straight to a screen means "work there": focus its list.
+            Action::GoTo(screen) => {
+                self.goto(screen);
+                self.focus = Focus::Main;
+            }
             Action::Rescan => self.rescan(false),
             Action::RescanAll => self.rescan(true),
             Action::Click { x, y } => self.click(x, y),
@@ -1755,5 +1760,62 @@ mod tests {
             }
             other => panic!("expected review, got {}", other.is_some()),
         }
+    }
+
+    fn fresh_app() -> App {
+        // Same setup as `env`, but without navigating anywhere.
+        use crate::accounting::Accounting;
+        use crate::glyphs::{GlyphMode, Glyphs};
+        use crate::safety::Policy;
+        use crate::scan::Scanner;
+        use crate::softdelete::Holding;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let scanner = Scanner::new(2);
+        let root = scanner.scan_root(&home);
+        let hold = base.join("hold");
+        let policy = Policy::new(&home, &hold);
+        let holding = Holding::open(hold).unwrap();
+        let app = App::new(
+            scanner,
+            root,
+            policy,
+            holding,
+            Accounting::new(0),
+            Glyphs::new(GlyphMode::Nerd),
+            false,
+        );
+        std::mem::forget(dir); // keep the sandbox alive for the app's lifetime
+        app
+    }
+
+    #[test]
+    fn starts_on_home_with_the_menu_focused() {
+        let app = fresh_app();
+        assert_eq!(app.screen, Screen::Home);
+        assert_eq!(app.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn menu_keys_work_straight_away() {
+        let mut app = fresh_app();
+        app.update(Action::Down); // choose Explorer without pressing tab
+        assert_eq!(app.screen, Screen::Explorer);
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.update(Action::Into); // open it: focus moves to the list
+        assert_eq!(app.focus, Focus::Main);
+    }
+
+    #[test]
+    fn number_keys_jump_and_focus_the_screen() {
+        let mut app = fresh_app();
+        app.update(Action::GoTo(Screen::Explorer));
+        assert_eq!(app.screen, Screen::Explorer);
+        assert_eq!(app.focus, Focus::Main, "ready to move through rows");
+        app.update(Action::FocusToggle);
+        app.update(Action::GoTo(Screen::Holding));
+        assert_eq!(app.focus, Focus::Main);
     }
 }

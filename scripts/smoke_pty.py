@@ -201,6 +201,12 @@ wait_for("Free")
 wait_for("Biggest folders")
 wait_for("Scan complete")
 
+step("the menu has focus at startup: j opens the explorer, Enter focuses its list")
+wait_for("j/k choose")
+send(b"j")
+wait_for("marked: 0 items")
+send(b"\r")
+
 step("explorer, wait for the scan, jump to the top row (the biggest: proj)")
 send(b"2")
 wait_for("marked: 0 items")
