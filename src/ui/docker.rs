@@ -41,7 +41,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         ])
         .areas(area);
         render_list(frame, list, app);
-        app.graph_hits = render_side(frame, side, app);
+        render_side(frame, side, app).store(app);
     } else {
         render_list(frame, area, app);
     }
@@ -846,15 +846,15 @@ fn summary_line(app: &App, width: usize) -> TextLine<'static> {
 }
 
 /// The graph (unless hidden) over the details pane.
-fn render_side(frame: &mut Frame, area: Rect, app: &mut App) -> Vec<graph::GraphHit> {
+fn render_side(frame: &mut Frame, area: Rect, app: &mut App) -> graph::GraphOut {
     let g = app.glyphs;
     if app.graph == GraphMode::Hidden || area.height < 16 {
         render_detail(frame, area, app, &g);
-        return Vec::new();
+        return graph::GraphOut::default();
     }
     let [top, bottom] =
         Layout::vertical([Constraint::Percentage(45), Constraint::Fill(1)]).areas(area);
-    let hits = graph::render_data(frame, top, &g, app.graph, &graph_data(app));
+    let hits = graph::render_data(frame, top, &g, app.graph, &graph_data(app), app.hover);
     render_detail(frame, bottom, app, &g);
     hits
 }
@@ -914,6 +914,7 @@ fn graph_data(app: &App) -> GraphData {
             .collect(),
         // A click on a box selects that list line.
         keys: items.iter().map(|&i| (i, 0)).collect(),
+        by_size: false,
         cursor: cursor_item,
         scope,
         weights,

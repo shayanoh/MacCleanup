@@ -35,7 +35,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         render_list(frame, list, app);
         if let Some(b) = app.docker.browse.as_ref() {
             let g = app.glyphs;
-            app.graph_hits = graph::render_data(frame, side, &g, app.graph, &graph_data(b));
+            let out = graph::render_data(frame, side, &g, app.graph, &graph_data(b), app.hover);
+            out.store(app);
         }
     } else {
         render_list(frame, area, app);
@@ -73,6 +74,7 @@ fn graph_data(b: &BrowseState) -> GraphData {
         safeties: vec![Safety::Caution; rows.len()],
         marked: vec![false; rows.len()],
         keys: (0..rows.len()).map(|i| (i, 0)).collect(),
+        by_size: false,
         cursor: (!rows.is_empty()).then(|| b.cursor.min(rows.len() - 1)),
         scope: b.dir.clone(),
         weights,
