@@ -68,14 +68,6 @@ type Command = (
 
 const FIXED: &[Fixed] = &[
     Fixed {
-        id: "pnpm-cache",
-        tool: "pnpm",
-        label: "metadata cache",
-        rel: "Library/Caches/pnpm",
-        regen: "fetched again when needed",
-        command: None,
-    },
-    Fixed {
         id: "yarn",
         tool: "Yarn",
         label: "cache",
@@ -237,6 +229,7 @@ pub(crate) fn discover_with(
         // whether it has the npx cache commands)
         pnpms.len() + 2 * npms.len(),
     );
+    out.extend(pnpm_caches(home));
     out.extend(pnpm_stores(home, runner, &pnpms, work));
     out.extend(npm_caches(home, runner, &npms, work));
     work.stage(1, 1, "listing app caches");
@@ -302,7 +295,10 @@ fn pnpm_stores(
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
             let owner = owners.iter().find(|(s, _)| *s == store).map(|(_, e)| e);
             let (mode, note) = match owner {
-                Some(exe) => (Mode::Command(pinned(home, exe, &["store", "prune"])), None),
+                Some(exe) => (
+                    Mode::Command(pinned(home, exe, &["store", "prune"])),
+                    Some(unused_note(&store)),
+                ),
                 None => (
                     Mode::Folder,
                     Some(
@@ -322,6 +318,98 @@ fn pnpm_stores(
             }
         })
         .collect()
+}
+
+/// pnpm's cache folder holds two things apart from the store, and neither
+/// has a pnpm command: the `dlx` cache (what `pnpm dlx`, pnpm's npx, ran;
+/// pnpm also expires it by itself) and the registry metadata (`v10`, `v11`).
+/// Each is its own folder row, so the store's prune never touches them.
+fn pnpm_caches(home: &Path) -> Vec<ToolEntry> {
+    let root = home.join("Library/Caches/pnpm");
+    let Ok(rd) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            let dlx = name == "dlx";
+            ToolEntry {
+                id: if dlx { "pnpm-dlx".to_string() } else { format!("pnpm-cache:{name}") },
+                tool: "pnpm".to_string(),
+                label: if dlx { "dlx cache (pnpm dlx)".to_string() } else { format!("metadata cache {name}") },
+                path,
+                regen: if dlx {
+                    "downloaded again by pnpm dlx".to_string()
+                } else {
+                    "fetched again when needed".to_string()
+                },
+                mode: Mode::Folder,
+                note: dlx.then(|| "pnpm has no command for this one; it is moved. It is separate from the store.".to_string()),
+            }
+        })
+        .collect()
+}
+
+/// Bytes in a pnpm store that no project uses: files with one link and no
+/// APFS clone. pnpm links (or, on a Mac, clones) every file into the
+/// projects that use it, so a file nobody links or clones is unused.
+/// This is an estimate; `pnpm store prune` decides what it really removes.
+pub(crate) fn unused_in_store(store: &Path) -> u64 {
+    use rayon::prelude::*;
+    use std::os::unix::fs::MetadataExt;
+    fn walk(dir: &Path, total: &mut u64) {
+        let Ok(rd) = fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(&path, total);
+            } else if meta.is_file()
+                && meta.nlink() == 1
+                && crate::scan::clone_facts(&path).is_none_or(|c| c.refcnt <= 1)
+            {
+                *total += meta.blocks() * 512;
+            }
+        }
+    }
+    let Ok(rd) = fs::read_dir(store.join("files")) else {
+        return 0;
+    };
+    let shards: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    shards
+        .par_iter()
+        .map(|d| {
+            let mut t = 0;
+            if d.is_dir() {
+                walk(d, &mut t);
+            }
+            t
+        })
+        .sum()
+}
+
+fn unused_note(store: &Path) -> String {
+    let bytes = unused_in_store(store);
+    if bytes == 0 {
+        "No package here looks unused: every file is linked or cloned by a project.".to_string()
+    } else {
+        format!(
+            "About {} of this store looks unused (files no project links or clones); pnpm store prune removes what pnpm finds unreferenced.",
+            crate::fmt::human_size(bytes)
+        )
+    }
 }
 
 /// Does this npm have `npm cache npx rm` (npx's own cache commands)?
@@ -561,6 +649,37 @@ mod tests {
         assert!(spec("uv").can_force());
         assert_eq!(spec("uv").forced().display(), "uv cache clean --force");
         assert!(!spec("go-build").can_force());
+    }
+
+    #[test]
+    fn pnpm_dlx_and_metadata_are_their_own_folder_rows() {
+        let h = home();
+        dir(&h.home.join("Library/Caches/pnpm/dlx"));
+        dir(&h.home.join("Library/Caches/pnpm/v11"));
+        let entries = find(&h, &FakeRunner::new(&[]));
+        assert!(matches!(by_id(&entries, "pnpm-dlx").mode, Mode::Folder));
+        assert!(matches!(
+            by_id(&entries, "pnpm-cache:v11").mode,
+            Mode::Folder
+        ));
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.label == "pnpm" && e.tool == "App caches")
+        );
+    }
+
+    #[test]
+    fn unused_store_bytes_skip_files_a_project_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard = tmp.path().join("files/ab");
+        fs::create_dir_all(&shard).unwrap();
+        fs::write(shard.join("unused"), vec![1u8; 20000]).unwrap();
+        fs::write(shard.join("used"), vec![2u8; 20000]).unwrap();
+        fs::hard_link(shard.join("used"), tmp.path().join("project-link")).unwrap();
+        let bytes = unused_in_store(tmp.path());
+        assert!((20000..40000).contains(&bytes), "{bytes}");
+        assert_eq!(unused_in_store(&tmp.path().join("missing")), 0);
     }
 
     #[test]
