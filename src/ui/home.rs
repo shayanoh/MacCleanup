@@ -64,15 +64,17 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Line::raw(""),
     ];
 
-    let (files, bytes) = app.scanner.stats();
+    let stats = app.scanner.stats();
     let activity = if app.scanner.is_idle() {
         Line::from(vec![
             Span::styled(g.check().to_string(), Style::default().fg(SAFE)),
             Span::raw(format!(
-                " Scan complete {} {files} files {} {}",
+                " Scan complete {} {} files {} {} ({} on disk)",
                 g.dot(),
+                stats.files,
                 g.dot(),
-                human_size(bytes)
+                human_size(stats.bytes),
+                human_size(stats.disk)
             )),
         ])
     } else {
@@ -83,10 +85,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(ACCENT),
             ),
             Span::raw(format!(
-                " Scanning {} {files} files {} {}",
+                " Scanning {} {} files {} {} ({} on disk)",
                 g.dot(),
+                stats.files,
                 g.dot(),
-                human_size(bytes)
+                human_size(stats.bytes),
+                human_size(stats.disk)
             )),
         ])
     };

@@ -407,3 +407,108 @@ fn drawing_records_whether_the_terminal_is_too_small() {
     render(&mut e.app, 0, 0);
     assert!(e.app.too_small);
 }
+
+fn find_text(app: &mut App, w: u16, h: u16, needle: &str) -> Option<ratatui::style::Style> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| ui::draw(f, app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let symbols: Vec<&str> = needle.chars().map(|_| "").collect();
+    let _ = symbols;
+    let needle_chars: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width.saturating_sub(needle_chars.len() as u16) {
+            if needle_chars
+                .iter()
+                .enumerate()
+                .all(|(i, c)| buf[(x + i as u16, y)].symbol() == c)
+            {
+                let cell = &buf[(x, y)];
+                return Some(Style::default().fg(cell.fg).add_modifier(cell.modifier));
+            }
+        }
+    }
+    None
+}
+
+use ratatui::style::{Color, Style};
+
+#[test]
+fn explorer_header_marks_the_sorted_column() {
+    let mut e = explorer(GlyphMode::Nerd);
+    let text = render(&mut e.app, 120, 30);
+    assert!(
+        text.contains("On disk ▼"),
+        "default is on-disk, descending:\n{text}"
+    );
+    assert!(
+        !text.contains("Size ▼") && !text.contains("Name ▲"),
+        "{text}"
+    );
+
+    e.app.update(Action::CycleSort);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("Size ▼"), "{text}");
+    assert!(!text.contains("On disk ▼"), "{text}");
+
+    e.app.update(Action::CycleSort);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("Name ▲"), "{text}");
+}
+
+#[test]
+fn explorer_header_arrows_are_ascii_in_ascii_mode() {
+    let mut e = explorer(GlyphMode::Ascii);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("On disk v"), "{text}");
+    e.app.update(Action::CycleSort);
+    e.app.update(Action::CycleSort);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("Name ^"), "{text}");
+}
+
+#[test]
+fn sorted_column_is_white_and_the_others_gray() {
+    let mut e = explorer(GlyphMode::Nerd);
+    // Sorted by on-disk size: that header is white, the Size header is gray.
+    let disk = find_text(&mut e.app, 120, 30, "On disk").unwrap();
+    let size = find_text(&mut e.app, 120, 30, "Size").unwrap();
+    assert_eq!(disk.fg, Some(Color::White));
+    assert_eq!(size.fg, Some(Color::DarkGray));
+
+    e.app.update(Action::CycleSort); // by Size
+    let disk = find_text(&mut e.app, 120, 30, "On disk").unwrap();
+    let size = find_text(&mut e.app, 120, 30, "Size").unwrap();
+    assert_eq!(size.fg, Some(Color::White));
+    assert_eq!(disk.fg, Some(Color::DarkGray));
+}
+
+#[test]
+fn sorted_column_values_are_white_and_the_other_size_column_gray() {
+    let mut e = explorer(GlyphMode::Nerd);
+    // small.txt is 1500 bytes but occupies 4096 on disk, so the two columns
+    // print different strings we can find on screen.
+    let small = e
+        .app
+        .rows
+        .iter()
+        .find(|r| r.name == "small.txt")
+        .unwrap()
+        .clone();
+    let big_disk = human_size(small.disk);
+    let big_size = human_size(small.size);
+    assert_ne!(big_disk, big_size, "need distinct strings for this check");
+    let disk = find_text(&mut e.app, 120, 30, &big_disk).unwrap();
+    let size = find_text(&mut e.app, 120, 30, &big_size).unwrap();
+    assert_eq!(disk.fg, Some(Color::White));
+    assert_eq!(size.fg, Some(Color::DarkGray));
+}
+
+#[test]
+fn home_scan_line_shows_on_disk_size_too() {
+    let mut e = make_app(FILES, GlyphMode::Nerd);
+    let stats = e.app.scanner.stats();
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains(&human_size(stats.bytes)), "{text}");
+    assert!(text.contains(&human_size(stats.disk)), "{text}");
+    assert!(text.contains("on disk"), "{text}");
+}

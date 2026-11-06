@@ -7,9 +7,9 @@ A colorful, animated terminal app (Rust TUI) for macOS that shows where your dis
 ## What works today
 
 - **Home:** live free-space gauge, pending (soft-deleted) space, scan activity, and the biggest folders.
-- **Disk explorer:** a multithreaded scan of your home folder (or `--root`) with live sizes. Each row shows logical size, real on-disk size and a share bar. Browse with vim-style keys or the mouse, sort by size or name, mark items, then review and delete.
+- **Disk explorer:** a multithreaded scan of your home folder (or `--root`) with live sizes. Each row shows logical size, real on-disk size and a share bar. Browse with vim-style keys or the mouse, sort by on-disk size, size or name, mark items, then review and delete.
 - **Soft delete:** "delete" moves items to `~/ToBeDeleted` (or `--holding-dir`). Browse that folder, restore items to where they came from, delete items for good, or empty it. Moved files count as **pending**, not freed, because nothing is freed until the folder is emptied.
-- **Graphs:** a bar graph and a treemap (box area equals size) that follow your selection. Cycle bars, treemap and hidden with `g`; resize the panel with `[` and `]`.
+- **Graphs:** a bar graph and a treemap (box area equals size) that follow your selection. Cycle bars, treemap and hidden with `t`; resize the panel with `[` (bigger) and `]` (smaller). Graphs and share bars follow the sorted size (on-disk by default).
 - **Honest accounting:** the finish screen reports space truly freed (the volume's free space now minus at the start), not just what was moved.
 - **Safety:** a hard-coded protected list, a review screen before every delete, and an extra explicit confirmation for anything irreversible (see below).
 
@@ -44,12 +44,12 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 |---|---|
 | `j` / `k`, arrows | Move down / up |
 | `h` / `l`, `Enter` | Go out of / into a folder |
-| `Home` / `End` or `G`, `PageUp` / `PageDown` | Jump and page |
+| `g` / `G` (or `Home` / `End`), `PageUp` / `PageDown` | Jump to top / bottom, page |
 | `space` | Mark or unmark the selected item |
 | `d` | Review marked items, then delete |
-| `g` | Cycle graph: bars, treemap, hidden |
-| `[` / `]` | Shrink / grow the graph panel |
-| `s` | Sort by size or name |
+| `t` | Cycle graph type: bars, treemap, hidden |
+| `[` / `]` | Grow / shrink the graph panel |
+| `s` | Cycle sort: on-disk size (default), size, name. The sorted column is white with an arrow in the header |
 | `Tab` | Focus the sidebar (then `j`/`k` switch screens) |
 | `1` `2` `3` | Home, Explorer, ToBeDeleted |
 | `r` / `D` / `E` (ToBeDeleted screen) | Restore / delete for good / empty all |

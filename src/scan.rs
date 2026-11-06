@@ -103,6 +103,16 @@ fn finish_one(node: &Arc<Node>) {
     }
 }
 
+/// Totals seen so far by the scanner (for live progress counters).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    pub files: u64,
+    /// Logical bytes.
+    pub bytes: u64,
+    /// Allocated bytes on disk.
+    pub disk: u64,
+}
+
 /// One entry shown in the explorer list.
 #[derive(Clone)]
 pub struct Row {
@@ -138,6 +148,7 @@ struct Shared {
     threads: Mutex<HashSet<ThreadId>>,
     files_seen: AtomicU64,
     bytes_seen: AtomicU64,
+    disk_seen: AtomicU64,
     active: AtomicUsize,
 }
 
@@ -168,6 +179,7 @@ impl Scanner {
                 threads: Mutex::new(HashSet::new()),
                 files_seen: AtomicU64::new(0),
                 bytes_seen: AtomicU64::new(0),
+                disk_seen: AtomicU64::new(0),
                 active: AtomicUsize::new(0),
             }),
         }
@@ -252,12 +264,13 @@ impl Scanner {
         lock(&self.shared.denied).clone()
     }
 
-    /// (files seen, bytes seen) so far across all scans.
-    pub fn stats(&self) -> (u64, u64) {
-        (
-            self.shared.files_seen.load(Ordering::Relaxed),
-            self.shared.bytes_seen.load(Ordering::Relaxed),
-        )
+    /// Files, bytes and on-disk bytes seen so far across all scans.
+    pub fn stats(&self) -> ScanStats {
+        ScanStats {
+            files: self.shared.files_seen.load(Ordering::Relaxed),
+            bytes: self.shared.bytes_seen.load(Ordering::Relaxed),
+            disk: self.shared.disk_seen.load(Ordering::Relaxed),
+        }
     }
 
     /// Number of distinct worker threads that have run a directory job.
@@ -303,6 +316,7 @@ fn scan_dir(shared: &Arc<Shared>, node: &Arc<Node>) {
         add_up(node, *size, *disk, *files);
         shared.files_seen.fetch_add(*files, Ordering::Relaxed);
         shared.bytes_seen.fetch_add(*size, Ordering::Relaxed);
+        shared.disk_seen.fetch_add(*disk, Ordering::Relaxed);
         (*size, *disk, *files) = (0, 0, 0);
     };
     for entry in rd {
@@ -529,5 +543,18 @@ mod tests {
     #[test]
     fn default_threads_is_at_least_two() {
         assert!(Scanner::default_threads() >= 2);
+    }
+
+    #[test]
+    fn stats_include_files_bytes_and_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a/f1"), 1000);
+        write(&dir.path().join("a/b/f2"), 5000);
+        let (s, root) = scan(dir.path(), 2);
+        let stats = s.stats();
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.bytes, 6000);
+        assert_eq!(stats.disk, root.disk());
+        assert!(stats.disk >= 6000);
     }
 }

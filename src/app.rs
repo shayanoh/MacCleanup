@@ -36,6 +36,9 @@ pub enum GraphMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortBy {
+    /// Allocated bytes on disk (the default; this is what a delete frees).
+    Disk,
+    /// Logical size.
     Size,
     Name,
 }
@@ -220,6 +223,12 @@ pub struct App {
 
 fn sort_rows(rows: &mut [Row], by: SortBy) {
     match by {
+        SortBy::Disk => rows.sort_by(|a, b| {
+            b.disk
+                .cmp(&a.disk)
+                .then_with(|| b.size.cmp(&a.size))
+                .then_with(|| a.name.cmp(&b.name))
+        }),
         SortBy::Size => rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name))),
         SortBy::Name => rows.sort_by_key(|r| r.name.to_string_lossy().to_lowercase()),
     }
@@ -254,7 +263,7 @@ impl App {
             focus: Focus::Main,
             graph: GraphMode::Bars,
             graph_pct: 35,
-            sort: SortBy::Size,
+            sort: SortBy::Disk,
             rows: Vec::new(),
             cursor: 0,
             offset: 0,
@@ -299,6 +308,23 @@ impl App {
 
     pub fn selected_row(&self) -> Option<&Row> {
         self.rows.get(self.cursor)
+    }
+
+    /// The number the graphs and share bars use for a row: the size you are
+    /// sorting by (on-disk size unless sorted by logical size).
+    pub fn weight(&self, row: &Row) -> u64 {
+        match self.sort {
+            SortBy::Size => row.size,
+            SortBy::Disk | SortBy::Name => row.disk,
+        }
+    }
+
+    /// The matching total for the folder being shown.
+    pub fn weight_total(&self) -> u64 {
+        match self.sort {
+            SortBy::Size => self.current().size(),
+            SortBy::Disk | SortBy::Name => self.current().disk(),
+        }
     }
 
     pub fn marked_total(&self) -> u64 {
@@ -391,8 +417,9 @@ impl App {
             Action::ShrinkGraph => self.graph_pct = self.graph_pct.saturating_sub(5).max(20),
             Action::CycleSort => {
                 self.sort = match self.sort {
+                    SortBy::Disk => SortBy::Size,
                     SortBy::Size => SortBy::Name,
-                    SortBy::Name => SortBy::Size,
+                    SortBy::Name => SortBy::Disk,
                 };
                 self.refresh_rows();
             }
@@ -828,7 +855,8 @@ mod tests {
     use ratatui::layout::Rect;
     use std::fs;
 
-    const FILES: &[(&str, usize)] = &[("a/f", 3000), ("b.bin", 2000), ("c/f", 1000)];
+    // Multiples of the 4096-byte allocation unit, so size and on-disk size agree.
+    const FILES: &[(&str, usize)] = &[("a/f", 12288), ("b.bin", 8192), ("c/f", 4096)];
 
     #[test]
     fn down_up_clamp() {
@@ -876,13 +904,13 @@ mod tests {
         let mut e = env(FILES);
         let app = &mut e.app;
         app.update(Action::ToggleMark);
-        assert_eq!(app.marked_total(), 3000);
+        assert_eq!(app.marked_total(), 12288);
         app.update(Action::Down);
         app.update(Action::ToggleMark);
-        assert_eq!(app.marked_total(), 5000);
+        assert_eq!(app.marked_total(), 20480);
         assert_eq!(app.marks.len(), 2);
         app.update(Action::ToggleMark);
-        assert_eq!(app.marked_total(), 3000);
+        assert_eq!(app.marked_total(), 12288);
         assert_eq!(app.marks.len(), 1);
     }
 
@@ -905,7 +933,7 @@ mod tests {
         app.update(Action::ToggleMark);
         assert_eq!(app.marks.len(), 1);
         assert!(app.marks.contains_key(&home.join("a")));
-        assert_eq!(app.marked_total(), 3000);
+        assert_eq!(app.marked_total(), 12288);
     }
 
     #[test]
@@ -933,9 +961,9 @@ mod tests {
         app.update(Action::OpenReview);
         match &app.dialog {
             Some(Dialog::Review(r)) => {
-                assert_eq!(r.total, 5000);
+                assert_eq!(r.total, 20480);
                 let sizes: Vec<u64> = r.items.iter().map(|i| i.size).collect();
-                assert_eq!(sizes, [3000, 2000]);
+                assert_eq!(sizes, [12288, 8192]);
             }
             other => panic!("expected review, got {:?}", other.is_some()),
         }
@@ -957,7 +985,7 @@ mod tests {
         assert!(!home.join("b.bin").exists());
         assert!(home.join("c/f").exists());
         assert_eq!(app.held.len(), 2);
-        assert_eq!(app.accounting.pending(), 5000);
+        assert_eq!(app.accounting.pending(), 20480);
         assert!(app.marks.is_empty());
         assert!(matches!(app.dialog, Some(Dialog::Notice(_))));
         assert_eq!(names(app), ["c"]);
@@ -1040,24 +1068,68 @@ mod tests {
         assert_eq!(app.graph_pct, 20);
     }
 
+    /// A sparse file: big logical size, (almost) no space on disk.
+    fn write_sparse(path: &std::path::Path, len: u64) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let f = fs::File::create(path).unwrap();
+        f.set_len(len).unwrap();
+    }
+
+    fn sort_env() -> crate::testutil::Env {
+        // real.bin: 8192 on disk; a.bin: 4096; sparse.bin: 1 MB logical, ~0 on disk.
+        let e = env(&[("real.bin", 8192), ("a.bin", 4096)]);
+        write_sparse(&e.home.join("sparse.bin"), 1_000_000);
+        let mut e = e;
+        e.app.refresh_rows();
+        e
+    }
+
     #[test]
-    fn sort_toggle_orders_rows() {
-        let mut e = env(&[("zeta/f", 3000), ("alpha.bin", 2000), ("mid/f", 1000)]);
+    fn default_sort_is_on_disk_size() {
+        let e = sort_env();
+        assert_eq!(e.app.sort, SortBy::Disk);
+        assert_eq!(names(&e.app), ["real.bin", "a.bin", "sparse.bin"]);
+    }
+
+    #[test]
+    fn sort_cycles_disk_size_name() {
+        let mut e = sort_env();
         let app = &mut e.app;
-        assert_eq!(names(app), ["zeta", "alpha.bin", "mid"]);
         app.update(Action::CycleSort);
-        assert_eq!(names(app), ["alpha.bin", "mid", "zeta"]);
+        assert_eq!(app.sort, SortBy::Size);
+        assert_eq!(names(app), ["sparse.bin", "real.bin", "a.bin"]);
         app.update(Action::CycleSort);
-        assert_eq!(names(app), ["zeta", "alpha.bin", "mid"]);
+        assert_eq!(app.sort, SortBy::Name);
+        assert_eq!(names(app), ["a.bin", "real.bin", "sparse.bin"]);
+        app.update(Action::CycleSort);
+        assert_eq!(app.sort, SortBy::Disk);
+        assert_eq!(names(app), ["real.bin", "a.bin", "sparse.bin"]);
     }
 
     #[test]
     fn cursor_follows_same_path_after_sort() {
-        let mut e = env(&[("zeta/f", 3000), ("alpha.bin", 2000), ("mid/f", 1000)]);
+        let mut e = sort_env();
         let app = &mut e.app;
-        select(app, "mid");
+        select(app, "a.bin");
         app.update(Action::CycleSort);
-        assert_eq!(app.selected_row().unwrap().name, "mid");
+        assert_eq!(app.selected_row().unwrap().name, "a.bin");
+    }
+
+    #[test]
+    fn weight_follows_the_sort_metric() {
+        let mut e = sort_env();
+        let app = &mut e.app;
+        let sparse = app
+            .rows
+            .iter()
+            .find(|r| r.name == "sparse.bin")
+            .unwrap()
+            .clone();
+        assert!(sparse.size > sparse.disk);
+        assert_eq!(app.weight(&sparse), sparse.disk);
+        app.update(Action::CycleSort);
+        assert_eq!(app.weight(&sparse), sparse.size);
+        assert_eq!(app.weight_total(), app.current().size());
     }
 
     fn set_layout(app: &mut App) {
@@ -1157,7 +1229,7 @@ mod tests {
         app.update(Action::RestoreSelected);
         assert!(first.original.exists());
         assert_eq!(app.held.len(), 1);
-        assert_eq!(app.accounting.pending(), 5000 - first.size);
+        assert_eq!(app.accounting.pending(), 20480 - first.size);
 
         // Deleting forever asks for confirmation first.
         let payload_exists = app.held.len() == 1;
@@ -1234,7 +1306,7 @@ mod tests {
         settle(app);
         assert!(matches!(app.dialog, Some(Dialog::Notice(_))));
         assert!(!home.join("b.bin").exists());
-        assert_eq!(app.accounting.pending(), 2000);
+        assert_eq!(app.accounting.pending(), 8192);
         assert_eq!(app.held.len(), 1);
     }
 
@@ -1264,8 +1336,8 @@ mod tests {
         settle(app);
         match &app.dialog {
             Some(Dialog::Finish(f)) => {
-                assert_eq!(f.moved_bytes, 2000);
-                assert_eq!(f.emptied_bytes, 2000);
+                assert_eq!(f.moved_bytes, 8192);
+                assert_eq!(f.emptied_bytes, 8192);
                 assert_eq!(f.failures, 0);
             }
             other => panic!("expected finish, got {}", other.is_some()),

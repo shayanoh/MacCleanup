@@ -213,9 +213,9 @@ if os.environ.get("DUMP"):
     print("=== HOME ==="); send(b"1"); pump(0.5); print(screen.text())
     send(b"2"); pump(0.5)
     print("=== EXPLORER (bars) ==="); print(screen.text())
-    send(b"g"); pump(0.5)
+    send(b"t"); pump(0.5)
     print("=== EXPLORER (treemap) ==="); print(screen.text())
-    send(b"g"); send(b"g"); pump(0.3)
+    send(b"t"); send(b"t"); pump(0.3)
 
 step("mark proj and open the review dialog")
 send(b" ")

@@ -85,6 +85,14 @@ impl Glyphs {
         }
     }
 
+    /// Sort-order arrows for column headers.
+    pub fn sort_asc(&self) -> &'static str {
+        self.pick("▲", "^")
+    }
+    pub fn sort_desc(&self) -> &'static str {
+        self.pick("▼", "v")
+    }
+
     pub fn spinner(&self) -> &'static [&'static str] {
         match self.mode {
             GlyphMode::Nerd => NERD_SPINNER,
@@ -124,6 +132,8 @@ mod tests {
             g.warn(),
             g.nav(0),
             g.nav(7),
+            g.sort_asc(),
+            g.sort_desc(),
         ];
         v.extend(g.spinner().iter().copied());
         v

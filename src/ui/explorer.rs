@@ -9,7 +9,7 @@ use super::{
     safety_dot, text_width,
 };
 use crate::anim;
-use crate::app::{App, GraphMode};
+use crate::app::{App, GraphMode, SortBy};
 use crate::fmt::{eighths_bar, human_size};
 use crate::scan::Row;
 
@@ -50,22 +50,24 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     app.ensure_visible();
 
     // Status line: live scan activity.
-    let (files, bytes) = app.scanner.stats();
+    let stats = app.scanner.stats();
+    let totals = format!(
+        "{} files {} {} ({} on disk)",
+        stats.files,
+        g.dot(),
+        human_size(stats.bytes),
+        human_size(stats.disk)
+    );
     let status = if app.scanner.is_idle() {
         Line::from(vec![
             Span::styled(g.check().to_string(), Style::default().fg(Color::Green)),
-            Span::raw(format!(" {files} files {} {}", g.dot(), human_size(bytes))),
+            Span::raw(format!(" {totals}")),
         ])
     } else {
         let idx = anim::spinner_frame(app.tick, g.spinner().len());
         Line::from(vec![
             Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
-            Span::raw(format!(
-                " scanning{} {files} files {} {}",
-                g.ellipsis(),
-                g.dot(),
-                human_size(bytes)
-            )),
+            Span::raw(format!(" scanning{} {totals}", g.ellipsis())),
         ])
     };
     frame.render_widget(
@@ -81,22 +83,55 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let fixed = prefix_w + 1 + 9 + 1 + 9 + 1 + 8;
     let name_w = (inner.width as usize).saturating_sub(fixed).max(4);
 
-    let header = format!(
-        "{}{} {} {} Share",
-        " ".repeat(prefix_w),
-        pad("Name".to_string(), name_w),
-        right("Size", 9),
-        right("On disk", 9)
-    );
+    // Header: the sorted column is white with an arrow, the others gray.
+    let sort = app.sort;
+    let arrow = |by: SortBy| -> String {
+        if sort != by {
+            return String::new();
+        }
+        let a = if by == SortBy::Name {
+            g.sort_asc()
+        } else {
+            g.sort_desc()
+        };
+        format!(" {a}")
+    };
+    let head_style = |by: SortBy| {
+        if sort == by {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        }
+    };
+    let header = Line::from(vec![
+        Span::raw(" ".repeat(prefix_w)),
+        Span::styled(
+            pad(format!("Name{}", arrow(SortBy::Name)), name_w),
+            head_style(SortBy::Name),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            right(&format!("Size{}", arrow(SortBy::Size)), 9),
+            head_style(SortBy::Size),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            right(&format!("On disk{}", arrow(SortBy::Disk)), 9),
+            head_style(SortBy::Disk),
+        ),
+        Span::styled(" Share", Style::default().fg(DIM)),
+    ]);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(header, Style::default().fg(DIM)))),
+        Paragraph::new(header),
         Rect::new(inner.x, inner.y + 1, inner.width, 1),
     );
 
     // Rows.
     let list_rows = app.layout.list_rows as usize;
     let list_area = Rect::new(inner.x, inner.y + 2, inner.width, app.layout.list_rows);
-    let total = app.current().size().max(1);
+    let total = app.weight_total().max(1);
     let start = app.offset.min(app.rows.len());
     let end = (start + list_rows).min(app.rows.len());
     let mut lines: Vec<Line> = app.rows[start..end]
@@ -172,7 +207,7 @@ fn row_line<'a>(
         let frame_idx = anim::spinner_frame(app.tick, g.spinner().len());
         pad(format!("{} {}", g.spinner()[frame_idx], r.files), 8)
     } else {
-        eighths_bar(r.size as f64 / total as f64, 8, g)
+        eighths_bar(app.weight(&r) as f64 / total as f64, 8, g)
     };
 
     let line = Line::from(vec![
@@ -184,10 +219,13 @@ fn row_line<'a>(
             Style::default().fg(safety_color(safety)),
         ),
         Span::styled(fit_pad(&name, name_w, g), name_style),
-        Span::raw(format!(" {}", right(&human_size(r.size), 9))),
+        Span::styled(
+            format!(" {}", right(&human_size(r.size), 9)),
+            value_style(app.sort == SortBy::Size),
+        ),
         Span::styled(
             format!(" {}", right(&human_size(r.disk), 9)),
-            Style::default().fg(DIM),
+            value_style(app.sort == SortBy::Disk),
         ),
         Span::styled(format!(" {share}"), Style::default().fg(Color::Yellow)),
     ]);
@@ -195,5 +233,14 @@ fn row_line<'a>(
         line.style(Style::default().bg(SELECTED_BG))
     } else {
         line
+    }
+}
+
+/// The sorted column's values are white; the other size column is gray.
+fn value_style(sorted: bool) -> Style {
+    if sorted {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(DIM)
     }
 }

@@ -268,9 +268,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Screen::Explorer => &[
                 "j/k move",
                 "h/l out/in",
+                "g/G top/bottom",
                 "space mark",
                 "d review & delete",
-                "g graph",
+                "t graph type",
                 "[ ] resize",
                 "s sort",
                 "tab menu",
