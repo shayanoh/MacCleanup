@@ -88,6 +88,27 @@ fn popup(
     (!growing).then_some(inner)
 }
 
+/// What to tell the user when a command is stuck on (or failed on) a lock
+/// held by another process. Empty for any other output.
+fn lock_hint(text: &str) -> Option<&'static str> {
+    crate::catalog::is_lock_wait(text).then_some(
+        "Another uv process is using the cache (for example a `uv run` server). \
+         uv waits up to 5 minutes for it, then gives up.",
+    )
+}
+
+/// How many rows these lines take once wrapped to `width` columns.
+fn wrapped_rows(lines: &[Line], width: usize) -> usize {
+    let width = width.max(1);
+    lines
+        .iter()
+        .map(|l| {
+            let w: usize = l.spans.iter().map(|s| super::text_width(&s.content)).sum();
+            w.div_ceil(width).max(1)
+        })
+        .sum()
+}
+
 fn key_line<'a>(g: &Glyphs, keys: &[(&str, &str)]) -> Line<'a> {
     let mut spans = Vec::new();
     for (i, (key, what)) in keys.iter().enumerate() {
@@ -156,7 +177,9 @@ pub struct ReviewLayout {
 pub fn review_layout(area: Rect, r: &Review) -> ReviewLayout {
     let width = area.width.saturating_sub(4).min(96);
     let n = r.commands.len();
-    let full = if n == 0 { 0 } else { n * 2 + 2 };
+    // A forceable command gets one more line saying what `f` does.
+    let forceable = r.commands.iter().filter(|c| c.can_force).count();
+    let full = if n == 0 { 0 } else { n * 2 + 2 + forceable };
     let compact_lines = if n == 0 { 0 } else { n + 2 };
     let max_h = area.height.saturating_sub(2) as usize;
     let height = (r.items.len() + full + 14).min(max_h).max(13);
@@ -270,7 +293,12 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
                 Span::styled(format!("  {} ", g.dot()), Style::default().fg(DANGER)),
                 Span::styled(
                     fit(&c.line, 40, g),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    // A forced command is drawn in red: it skips a safety check.
+                    if c.force {
+                        Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    },
                 ),
                 Span::styled(
                     format!("  {}  up to {}", c.tool, human_size(c.up_to)),
@@ -285,6 +313,19 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
                     ),
                     Style::default().fg(DIM),
                 )));
+                if c.can_force {
+                    lines.push(Line::from(if c.force {
+                        Span::styled(
+                            "    FORCED: skips the in-use check; a process using it now may be disturbed",
+                            Style::default().fg(DANGER),
+                        )
+                    } else {
+                        Span::styled(
+                            "    waits up to 5 minutes if another process uses it; f forces it",
+                            Style::default().fg(DIM),
+                        )
+                    }));
+                }
             }
         }
         if lay.clipped {
@@ -369,20 +410,23 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
         lines.push(key_line(g, &[("Esc", "Cancel")]));
     } else {
         // Commands cannot be undone, so Enter does nothing here.
-        lines.push(key_line(
-            g,
-            &[
-                (
-                    "y",
-                    if r.items.is_empty() {
-                        "Run the commands"
-                    } else {
-                        "Move, then run the commands"
-                    },
-                ),
-                ("Esc", "Cancel"),
-            ],
-        ));
+        let run = if r.items.is_empty() {
+            "Run the commands"
+        } else {
+            "Move, then run the commands"
+        };
+        if r.commands.iter().any(|c| c.can_force) {
+            lines.push(key_line(
+                g,
+                &[
+                    ("y", run),
+                    ("f", "Force (skip the in-use check)"),
+                    ("Esc", "Cancel"),
+                ],
+            ));
+        } else {
+            lines.push(key_line(g, &[("y", run), ("Esc", "Cancel")]));
+        }
     }
     if !r.items.is_empty() {
         lines.push(Line::from(vec![
@@ -477,14 +521,15 @@ fn confirm_forever(frame: &mut Frame, area: Rect, g: &Glyphs, t: &ForeverTarget,
 
 fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress, scale: f64) {
     let g = &app.glyphs;
+    let command = p.phase == Phase::Command;
     let Some(inner) = popup(
         frame,
         area,
         g,
         "Working",
         ACCENT,
-        area.width.saturating_sub(4).min(76),
-        9,
+        area.width.saturating_sub(4).min(86),
+        if command { 15 } else { 9 },
         scale,
     ) else {
         return;
@@ -504,13 +549,8 @@ fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress, scale:
         Phase::Deleting => "Deleting for good",
         Phase::Command => "Running cleanup commands",
     };
-    let sizes = if p.phase == Phase::Command {
-        format!("running: {}", fit(&p.current.to_string_lossy(), 50, g))
-    } else {
-        format!("{} of {}", human_size(p.usage.size), both_usage(p.of))
-    };
     let bar_w = (inner.width as usize).saturating_sub(7);
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
             Span::raw(format!(" {what}, please wait")),
@@ -520,14 +560,71 @@ fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress, scale:
             Span::styled(eighths_bar(frac, bar_w, g), Style::default().fg(SAFE)),
             Span::raw(format!(" {:>3}%", (frac * 100.0).floor() as u32)),
         ]),
-        Line::from(format!("{} / {} items", p.done, p.total)),
-        Line::from(sizes),
-        Line::from(Span::styled(
+    ];
+    if command {
+        let status = app.command_status();
+        let elapsed = status
+            .as_ref()
+            .and_then(|s| s.elapsed)
+            .map_or_else(|| "0s".to_string(), crate::fmt::duration);
+        lines.push(Line::from(format!(
+            "command {} of {}",
+            (p.done + 1).min(p.total.max(1)),
+            p.total.max(1)
+        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                fit(&p.current.to_string_lossy(), 40, g),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  running for {elapsed}")),
+        ]));
+        let last = status.as_ref().map(|s| s.last_line.as_str()).unwrap_or("");
+        lines.push(Line::from(Span::styled(
+            fit(
+                &if last.is_empty() {
+                    "(no output yet)".to_string()
+                } else {
+                    format!("{} {last}", g.dot())
+                },
+                inner.width as usize,
+                g,
+            ),
+            Style::default().fg(DIM),
+        )));
+        lines.push(Line::raw(""));
+        if let Some(hint) = lock_hint(last) {
+            lines.push(Line::from(Span::styled(hint, Style::default().fg(CAUTION))));
+            lines.push(Line::from(Span::styled(
+                "Close it, or cancel here and retry with --force afterwards.",
+                Style::default().fg(CAUTION),
+            )));
+        }
+        if status.as_ref().is_some_and(|s| s.cancelling) {
+            lines.push(Line::from(Span::styled(
+                "Cancelling the command...",
+                Style::default().fg(CAUTION).add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::raw(""));
+            lines.push(key_line(
+                g,
+                &[("Esc", "Cancel this command (moves already made stay)")],
+            ));
+        }
+    } else {
+        lines.push(Line::from(format!("{} / {} items", p.done, p.total)));
+        lines.push(Line::from(format!(
+            "{} of {}",
+            human_size(p.usage.size),
+            both_usage(p.of)
+        )));
+        lines.push(Line::from(Span::styled(
             fit_start(&p.current.to_string_lossy(), inner.width as usize, g),
             Style::default().fg(DIM),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(lines), inner);
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) {
@@ -588,18 +685,32 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
     for c in &f.commands {
         let (mark, color) = if c.ok {
             (g.check(), SAFE)
+        } else if c.cancelled {
+            (g.warn(), CAUTION)
         } else {
             (g.warn(), DANGER)
         };
-        let note = if c.ok || c.note.is_empty() {
+        let note = if c.ok {
+            String::new()
+        } else if c.cancelled {
+            " (cancelled)".to_string()
+        } else if c.note.is_empty() {
             String::new()
         } else {
-            format!(" ({})", fit(&c.note, 40, g))
+            format!(" ({})", fit(&c.note, 60, g))
         };
         lines.push(Line::from(Span::styled(
             format!("{mark} {}{note}", c.line),
             Style::default().fg(color),
         )));
+        if c.lock_wait
+            && let Some(hint) = lock_hint(&c.note)
+        {
+            lines.push(Line::from(Span::styled(
+                format!("    {hint}"),
+                Style::default().fg(CAUTION),
+            )));
+        }
     }
     lines.push(Line::from(format!(
         "Free space now {}   pending {}",
@@ -613,8 +724,20 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
         )));
     }
     lines.push(Line::raw(""));
-    lines.push(key_line(g, &[("Enter", "Done")]));
-    let height = lines.len() as u16 + 2;
+    if f.retry.is_empty() {
+        lines.push(key_line(g, &[("Enter", "Done")]));
+    } else {
+        lines.push(key_line(
+            g,
+            &[
+                ("f", "Retry with --force (skips uv's in-use check)"),
+                ("Enter", "Done"),
+            ],
+        ));
+    }
+    // Long lines wrap inside the window, so count rows, not lines.
+    let popup_w = area.width.saturating_sub(4).min(86);
+    let height = wrapped_rows(&lines, popup_w.saturating_sub(2) as usize) as u16 + 2;
     let Some(inner) = popup(
         frame,
         area,
@@ -740,6 +863,8 @@ mod review_layout_tests {
                     line: format!("tool{i} clean"),
                     spec: CommandSpec::new("tool", &["clean"]),
                     up_to: 0,
+                    can_force: false,
+                    force: false,
                 })
                 .collect(),
             total: Usage::default(),

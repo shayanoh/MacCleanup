@@ -7,7 +7,9 @@ use ratatui::layout::Rect;
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
 use crate::bg::{Latest, Work};
-use crate::catalog::{CommandRunner, CommandSpec, SystemRunner, ToolEntry, discover_tools};
+use crate::catalog::{
+    CommandRunner, CommandSpec, RunControl, SystemRunner, ToolEntry, discover_tools, is_lock_wait,
+};
 use crate::filter;
 use crate::fmt::both_usage;
 use crate::glyphs::Glyphs;
@@ -125,6 +127,10 @@ pub enum Action {
     CycleSort,
     FocusToggle,
     GoTo(Screen),
+    /// In a review: switch commands that have one to their `--force` form (`f`).
+    ToggleForce,
+    /// On the result screen: run the lock-blocked commands again with `--force`.
+    RetryForced,
     /// A digit key: the page at this position (1-based) in the menu.
     Menu(usize),
     Click {
@@ -179,6 +185,25 @@ pub struct ReviewCommand {
     pub spec: CommandSpec,
     /// The most it might free (what deleting its folder alone would).
     pub up_to: u64,
+    /// The command has a `--force` variant (uv's in-use check can be skipped).
+    pub can_force: bool,
+    /// The user chose the forced form for this run.
+    pub force: bool,
+}
+
+impl ReviewCommand {
+    /// What will really run: the forced form if the user chose it.
+    pub fn effective_spec(&self) -> CommandSpec {
+        if self.force {
+            self.spec.forced()
+        } else {
+            self.spec.clone()
+        }
+    }
+
+    fn refresh_line(&mut self) {
+        self.line = self.effective_spec().display();
+    }
 }
 
 /// How one cleanup command ended.
@@ -186,8 +211,12 @@ pub struct ReviewCommand {
 pub struct CommandOutcome {
     pub line: String,
     pub ok: bool,
+    /// Stopped by the user, or never started because of that.
+    pub cancelled: bool,
     /// The last line the command printed.
     pub note: String,
+    /// It failed (or stalled) waiting for a lock another process holds.
+    pub lock_wait: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +254,8 @@ pub struct FinishInfo {
     pub first_failure: Option<String>,
     /// How each tool command ended (empty when none ran).
     pub commands: Vec<CommandOutcome>,
+    /// Commands that failed on a lock and can be run again with `--force`.
+    pub retry: Vec<ReviewCommand>,
     /// App tick when the finish screen opened (drives the count-up).
     pub started_tick: u64,
 }
@@ -291,6 +322,17 @@ pub struct Detail {
     pub space: Space,
     /// False while the folder is still being scanned (numbers still growing).
     pub complete: bool,
+}
+
+/// A running tool command as the Working dialog shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandStatus {
+    /// How long the current command has run.
+    pub elapsed: Option<std::time::Duration>,
+    /// The last line it printed (uv says it is waiting for a lock there).
+    pub last_line: String,
+    /// The user asked it to stop.
+    pub cancelling: bool,
 }
 
 /// Whether a path is in the selection.
@@ -413,6 +455,10 @@ pub struct App {
     pub runner: Arc<dyn CommandRunner>,
     job: Option<DeleteJob>,
     cmd_job: Option<CommandJob>,
+    /// The running command's output and cancel switch.
+    cmd_ctl: Option<Arc<RunControl>>,
+    /// What the commands in `pending_commands` were in the review.
+    pending_meta: Vec<ReviewCommand>,
     /// Ids and commands waiting to run (or running) after the moves.
     pending_commands: Vec<(String, CommandSpec)>,
     cmd_outcomes: Vec<CommandOutcome>,
@@ -540,6 +586,8 @@ impl App {
             runner: Arc::new(SystemRunner),
             job: None,
             cmd_job: None,
+            cmd_ctl: None,
+            pending_meta: Vec::new(),
             pending_commands: Vec::new(),
             cmd_outcomes: Vec::new(),
             last_moves: (Usage::default(), Usage::default(), 0),
@@ -798,6 +846,31 @@ impl App {
                 Some(Dialog::Review(r)) => self.dialog = Some(Dialog::Irreversible(r)),
                 other => self.dialog = other,
             },
+            Action::ToggleForce => {
+                if let Some(Dialog::Review(r)) = &mut self.dialog {
+                    for c in r.commands.iter_mut().filter(|c| c.can_force) {
+                        c.force = !c.force;
+                        c.refresh_line();
+                    }
+                }
+            }
+            Action::RetryForced => {
+                // Run the lock-blocked commands again, forced. It goes
+                // through the review like anything else, so it needs a `y`.
+                if let Some(Dialog::Finish(f)) = &self.dialog
+                    && !f.retry.is_empty()
+                {
+                    let commands = f.retry.clone();
+                    self.review_scroll = 0;
+                    self.dialog = Some(Dialog::Review(Review {
+                        items: Vec::new(),
+                        commands,
+                        total: Usage::default(),
+                        space_ready: true,
+                        space: Space::default(),
+                    }));
+                }
+            }
             Action::ReviewHeld => {
                 if matches!(self.dialog, Some(Dialog::QuitWarning(_))) {
                     self.dialog = None;
@@ -911,10 +984,27 @@ impl App {
         self.review_scroll = next.clamp(0, max as i64) as usize;
     }
 
+    /// What the running tool command is doing, for the Working dialog.
+    pub fn command_status(&self) -> Option<CommandStatus> {
+        let ctl = self.cmd_ctl.as_ref()?;
+        Some(CommandStatus {
+            elapsed: ctl.elapsed(),
+            last_line: ctl.last_line(),
+            cancelling: ctl.cancelled(),
+        })
+    }
+
     /// Quitting while a delete is running would kill it half-way, so wait
     /// for it to finish first.
     fn request_quit(&mut self) {
-        if self.job.is_some() || self.cmd_job.is_some() {
+        if self.cmd_job.is_some() && self.job.is_none() {
+            // A tool command is stoppable: stop it, then quit.
+            if let Some(ctl) = &self.cmd_ctl {
+                ctl.cancel();
+            }
+            self.quit_after_job = true;
+            self.notice = Some("Stopping the command before quitting...".to_string());
+        } else if self.job.is_some() || self.cmd_job.is_some() {
             self.quit_after_job = true;
             self.notice = Some("Finishing the delete before quitting...".to_string());
         } else if matches!(self.dialog, Some(Dialog::QuitWarning(_))) || self.held.is_empty() {
@@ -975,8 +1065,15 @@ impl App {
     }
 
     fn cancel(&mut self) {
-        // A running delete cannot be cancelled.
+        // A move or a delete cannot be cancelled half-way; a running tool
+        // command can (it is stopped, and the ones after it are skipped).
         if let Some(Dialog::Deleting(p)) = self.dialog.take() {
+            if p.phase == Phase::Command
+                && let Some(ctl) = &self.cmd_ctl
+            {
+                ctl.cancel();
+                self.notice = Some("Cancelling the command...".to_string());
+            }
             self.dialog = Some(Dialog::Deleting(p));
         }
     }
@@ -1546,6 +1643,8 @@ impl App {
                         line: spec.display(),
                         spec: spec.clone(),
                         up_to: r.row.frees.unwrap_or(0),
+                        can_force: spec.can_force(),
+                        force: false,
                     })
                 }
                 _ => None,
@@ -1928,8 +2027,9 @@ impl App {
         self.pending_commands = review
             .commands
             .iter()
-            .map(|c| (c.id.clone(), c.spec.clone()))
+            .map(|c| (c.id.clone(), c.effective_spec()))
             .collect();
+        self.pending_meta = review.commands.clone();
         if items.is_empty() {
             self.start_commands();
             return;
@@ -2027,6 +2127,7 @@ impl App {
                 failures,
                 first_failure: reason,
                 commands: Vec::new(),
+                retry: Vec::new(),
                 started_tick: self.tick,
             }),
             DeleteMode::SoftOnly => {
@@ -2077,7 +2178,9 @@ impl App {
             phase: Phase::Command,
             current: PathBuf::new(),
         }));
-        self.cmd_job = Some(CommandJob::start(Arc::clone(&self.runner), specs));
+        let ctl = RunControl::new();
+        self.cmd_ctl = Some(Arc::clone(&ctl));
+        self.cmd_job = Some(CommandJob::start(Arc::clone(&self.runner), specs, ctl));
     }
 
     fn poll_commands(&mut self) {
@@ -2099,6 +2202,7 @@ impl App {
                 CommandEvent::Done {
                     line,
                     ok,
+                    cancelled,
                     output_tail,
                 } => {
                     let note = output_tail
@@ -2110,7 +2214,13 @@ impl App {
                         .chars()
                         .take(100)
                         .collect();
-                    self.cmd_outcomes.push(CommandOutcome { line, ok, note });
+                    self.cmd_outcomes.push(CommandOutcome {
+                        line,
+                        ok,
+                        cancelled,
+                        note,
+                        lock_wait: !ok && !cancelled && is_lock_wait(&output_tail),
+                    });
                     if let Some(Dialog::Deleting(p)) = &mut self.dialog {
                         p.done = self.cmd_outcomes.len();
                     }
@@ -2123,9 +2233,23 @@ impl App {
     /// Every command has run: forget their marks and show how it went.
     fn commands_done(&mut self) {
         self.cmd_job = None;
+        self.cmd_ctl = None;
         for (id, _) in std::mem::take(&mut self.pending_commands) {
             self.tool_marks.remove(&id);
         }
+        // Commands that failed only because a lock was held, and that have a
+        // force variant, can be offered again in their forced form.
+        let outcomes = std::mem::take(&mut self.cmd_outcomes);
+        let retry: Vec<ReviewCommand> = std::mem::take(&mut self.pending_meta)
+            .into_iter()
+            .zip(&outcomes)
+            .filter(|(meta, out)| meta.can_force && !meta.force && out.lock_wait)
+            .map(|(mut meta, _)| {
+                meta.force = true;
+                meta.refresh_line();
+                meta
+            })
+            .collect();
         self.marks_changed();
         self.refresh_free();
         self.refresh_held();
@@ -2139,7 +2263,8 @@ impl App {
             free_after: self.free_now,
             failures,
             first_failure: self.job_failure.take(),
-            commands: std::mem::take(&mut self.cmd_outcomes),
+            commands: outcomes,
+            retry,
             started_tick: self.tick,
         }));
         if self.quit_after_job {
@@ -4925,5 +5050,245 @@ mod tests {
         app.update(Action::Down);
         app.update(Action::Bottom);
         assert_eq!(scroll_of(app), 0);
+    }
+
+    // --- cancelling a running command, and forcing one --------------------
+
+    fn start_review(app: &mut App) {
+        app.update(Action::OpenReview);
+        app.update(Action::Confirm);
+    }
+
+    /// Tick until `done` holds (or fail after about five seconds).
+    fn tick_until(app: &mut App, what: &str, done: impl Fn(&App) -> bool) {
+        for _ in 0..1000 {
+            app.update(Action::Tick);
+            if done(app) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("never happened: {what}");
+    }
+
+    #[test]
+    fn escape_cancels_a_running_command_and_the_rest_is_skipped() {
+        let fake = Arc::new(FakeRunner::new(&[]).waiting_for_cancel());
+        let mut e = command_app(fake.clone());
+        for p in ["Library/Caches/Store", "Library/Caches/Other"] {
+            mark_target(&mut e.app, &e.home.join(p));
+        }
+        start_review(&mut e.app);
+        tick_until(&mut e.app, "the first command to start", |_| {
+            !fake.calls().is_empty()
+        });
+        assert!(matches!(
+            &e.app.dialog,
+            Some(Dialog::Deleting(p)) if p.phase == Phase::Command
+        ));
+        e.app.update(Action::Cancel);
+        settle(&mut e.app);
+        let f = finish_of(&e.app);
+        assert_eq!(f.commands.len(), 2);
+        assert!(
+            f.commands[0].cancelled && !f.commands[0].ok,
+            "{:?}",
+            f.commands[0]
+        );
+        assert!(
+            f.commands[1].cancelled,
+            "the second never started: {:?}",
+            f.commands[1]
+        );
+        assert_eq!(fake.calls().len(), 1);
+        assert!(e.app.tool_marks.is_empty());
+    }
+
+    #[test]
+    fn escape_does_nothing_while_folders_are_being_moved() {
+        let mut e = command_app(Arc::new(FakeRunner::new(&[])));
+        let progress = DeleteProgress {
+            done: 0,
+            total: 1,
+            usage: Usage::default(),
+            of: Usage::default(),
+            phase: Phase::Moving,
+            current: PathBuf::new(),
+        };
+        e.app.dialog = Some(Dialog::Deleting(progress));
+        e.app.update(Action::Cancel);
+        assert!(matches!(e.app.dialog, Some(Dialog::Deleting(_))));
+    }
+
+    #[test]
+    fn quitting_while_a_command_runs_cancels_it_and_exits() {
+        let fake = Arc::new(FakeRunner::new(&[]).waiting_for_cancel());
+        let mut e = command_app(fake.clone());
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        start_review(&mut e.app);
+        tick_until(&mut e.app, "the command to start", |_| {
+            !fake.calls().is_empty()
+        });
+        e.app.update(Action::Quit);
+        assert!(!e.app.should_quit, "it waits for the kill to finish");
+        tick_until(&mut e.app, "the app to quit", |a| a.should_quit);
+    }
+
+    #[test]
+    fn the_status_of_a_running_command_shows_its_output_and_elapsed_time() {
+        let line = "Cache is currently in-use, waiting for other uv processes to finish";
+        let fake = Arc::new(FakeRunner::new(&[]).printing(line).waiting_for_cancel());
+        let mut e = command_app(fake.clone());
+        assert!(e.app.command_status().is_none(), "nothing is running");
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        start_review(&mut e.app);
+        tick_until(&mut e.app, "the command to start", |_| {
+            !fake.calls().is_empty()
+        });
+        let st = e.app.command_status().expect("a command is running");
+        assert_eq!(st.last_line, line);
+        assert!(st.elapsed.is_some());
+        e.app.update(Action::Cancel);
+        settle(&mut e.app);
+        assert!(
+            e.app.command_status().is_none(),
+            "and nothing once it is over"
+        );
+    }
+
+    /// One tool command that has a `--force` variant, like `uv cache clean`.
+    fn uv_app(runner: Arc<FakeRunner>) -> crate::testutil::Env {
+        let mut e = command_app(runner);
+        e.app.tool_entries = vec![ToolEntry {
+            id: "uv".to_string(),
+            tool: "uv".to_string(),
+            label: "cache".to_string(),
+            path: e.home.join("Library/Caches/Store"),
+            regen: "again".to_string(),
+            mode: Mode::Command(
+                CommandSpec::new("/x/uv", &["cache", "clean"]).with_force_args(&["--force"]),
+            ),
+            note: None,
+        }];
+        e.app.rebuild_targets();
+        e.app.settle_targets();
+        e
+    }
+
+    #[test]
+    fn f_switches_a_forceable_command_to_its_forced_form_and_back() {
+        let mut e = uv_app(Arc::new(FakeRunner::new(&[])));
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        e.app.update(Action::OpenReview);
+        let c = &review_of(&e.app).commands[0];
+        assert!(c.can_force && !c.force);
+        assert_eq!(c.line, "uv cache clean");
+        e.app.update(Action::ToggleForce);
+        let c = &review_of(&e.app).commands[0];
+        assert!(c.force);
+        assert_eq!(c.line, "uv cache clean --force");
+        e.app.update(Action::ToggleForce);
+        assert_eq!(review_of(&e.app).commands[0].line, "uv cache clean");
+    }
+
+    #[test]
+    fn f_does_nothing_when_no_command_can_be_forced() {
+        let mut e = command_app(Arc::new(FakeRunner::new(&[])));
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        e.app.update(Action::OpenReview);
+        assert!(!review_of(&e.app).commands[0].can_force);
+        e.app.update(Action::ToggleForce);
+        assert!(!review_of(&e.app).commands[0].force);
+        assert_eq!(review_of(&e.app).commands[0].line, "store clean");
+    }
+
+    #[test]
+    fn the_command_runs_with_force_only_when_the_review_says_so() {
+        for forced in [false, true] {
+            let fake = Arc::new(FakeRunner::new(&[]));
+            let mut e = uv_app(fake.clone());
+            mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+            e.app.update(Action::OpenReview);
+            if forced {
+                e.app.update(Action::ToggleForce);
+            }
+            e.app.update(Action::Confirm);
+            settle(&mut e.app);
+            let args = fake.calls()[0].args.clone();
+            assert_eq!(args.contains(&"--force".to_string()), forced, "{args:?}");
+        }
+    }
+
+    const LOCK_TIMEOUT: &str = "error: Timeout (300s) when waiting for lock on `/Users/x/.cache/uv` at `/Users/x/.cache/uv/.lock`, is another uv process running? You can set `UV_LOCK_TIMEOUT` to increase the timeout.";
+
+    #[test]
+    fn a_lock_timeout_offers_a_forced_retry_that_goes_through_the_review() {
+        let fake = Arc::new(FakeRunner::new(&[]).failing_with(&[("uv cache clean", LOCK_TIMEOUT)]));
+        let mut e = uv_app(fake.clone());
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        start_review(&mut e.app);
+        settle(&mut e.app);
+        let f = finish_of(&e.app);
+        assert!(!f.commands[0].ok && !f.commands[0].cancelled);
+        assert!(
+            f.commands[0].note.contains("Timeout"),
+            "{:?}",
+            f.commands[0]
+        );
+        assert_eq!(f.retry.len(), 1, "a forced retry is offered");
+
+        e.app.update(Action::RetryForced);
+        let r = review_of(&e.app);
+        assert!(r.items.is_empty());
+        assert_eq!(r.commands.len(), 1);
+        assert!(r.commands[0].force);
+        assert_eq!(r.commands[0].line, "uv cache clean --force");
+        assert_eq!(
+            fake.calls().len(),
+            1,
+            "nothing runs before the confirmation"
+        );
+
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].args.contains(&"--force".to_string()));
+    }
+
+    #[test]
+    fn other_failures_and_cancels_offer_no_forced_retry() {
+        // An ordinary failure.
+        let fake = Arc::new(FakeRunner::new(&[]).failing(&["uv cache clean"]));
+        let mut e = uv_app(fake);
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        start_review(&mut e.app);
+        settle(&mut e.app);
+        assert!(finish_of(&e.app).retry.is_empty());
+        e.app.update(Action::RetryForced);
+        assert!(
+            matches!(e.app.dialog, Some(Dialog::Finish(_))),
+            "nothing to retry"
+        );
+
+        // A cancel.
+        let fake = Arc::new(FakeRunner::new(&[]).waiting_for_cancel());
+        let mut e = uv_app(fake.clone());
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        start_review(&mut e.app);
+        tick_until(&mut e.app, "start", |_| !fake.calls().is_empty());
+        e.app.update(Action::Cancel);
+        settle(&mut e.app);
+        assert!(finish_of(&e.app).retry.is_empty());
+    }
+
+    #[test]
+    fn a_command_without_a_force_variant_never_gets_one_on_retry() {
+        let fake = Arc::new(FakeRunner::new(&[]).failing_with(&[("store clean", LOCK_TIMEOUT)]));
+        let mut e = command_app(fake);
+        mark_target(&mut e.app, &e.home.join("Library/Caches/Store"));
+        start_review(&mut e.app);
+        settle(&mut e.app);
+        assert!(finish_of(&e.app).retry.is_empty());
     }
 }

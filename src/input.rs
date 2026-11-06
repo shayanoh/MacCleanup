@@ -125,6 +125,9 @@ fn dialog_key(code: KeyCode, dialog: &Dialog) -> Option<Action> {
         // Tool commands cannot be undone: only an explicit `y` runs them.
         Dialog::Review(r) if !r.commands.is_empty() => match code {
             code if review_scroll_key(code).is_some() => review_scroll_key(code),
+            KeyCode::Char('f') if r.commands.iter().any(|c| c.can_force) => {
+                Some(Action::ToggleForce)
+            }
             KeyCode::Char('y') => Some(Action::Confirm),
             KeyCode::Char('x') if !r.items.is_empty() => Some(Action::ConfirmIrreversible),
             KeyCode::Esc | KeyCode::Char('n') => Some(Action::Cancel),
@@ -143,7 +146,17 @@ fn dialog_key(code: KeyCode, dialog: &Dialog) -> Option<Action> {
             KeyCode::Esc | KeyCode::Char('n') => Some(Action::Cancel),
             _ => None,
         },
+        // A running tool command can be stopped; a move or a delete cannot.
+        Dialog::Deleting(p) if p.phase == crate::jobs::Phase::Command => match code {
+            KeyCode::Esc => Some(Action::Cancel),
+            KeyCode::Char('q') => Some(Action::Quit),
+            _ => None,
+        },
         Dialog::Deleting(_) => None,
+        // After a lock failure, `f` offers the forced form (through the review).
+        Dialog::Finish(f) if !f.retry.is_empty() && code == KeyCode::Char('f') => {
+            Some(Action::RetryForced)
+        }
         Dialog::Finish(_) | Dialog::Notice(_) => match code {
             KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => Some(Action::Cancel),
             _ => None,
@@ -568,6 +581,8 @@ mod tests {
                     line: "tool clean".to_string(),
                     spec: CommandSpec::new("tool", &["clean"]),
                     up_to: 0,
+                    can_force: false,
+                    force: false,
                 })
                 .collect(),
             total: Usage::default(),
@@ -735,6 +750,84 @@ mod tests {
         assert_eq!(
             map_mouse(mouse(MouseEventKind::ScrollDown, 5, 7), &e.app),
             None
+        );
+    }
+
+    fn progress(phase: crate::jobs::Phase) -> crate::app::DeleteProgress {
+        crate::app::DeleteProgress {
+            done: 0,
+            total: 1,
+            usage: crate::usage::Usage::default(),
+            of: crate::usage::Usage::default(),
+            phase,
+            current: std::path::PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn a_running_command_can_be_cancelled_but_a_move_cannot() {
+        use crate::jobs::Phase;
+        let running = Dialog::Deleting(progress(Phase::Command));
+        assert_eq!(dialog_key(KeyCode::Esc, &running), Some(Action::Cancel));
+        assert_eq!(dialog_key(KeyCode::Char('q'), &running), Some(Action::Quit));
+        let moving = Dialog::Deleting(progress(Phase::Moving));
+        assert_eq!(dialog_key(KeyCode::Esc, &moving), None);
+        assert_eq!(dialog_key(KeyCode::Char('q'), &moving), None);
+        // Ctrl-C always quits (which cancels a running command).
+        let e = env(FILES);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(ctrl_c, &e.app), Some(Action::Quit));
+    }
+
+    #[test]
+    fn f_toggles_force_in_a_review_only_when_a_command_can_be_forced() {
+        use crate::app::Dialog;
+        let Dialog::Review(mut r) = review_with(1, 1) else {
+            panic!()
+        };
+        assert_eq!(
+            dialog_key(KeyCode::Char('f'), &Dialog::Review(r.clone())),
+            None
+        );
+        r.commands[0].can_force = true;
+        assert_eq!(
+            dialog_key(KeyCode::Char('f'), &Dialog::Review(r.clone())),
+            Some(Action::ToggleForce)
+        );
+        r.commands.clear();
+        assert_eq!(dialog_key(KeyCode::Char('f'), &Dialog::Review(r)), None);
+    }
+
+    #[test]
+    fn f_on_the_result_screen_retries_with_force_only_when_offered() {
+        use crate::app::{Dialog, FinishInfo};
+        let mut f = FinishInfo {
+            moved: Default::default(),
+            emptied: Default::default(),
+            free_before: 0,
+            free_after: 0,
+            failures: 0,
+            first_failure: None,
+            commands: Vec::new(),
+            retry: Vec::new(),
+            started_tick: 0,
+        };
+        assert_eq!(
+            dialog_key(KeyCode::Char('f'), &Dialog::Finish(f.clone())),
+            None
+        );
+        let Dialog::Review(r) = review_with(0, 1) else {
+            panic!()
+        };
+        f.retry = r.commands;
+        assert_eq!(
+            dialog_key(KeyCode::Char('f'), &Dialog::Finish(f.clone())),
+            Some(Action::RetryForced)
+        );
+        // The ordinary ways out still work.
+        assert_eq!(
+            dialog_key(KeyCode::Enter, &Dialog::Finish(f)),
+            Some(Action::Cancel)
         );
     }
 }

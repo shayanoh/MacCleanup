@@ -23,9 +23,14 @@ struct Env {
 struct NoTools;
 
 impl maccleanup::catalog::CommandRunner for NoTools {
-    fn run(&self, _: &maccleanup::catalog::CommandSpec) -> maccleanup::catalog::CommandResult {
+    fn run(
+        &self,
+        _: &maccleanup::catalog::CommandSpec,
+        _: &maccleanup::catalog::RunControl,
+    ) -> maccleanup::catalog::CommandResult {
         maccleanup::catalog::CommandResult {
             ok: true,
+            cancelled: false,
             output_tail: String::new(),
         }
     }
@@ -2091,4 +2096,202 @@ fn the_scroll_hint_is_ascii_in_ascii_mode() {
     for c in render_cells(&mut e.app, 100, 30) {
         assert!(c.is_ascii(), "non-ascii cell {c:?}");
     }
+}
+
+// --- a stuck or failing tool command ------------------------------------------
+
+const UV_WAIT: &str = "Cache is currently in-use, waiting for other uv processes to finish (use `--force` to override)";
+const UV_TIMEOUT: &str = "error: Timeout (300s) when waiting for lock on `/Users/x/.cache/uv` at `/Users/x/.cache/uv/.lock`, is another uv process running?";
+
+/// A command that prints a line and then waits (until cancelled), or fails.
+struct StuckRunner {
+    fail_with: Option<&'static str>,
+}
+
+impl maccleanup::catalog::CommandRunner for StuckRunner {
+    fn run(
+        &self,
+        _: &maccleanup::catalog::CommandSpec,
+        ctl: &maccleanup::catalog::RunControl,
+    ) -> maccleanup::catalog::CommandResult {
+        ctl.begin();
+        if let Some(out) = self.fail_with {
+            return maccleanup::catalog::CommandResult {
+                ok: false,
+                cancelled: false,
+                output_tail: out.to_string(),
+            };
+        }
+        ctl.set_line(UV_WAIT);
+        while !ctl.cancelled() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        maccleanup::catalog::CommandResult {
+            ok: false,
+            cancelled: true,
+            output_tail: "(cancelled)".to_string(),
+        }
+    }
+    fn query(&self, _: &maccleanup::catalog::CommandSpec) -> Option<String> {
+        None
+    }
+    fn available(&self, _: &str) -> bool {
+        false
+    }
+}
+
+fn uv_screen(mode: GlyphMode, fail_with: Option<&'static str>) -> Env {
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    let mut e = make_app(TARGET_FILES, mode);
+    e.app.runner = std::sync::Arc::new(StuckRunner { fail_with });
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    let home = e.app.policy.home().to_path_buf();
+    e.app.tool_entries = vec![ToolEntry {
+        id: "uv".to_string(),
+        tool: "uv".to_string(),
+        label: "cache".to_string(),
+        path: home.join("Library/Caches/Spotify"),
+        regen: "again".to_string(),
+        mode: Mode::Command(
+            CommandSpec::new("/opt/x/bin/uv", &["cache", "clean"]).with_force_args(&["--force"]),
+        ),
+        note: None,
+    }];
+    e.app.rebuild_targets();
+    e.app.settle_targets();
+    cursor_on_row(&mut e.app, "cache");
+    e.app.update(Action::ToggleMark);
+    e
+}
+
+fn tick_until_command_running(app: &mut App) {
+    for _ in 0..1000 {
+        app.update(Action::Tick);
+        if app
+            .command_status()
+            .is_some_and(|s| !s.last_line.is_empty())
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the command never started");
+}
+
+#[test]
+fn the_working_dialog_shows_the_commands_output_how_long_it_runs_and_how_to_stop_it() {
+    let mut e = uv_screen(GlyphMode::Nerd, None);
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    tick_until_command_running(&mut e.app);
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("uv cache clean"), "{text}");
+    assert!(text.contains("running for"), "{text}");
+    assert!(
+        text.contains("waiting for other uv processes"),
+        "uv's own message is shown:\n{text}"
+    );
+    assert!(text.contains("Esc"), "{text}");
+    assert!(text.contains("cancel"), "{text}");
+    assert!(
+        text.contains("Another uv process"),
+        "an explanation for the lock wait:\n{text}"
+    );
+    e.app.update(Action::Cancel);
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("Cancelling"), "{text}");
+}
+
+#[test]
+fn the_review_offers_force_for_uv_and_shows_the_forced_form_clearly() {
+    let mut e = uv_screen(GlyphMode::Nerd, None);
+    open_review(&mut e.app);
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("uv cache clean"), "{text}");
+    assert!(!text.contains("--force"), "not forced yet:\n{text}");
+    assert!(text.contains("[ f ]"), "{text}");
+    e.app.update(Action::ToggleForce);
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("uv cache clean --force"), "{text}");
+    assert!(text.contains("in-use check"), "the risk is stated:\n{text}");
+}
+
+#[test]
+fn a_command_that_cannot_be_forced_shows_no_force_key() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let home = e.app.policy.home().to_path_buf();
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    e.app.tool_entries = vec![ToolEntry {
+        id: "t".to_string(),
+        tool: "Tool".to_string(),
+        label: "cache".to_string(),
+        path: home.join("Library/Caches/Spotify"),
+        regen: "again".to_string(),
+        mode: Mode::Command(CommandSpec::new("/opt/x/bin/tool", &["clean"])),
+        note: None,
+    }];
+    e.app.rebuild_targets();
+    e.app.settle_targets();
+    cursor_on_row(&mut e.app, "cache");
+    e.app.update(Action::ToggleMark);
+    open_review(&mut e.app);
+    let text = render(&mut e.app, 150, 40);
+    assert!(!text.contains("[ f ]"), "{text}");
+}
+
+#[test]
+fn a_lock_timeout_explains_itself_and_offers_the_forced_retry() {
+    let mut e = uv_screen(GlyphMode::Nerd, Some(UV_TIMEOUT));
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..1000 {
+        e.app.update(Action::Tick);
+        if matches!(e.app.dialog, Some(Dialog::Finish(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("Timeout"), "what uv said:\n{text}");
+    assert!(text.contains("Another uv process"), "{text}");
+    assert!(text.contains("[ f ]") && text.contains("--force"), "{text}");
+}
+
+#[test]
+fn a_cancelled_command_is_reported_as_cancelled() {
+    let mut e = uv_screen(GlyphMode::Nerd, None);
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    tick_until_command_running(&mut e.app);
+    e.app.update(Action::Cancel);
+    for _ in 0..1000 {
+        e.app.update(Action::Tick);
+        if matches!(e.app.dialog, Some(Dialog::Finish(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("cancelled"), "{text}");
+    assert!(
+        !text.contains("[ f ]"),
+        "no forced retry after a cancel:\n{text}"
+    );
+}
+
+#[test]
+fn the_command_dialogs_are_ascii_in_ascii_mode() {
+    let mut e = uv_screen(GlyphMode::Ascii, None);
+    open_review(&mut e.app);
+    e.app.update(Action::ToggleForce);
+    for c in render_cells(&mut e.app, 150, 40) {
+        assert!(c.is_ascii(), "review: non-ascii cell {c:?}");
+    }
+    e.app.update(Action::Confirm);
+    tick_until_command_running(&mut e.app);
+    for c in render_cells(&mut e.app, 150, 40) {
+        assert!(c.is_ascii(), "working: non-ascii cell {c:?}");
+    }
+    e.app.update(Action::Cancel);
 }

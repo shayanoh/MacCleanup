@@ -55,9 +55,16 @@ struct Fixed {
     label: &'static str,
     rel: &'static str,
     regen: &'static str,
-    /// Programs to try in order, and the arguments for the clean command.
-    command: Option<(&'static [&'static str], &'static [&'static str])>,
+    /// Programs to try in order, the arguments for the clean command, and
+    /// the arguments that force it (empty when it has no such variant).
+    command: Option<Command>,
 }
+
+type Command = (
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+);
 
 const FIXED: &[Fixed] = &[
     Fixed {
@@ -74,7 +81,7 @@ const FIXED: &[Fixed] = &[
         label: "cache",
         rel: "Library/Caches/Yarn",
         regen: "downloaded again when needed",
-        command: Some((&["yarn"], &["cache", "clean"])),
+        command: Some((&["yarn"], &["cache", "clean"], &[])),
     },
     Fixed {
         id: "go-build",
@@ -82,7 +89,7 @@ const FIXED: &[Fixed] = &[
         label: "build cache",
         rel: "Library/Caches/go-build",
         regen: "rebuilt when needed",
-        command: Some((&["go"], &["clean", "-cache"])),
+        command: Some((&["go"], &["clean", "-cache"], &[])),
     },
     Fixed {
         id: "go-mod",
@@ -90,7 +97,7 @@ const FIXED: &[Fixed] = &[
         label: "module cache",
         rel: "go/pkg/mod",
         regen: "downloaded again when needed",
-        command: Some((&["go"], &["clean", "-modcache"])),
+        command: Some((&["go"], &["clean", "-modcache"], &[])),
     },
     Fixed {
         id: "uv",
@@ -98,7 +105,9 @@ const FIXED: &[Fixed] = &[
         label: "cache",
         rel: ".cache/uv",
         regen: "downloaded again when needed",
-        command: Some((&["uv"], &["cache", "clean"])),
+        // uv waits (up to 5 minutes) while another uv process, for example
+        // a `uv run` server, holds its cache; `--force` skips that check.
+        command: Some((&["uv"], &["cache", "clean"], &["--force"])),
     },
     Fixed {
         id: "pip",
@@ -106,7 +115,7 @@ const FIXED: &[Fixed] = &[
         label: "cache",
         rel: "Library/Caches/pip",
         regen: "downloaded again when needed",
-        command: Some((&["pip", "pip3"], &["cache", "purge"])),
+        command: Some((&["pip", "pip3"], &["cache", "purge"], &[])),
     },
     Fixed {
         id: "brew",
@@ -114,7 +123,7 @@ const FIXED: &[Fixed] = &[
         label: "downloads cache",
         rel: "Library/Caches/Homebrew",
         regen: "downloaded again when needed",
-        command: Some((&["brew"], &["cleanup", "--prune=all"])),
+        command: Some((&["brew"], &["cleanup", "--prune=all"], &[])),
     },
     Fixed {
         id: "pub",
@@ -202,11 +211,11 @@ pub(crate) fn discover_with(
         }
         let mode = f
             .command
-            .and_then(|(programs, args)| {
+            .and_then(|(programs, args, force)| {
                 programs
                     .iter()
                     .find_map(|p| find(p).into_iter().next())
-                    .map(|exe| Mode::Command(pinned(home, &exe, args)))
+                    .map(|exe| Mode::Command(pinned(home, &exe, args).with_force_args(force)))
             })
             .unwrap_or(Mode::Folder);
         out.push(ToolEntry {
@@ -487,6 +496,31 @@ mod tests {
             other => panic!("expected a command, got {other:?}"),
         }
         assert!(matches!(by_id(&entries, "yarn").mode, Mode::Folder));
+    }
+
+    #[test]
+    fn only_uv_cache_clean_offers_a_force_variant() {
+        let h = home();
+        dir(&h.home.join(".cache/uv"));
+        dir(&h.home.join("Library/Caches/go-build"));
+        let uv = h.home.join("tools/uv");
+        let go = h.home.join("tools/go");
+        exe(&uv);
+        exe(&go);
+        let path = std::env::join_paths([uv.parent().unwrap()]).unwrap();
+        let entries = discover_with(
+            &h.home,
+            &FakeRunner::new(&[]),
+            &Places::only(&path),
+            &Work::new(),
+        );
+        let spec = |id: &str| match &by_id(&entries, id).mode {
+            Mode::Command(s) => s.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(spec("uv").can_force());
+        assert_eq!(spec("uv").forced().display(), "uv cache clean --force");
+        assert!(!spec("go-build").can_force());
     }
 
     #[test]
