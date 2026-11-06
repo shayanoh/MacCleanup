@@ -79,6 +79,29 @@ pub fn both(size: u64, disk: u64) -> String {
     format!("{} ({} on disk)", human_size(size), human_size(disk))
 }
 
+/// Seconds since the Unix epoch, now.
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// How long before `now` a time was: "today", "3d ago", "5w ago", "3mo ago",
+/// "2y ago"; "-" when the time is unknown (0). A time in the future is "today".
+pub fn ago(now: i64, then: i64) -> String {
+    if then <= 0 {
+        return "-".to_string();
+    }
+    let days = (now - then).max(0) / 86_400;
+    match days {
+        0 => "today".to_string(),
+        1..=13 => format!("{days}d ago"),
+        14..=59 => format!("{}w ago", days / 7),
+        60..=729 => format!("{}mo ago", days / 30),
+        _ => format!("{}y ago", days / 365),
+    }
+}
+
 pub fn both_usage(u: Usage) -> String {
     both(u.size, u.disk)
 }
@@ -163,5 +186,22 @@ mod tests {
     fn both_shows_size_and_on_disk() {
         assert_eq!(both(1500, 4096), "1.5 KB (4.1 KB on disk)");
         assert_eq!(both(0, 0), "0 B (0 B on disk)");
+    }
+
+    #[test]
+    fn ago_buckets() {
+        let now = 1_800_000_000;
+        let day = 86_400;
+        assert_eq!(ago(now, 0), "-");
+        assert_eq!(ago(now, now - 3600), "today");
+        assert_eq!(
+            ago(now, now + 500),
+            "today",
+            "a future time is not negative"
+        );
+        assert_eq!(ago(now, now - 3 * day), "3d ago");
+        assert_eq!(ago(now, now - 40 * day), "5w ago");
+        assert_eq!(ago(now, now - 100 * day), "3mo ago");
+        assert_eq!(ago(now, now - 800 * day), "2y ago");
     }
 }

@@ -50,6 +50,8 @@ pub enum SortBy {
     Frees,
     /// Logical size.
     Size,
+    /// Newest modification time inside (most recent first).
+    Modified,
     Name,
 }
 
@@ -500,6 +502,11 @@ pub fn cmp_rows(by: SortBy, a: &Row, b: &Row) -> std::cmp::Ordering {
             .cmp(&a.frees.unwrap_or(0))
             .then_with(|| b.disk.cmp(&a.disk))
             .then_with(|| a.name.cmp(&b.name)),
+        SortBy::Modified => b
+            .mtime
+            .cmp(&a.mtime)
+            .then_with(|| b.disk.cmp(&a.disk))
+            .then_with(|| a.name.cmp(&b.name)),
         SortBy::Size => b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)),
         SortBy::Name => a
             .name
@@ -640,7 +647,7 @@ impl App {
         match self.sort {
             SortBy::Size => row.size,
             SortBy::Frees if self.frees_total() > 0 => row.frees.unwrap_or(0),
-            SortBy::Frees | SortBy::Disk | SortBy::Name => row.disk,
+            SortBy::Frees | SortBy::Disk | SortBy::Name | SortBy::Modified => row.disk,
         }
     }
 
@@ -654,7 +661,7 @@ impl App {
         match self.sort {
             SortBy::Size => self.current().size(),
             SortBy::Frees if self.frees_total() > 0 => self.frees_total(),
-            SortBy::Frees | SortBy::Disk | SortBy::Name => self
+            SortBy::Frees | SortBy::Disk | SortBy::Name | SortBy::Modified => self
                 .current_space
                 .map_or_else(|| self.current().disk(), |s| s.footprint),
         }
@@ -945,11 +952,13 @@ impl App {
             Action::ShrinkGraph => self.graph_pct = self.graph_pct.saturating_sub(5).max(20),
             Action::CycleSort => {
                 self.sort = match self.sort {
-                    // Same order as the column headers: Name, Size, On disk, Frees.
+                    // Same order as the column headers: Name, Size, On disk,
+                    // Frees, Modified.
                     SortBy::Name => SortBy::Size,
                     SortBy::Size => SortBy::Disk,
                     SortBy::Disk => SortBy::Frees,
-                    SortBy::Frees => SortBy::Name,
+                    SortBy::Frees => SortBy::Modified,
+                    SortBy::Modified => SortBy::Name,
                 };
                 if self.screen == Screen::Targets {
                     // Only the order changes: no need to build the list again.
@@ -2751,7 +2760,7 @@ mod tests {
 
     #[test]
     fn sort_cycles_in_the_order_of_the_column_headers() {
-        // Header order is Name, Size, On disk, Frees; `s` walks it left to right.
+        // Header order is Name, Size, On disk, Frees, Modified; `s` walks it left to right.
         let mut e = sort_env();
         let app = &mut e.app;
         assert_eq!(app.sort, SortBy::Disk, "on disk is the default");
@@ -2759,6 +2768,8 @@ mod tests {
         assert_eq!(app.sort, SortBy::Frees);
         // Plain files free what they occupy, so this order matches on-disk.
         assert_eq!(names(app), ["real.bin", "a.bin", "sparse.bin"]);
+        app.update(Action::CycleSort);
+        assert_eq!(app.sort, SortBy::Modified);
         app.update(Action::CycleSort);
         assert_eq!(app.sort, SortBy::Name);
         assert_eq!(names(app), ["a.bin", "real.bin", "sparse.bin"]);
@@ -2792,6 +2803,7 @@ mod tests {
         assert!(sparse.size > sparse.disk);
         assert_eq!(app.weight(&sparse), sparse.disk);
         app.update(Action::CycleSort); // by what it frees
+        app.update(Action::CycleSort); // by modified
         app.update(Action::CycleSort); // by name
         app.update(Action::CycleSort); // by size
         assert_eq!(app.sort, SortBy::Size);
@@ -3943,6 +3955,7 @@ mod tests {
         assert_eq!(sp.footprint, 8192 + 12288);
         assert_eq!(app.weight_total(), 8192 + 12288);
         app.update(Action::CycleSort); // by what frees
+        app.update(Action::CycleSort); // by modified
         app.update(Action::CycleSort); // by name
         app.update(Action::CycleSort); // by size: the logical total
         assert_eq!(app.sort, SortBy::Size);
@@ -4248,14 +4261,21 @@ mod tests {
         let app = &mut e.app;
         assert_eq!(app.sort, SortBy::Disk);
         let mut seen = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.update(Action::CycleSort);
             seen.push(app.sort);
         }
         assert_eq!(
             seen,
-            [SortBy::Frees, SortBy::Name, SortBy::Size, SortBy::Disk]
+            [
+                SortBy::Frees,
+                SortBy::Modified,
+                SortBy::Name,
+                SortBy::Size,
+                SortBy::Disk
+            ]
         );
+        app.update(Action::CycleSort);
         app.update(Action::CycleSort);
         app.update(Action::CycleSort);
         assert_eq!(app.sort, SortBy::Name);

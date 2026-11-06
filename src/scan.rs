@@ -181,6 +181,8 @@ struct Tally {
     private: u64,
     /// Bytes of unshared files that only a local snapshot keeps alive.
     snap: u64,
+    /// Newest modification time (Unix seconds) among these files.
+    mtime: i64,
 }
 
 /// A scanned directory. Totals cover its whole subtree and grow live while
@@ -196,6 +198,9 @@ pub struct Node {
     files: AtomicU64,
     private: AtomicU64,
     snap: AtomicU64,
+    /// Newest modification time (Unix seconds) of any file in the subtree.
+    /// Only grows: a rescan after deletions can leave it a little high.
+    mtime: AtomicI64,
     /// 1 for this directory's own listing plus one per unfinished child.
     pending: AtomicUsize,
     done: AtomicBool,
@@ -216,6 +221,7 @@ impl Node {
             files: AtomicU64::new(0),
             private: AtomicU64::new(0),
             snap: AtomicU64::new(0),
+            mtime: AtomicI64::new(0),
             pending: AtomicUsize::new(1),
             done: AtomicBool::new(false),
             started: AtomicBool::new(false),
@@ -248,6 +254,12 @@ impl Node {
         self.snap.load(Ordering::Relaxed)
     }
 
+    /// Newest modification time (Unix seconds) of any file in the subtree,
+    /// 0 when it has none.
+    pub fn mtime(&self) -> i64 {
+        self.mtime.load(Ordering::Relaxed)
+    }
+
     /// True once a worker has begun listing this folder.
     pub fn is_started(&self) -> bool {
         self.started.load(Ordering::Acquire)
@@ -274,6 +286,7 @@ impl Node {
             files: self.files(),
             private: self.private(),
             snap: self.snapshot_held(),
+            mtime: self.mtime(),
         }
     }
 }
@@ -287,6 +300,7 @@ fn add_up(node: &Arc<Node>, t: &Tally) {
         n.files.fetch_add(t.files, Ordering::Relaxed);
         n.private.fetch_add(t.private, Ordering::Relaxed);
         n.snap.fetch_add(t.snap, Ordering::Relaxed);
+        n.mtime.fetch_max(t.mtime, Ordering::Relaxed);
         cur = n.parent.upgrade();
     }
 }
@@ -397,6 +411,9 @@ pub struct Row {
     pub space: Option<Space>,
     /// What deleting this entry frees right now. `None` while a scan runs.
     pub frees: Option<u64>,
+    /// Newest modification time (Unix seconds) of the file, or of anything
+    /// inside the folder; 0 when unknown.
+    pub mtime: i64,
 }
 
 impl Row {
@@ -418,6 +435,7 @@ impl Row {
                 },
                 files: n.files(),
                 scanning: !n.is_done(),
+                mtime: n.mtime(),
                 // `frees` is kept as it was (`..self.clone()`).
                 ..self.clone()
             },
@@ -656,6 +674,7 @@ impl Scanner {
                         node: Some(Arc::clone(n)),
                         space: None,
                         frees: None,
+                        mtime: n.mtime(),
                     }),
                     None => rows.push(Row {
                         name,
@@ -669,6 +688,7 @@ impl Scanner {
                         node: None,
                         space: None,
                         frees: None,
+                        mtime: md.mtime(),
                     }),
                 }
             } else {
@@ -683,6 +703,7 @@ impl Scanner {
                     node: None,
                     space: None,
                     frees: None,
+                    mtime: md.mtime(),
                 });
             }
         }
@@ -1226,6 +1247,7 @@ fn scan_dir(shared: &Arc<Shared>, node: &Arc<Node>) {
             tally.files += 1;
             tally.private += private;
             tally.snap += snap;
+            tally.mtime = tally.mtime.max(md.mtime());
             if tally.files >= FLUSH_EVERY {
                 flush(&mut tally);
             }
@@ -1254,6 +1276,41 @@ mod tests {
         let node = scanner.scan_root(root);
         assert!(scanner.wait_idle(WAIT), "scan did not finish");
         (scanner, node)
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn folder_mtime_is_the_newest_file_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/old.txt"), 10);
+        write(&r.join("a/deep/new.txt"), 10);
+        write(&r.join("b/other.txt"), 10);
+        set_mtime(&r.join("a/old.txt"), 1_000_000);
+        set_mtime(&r.join("a/deep/new.txt"), 3_000_000);
+        set_mtime(&r.join("b/other.txt"), 2_000_000);
+        let (s, root) = scan(r, 2);
+        assert_eq!(root.mtime(), 3_000_000);
+        let rows = s.list_children(&root);
+        let by_name = |n: &str| rows.iter().find(|x| x.name == n).unwrap().mtime;
+        assert_eq!(
+            by_name("a"),
+            3_000_000,
+            "a folder row carries its newest file"
+        );
+        assert_eq!(by_name("b"), 2_000_000);
+        let sub = s.list_children(&root.subdir(&r.join("a")).unwrap());
+        let old = sub.iter().find(|x| x.name == "old.txt").unwrap();
+        assert_eq!(old.mtime, 1_000_000, "a file row carries its own time");
     }
 
     #[test]
@@ -2232,6 +2289,7 @@ mod tests {
             node: None,
             space: None,
             frees: None,
+            mtime: 0,
         };
         assert!(row(true, true).queued(), "undiscovered folder waits");
         assert!(!row(true, false).queued());

@@ -214,9 +214,9 @@ pub(super) fn cols(inner_width: u16, g: &Glyphs) -> Cols {
     let mark_w = text_width(g.marked()).max(text_width(g.unmarked()));
     let dot_w = text_width(g.safe());
     let prefix_w = 2 + mark_w + 1 + icon_w + 1 + dot_w + 1;
-    // Size, on disk, frees: three 9-wide columns; the share bar goes first
-    // when the pane is narrow.
-    let fixed_no_share = prefix_w + 3 * (1 + 9);
+    // Size, on disk, frees, modified: four 9-wide columns; the share bar goes
+    // first when the pane is narrow.
+    let fixed_no_share = prefix_w + 4 * (1 + 9);
     let cw = inner_width.saturating_sub(1) as usize; // last column: scrollbar
     let show_share = cw >= fixed_no_share + 9 + 16;
     let fixed = fixed_no_share + if show_share { 9 } else { 0 };
@@ -273,6 +273,11 @@ pub(super) fn header_line(sort: SortBy, c: &Cols, g: &Glyphs) -> Line<'static> {
             right(&format!("Frees{}", arrow(SortBy::Frees)), 9),
             head_style(SortBy::Frees),
         ),
+        Span::raw(" "),
+        Span::styled(
+            right(&format!("Modified{}", arrow(SortBy::Modified)), 9),
+            head_style(SortBy::Modified),
+        ),
     ];
     if c.show_share {
         header.push(Span::styled(" Share", Style::default().fg(DIM)));
@@ -280,7 +285,7 @@ pub(super) fn header_line(sort: SortBy, c: &Cols, g: &Glyphs) -> Line<'static> {
     Line::from(header)
 }
 
-/// The Size, On disk and Frees cells of a row. `frees_text` replaces the
+/// The Size, On disk, Frees and Modified cells of a row. `frees_text` replaces the
 /// Frees value (for example "up to 6 GB" on a tool command).
 pub(super) fn number_spans(
     r: &Row,
@@ -311,6 +316,17 @@ pub(super) fn number_spans(
                 }
             ),
             value_style(sort == SortBy::Frees),
+        ),
+        Span::styled(
+            format!(
+                " {}",
+                if queued {
+                    unknown.clone()
+                } else {
+                    right(&crate::fmt::ago(crate::fmt::now_secs(), r.mtime), 9)
+                }
+            ),
+            value_style(sort == SortBy::Modified),
         ),
     ]
 }
