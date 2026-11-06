@@ -6,6 +6,9 @@ pub mod analysis;
 pub mod api;
 pub mod cli;
 pub mod model;
+#[cfg(test)]
+pub(crate) mod testdata;
+pub mod view;
 pub mod vmtools;
 
 pub use model::*;
