@@ -26,7 +26,7 @@ use crate::safety::Safety;
 
 pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 14;
-pub const SIDEBAR_WIDTH: u16 = 22;
+pub const SIDEBAR_WIDTH: u16 = 23;
 
 pub const ACCENT: Color = Color::Cyan;
 pub const DIM: Color = Color::DarkGray;
@@ -289,7 +289,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         &[
             "j/k choose",
             "enter open",
-            "1/2/3/4 jump",
+            "1-7 open page",
             "tab focus list",
             "q quit",
         ]

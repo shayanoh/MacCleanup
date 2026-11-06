@@ -192,7 +192,7 @@ fn explorer_lists_rows_with_sizes() {
 fn marked_footer_text() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "big");
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 130, 30);
     assert!(text.contains("marked: 1 items"), "{text}");
     assert!(text.contains("not deleted yet"), "{text}");
 }
@@ -1600,7 +1600,8 @@ fn tools_still_being_looked_up_are_said_so() {
     e.app.update(Action::GoTo(Screen::Targets));
     assert!(e.app.tools_looking());
     let text = render(&mut e.app, 140, 36);
-    assert!(text.contains("looking for installed tools"), "{text}");
+    // The phase moves quickly; the label and a bar are always there.
+    assert!(text.contains("tools:"), "{text}");
 }
 
 #[test]
@@ -1720,4 +1721,50 @@ fn y_is_refused_while_a_marked_command_is_hidden_by_a_short_terminal() {
         "{:?}",
         e.app.dialog
     );
+}
+
+#[test]
+fn work_in_progress_shows_what_it_is_doing_with_a_bar() {
+    let mut e = make_app(TARGET_FILES, GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Targets));
+    assert!(e.app.targets_building() && e.app.tools_looking());
+    let text = render(&mut e.app, 190, 40);
+    // The list build has three known stages; the tool lookup has a moving bar.
+    assert!(text.contains("list:") && text.contains("/3"), "{text}");
+    assert!(text.contains("tools:"), "{text}");
+    let status = text.lines().find(|l| l.contains("list:")).unwrap();
+    assert!(
+        status.chars().any(|c| "▏▎▍▌▋▊▉█".contains(c)),
+        "a bar is drawn: {status}"
+    );
+}
+
+#[test]
+fn the_progress_readout_is_ascii_in_ascii_mode() {
+    let mut e = make_app(TARGET_FILES, GlyphMode::Ascii);
+    e.app.update(Action::GoTo(Screen::Targets));
+    for c in render_cells(&mut e.app, 190, 40) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+#[test]
+fn the_menu_shows_each_pages_number_and_planned_pages_keep_theirs() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let text = render(&mut e.app, 140, 36);
+    for (n, label) in [
+        (1, "Home"),
+        (2, "Explorer"),
+        (3, "Leftovers"),
+        (4, "Uninstall"),
+        (5, "Caches & Projects"),
+        (6, "Docker"),
+        (7, "ToBeDeleted"),
+    ] {
+        let line = text
+            .lines()
+            .find(|l| l.contains(label) && l.starts_with(&format!("│{n}")))
+            .unwrap_or_else(|| panic!("no menu line '{n} ... {label}':\n{text}"));
+        assert!(line.contains(label));
+    }
 }

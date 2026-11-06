@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
@@ -1012,7 +1013,17 @@ impl SpaceView {
             seed.snap += s.snap;
         }
         let roots: HashSet<&Path> = nodes.iter().map(|n| n.path.as_path()).collect();
-        let locate = |p: &Path| p.ancestors().any(|a| roots.contains(a)).then_some(0);
+        // Clone members repeat the same few folders very often: remember
+        // the answer per folder instead of walking its ancestors each time.
+        let memo: RefCell<HashMap<PathBuf, Option<usize>>> = RefCell::new(HashMap::new());
+        let locate = |p: &Path| {
+            if let Some(known) = memo.borrow().get(p) {
+                return *known;
+            }
+            let found = p.ancestors().any(|a| roots.contains(a)).then_some(0);
+            memo.borrow_mut().insert(p.to_path_buf(), found);
+            found
+        };
         compute_with(&self.shared, vec![seed], &locate)
             .pop()
             .unwrap_or_default()
@@ -1059,7 +1070,15 @@ impl SpaceView {
             .enumerate()
             .map(|(i, n)| (n.path.as_path(), i))
             .collect();
-        let locate = |p: &Path| p.ancestors().find_map(|a| index.get(a).copied());
+        let memo: RefCell<HashMap<PathBuf, Option<usize>>> = RefCell::new(HashMap::new());
+        let locate = |p: &Path| {
+            if let Some(known) = memo.borrow().get(p) {
+                return *known;
+            }
+            let found = p.ancestors().find_map(|a| index.get(a).copied());
+            memo.borrow_mut().insert(p.to_path_buf(), found);
+            found
+        };
         compute_with(&self.shared, seeds(nodes), &locate)
     }
 }

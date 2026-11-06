@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use super::command::{CommandRunner, CommandSpec};
 use super::resolve::{Places, resolve_in};
+use crate::bg::Work;
 use crate::safety::keeps_offline_data;
 
 /// How a cache is cleaned.
@@ -42,8 +43,9 @@ pub struct ToolEntry {
 }
 
 /// Find every tool cache that exists, using the real `PATH` and environment.
-pub fn discover_tools(home: &Path, runner: &dyn CommandRunner) -> Vec<ToolEntry> {
-    discover_with(home, runner, &Places::from_env())
+/// `work` shows what it is doing (it asks installed programs, which is slow).
+pub fn discover_tools(home: &Path, runner: &dyn CommandRunner, work: &Work) -> Vec<ToolEntry> {
+    discover_with(home, runner, &Places::from_env(), work)
 }
 
 /// One fixed cache folder and the command that cleans it, if there is one.
@@ -187,7 +189,9 @@ pub(crate) fn discover_with(
     home: &Path,
     runner: &dyn CommandRunner,
     places: &Places,
+    work: &Work,
 ) -> Vec<ToolEntry> {
+    work.begin("looking for installed tools", 0);
     let find = |name: &str| resolve_in(home, name, places);
     let mut out: Vec<ToolEntry> = Vec::new();
 
@@ -216,20 +220,34 @@ pub(crate) fn discover_with(
         });
     }
 
-    out.extend(pnpm_stores(home, runner, &find("pnpm")));
-    out.extend(npm_caches(home, runner, &find("npm")));
+    let (pnpms, npms) = (find("pnpm"), find("npm"));
+    // One question per install: that is the length of the slow part.
+    work.begin(
+        "asking pnpm and npm where their caches are",
+        pnpms.len() + npms.len(),
+    );
+    out.extend(pnpm_stores(home, runner, &pnpms, work));
+    out.extend(npm_caches(home, runner, &npms, work));
+    work.stage(1, 1, "listing app caches");
     let claimed: Vec<PathBuf> = out.iter().map(|e| e.path.clone()).collect();
     out.extend(app_caches(home, &claimed));
     out
 }
 
 /// One entry per pnpm store folder, cleaned by the pnpm that reports it.
-fn pnpm_stores(home: &Path, runner: &dyn CommandRunner, pnpms: &[PathBuf]) -> Vec<ToolEntry> {
+fn pnpm_stores(
+    home: &Path,
+    runner: &dyn CommandRunner,
+    pnpms: &[PathBuf],
+    work: &Work,
+) -> Vec<ToolEntry> {
     // Which pnpm owns which store folder (first one found wins).
     let mut owners: Vec<(PathBuf, PathBuf)> = Vec::new();
     for exe in pnpms {
         let spec = pinned(home, exe, &["store", "path"]);
-        if let Some(store) = folder_under(home, runner.query(&spec))
+        let answer = runner.query(&spec);
+        work.step();
+        if let Some(store) = folder_under(home, answer)
             && !owners.iter().any(|(s, _)| *s == store)
         {
             owners.push((store, exe.clone()));
@@ -296,11 +314,18 @@ fn pnpm_stores(home: &Path, runner: &dyn CommandRunner, pnpms: &[PathBuf]) -> Ve
 }
 
 /// The npm cache folder(s): what each npm reports, or `~/.npm` by default.
-fn npm_caches(home: &Path, runner: &dyn CommandRunner, npms: &[PathBuf]) -> Vec<ToolEntry> {
+fn npm_caches(
+    home: &Path,
+    runner: &dyn CommandRunner,
+    npms: &[PathBuf],
+    work: &Work,
+) -> Vec<ToolEntry> {
     let mut found: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     for exe in npms {
         let spec = pinned(home, exe, &["config", "get", "cache"]);
-        if let Some(dir) = folder_under(home, runner.query(&spec))
+        let answer = runner.query(&spec);
+        work.step();
+        if let Some(dir) = folder_under(home, answer)
             && !found.iter().any(|(d, _)| *d == dir)
         {
             found.push((dir, Some(exe.clone())));
@@ -425,7 +450,7 @@ mod tests {
     }
 
     fn find(h: &Home, runner: &FakeRunner) -> Vec<ToolEntry> {
-        discover_with(&h.home, runner, &Places::only(OsStr::new("")))
+        discover_with(&h.home, runner, &Places::only(OsStr::new("")), &Work::new())
     }
 
     fn by_id<'a>(entries: &'a [ToolEntry], id: &str) -> &'a ToolEntry {
@@ -456,7 +481,7 @@ mod tests {
         let go = h.home.join("tools/go");
         exe(&go);
         let places = Places::only(go.parent().unwrap().as_os_str());
-        let entries = discover_with(&h.home, &FakeRunner::new(&[]), &places);
+        let entries = discover_with(&h.home, &FakeRunner::new(&[]), &places, &Work::new());
         match &by_id(&entries, "go-build").mode {
             Mode::Command(spec) => assert_eq!(spec.display(), "go clean -cache"),
             other => panic!("expected a command, got {other:?}"),

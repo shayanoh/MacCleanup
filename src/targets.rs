@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::app::{SortBy, cmp_rows};
+use crate::bg::Work;
 use crate::catalog::{ArtifactKind, CommandSpec, Mode, ToolEntry, detect_artifacts};
 use crate::filter::Query;
 use crate::safety::{Policy, Safety};
@@ -136,16 +137,31 @@ pub fn display_path(home: &Path, p: &Path) -> String {
     }
 }
 
+/// Everything a list build reads, gathered so it can move to a thread.
+pub struct BuildSource {
+    pub root: Arc<Node>,
+    pub home: PathBuf,
+    pub view: SpaceView,
+    /// Was the scan finished when the build was asked for?
+    pub scan_idle: bool,
+    pub policy: Arc<Policy>,
+    pub entries: Vec<ToolEntry>,
+    pub closed: HashSet<String>,
+}
+
 impl Targets {
-    pub fn build(
-        root: &Arc<Node>,
-        home: &Path,
-        view: &SpaceView,
-        scan_idle: bool,
-        policy: &Policy,
-        entries: &[ToolEntry],
-        closed: &HashSet<String>,
-    ) -> Targets {
+    pub fn build(src: &BuildSource, work: &Work) -> Targets {
+        let BuildSource {
+            root,
+            home,
+            view,
+            scan_idle,
+            policy,
+            entries,
+            closed,
+        } = src;
+        let (home, scan_idle) = (home.as_path(), *scan_idle);
+        work.stage(0, 3, "listing tool caches");
         let mut cands: Vec<Cand> = Vec::new();
         for e in entries {
             let Some(node) = locate(root, &e.path) else {
@@ -170,6 +186,7 @@ impl Targets {
                 note: e.note.clone(),
             });
         }
+        work.stage(1, 3, "finding project folders");
         for c in detect_artifacts(root) {
             cands.push(Cand {
                 path: c.path,
@@ -206,6 +223,7 @@ impl Targets {
         });
 
         // Numbers: one pass over the clone tables when the scan is idle.
+        work.stage(2, 3, "reading space numbers");
         let idle = scan_idle;
         let nodes: Vec<Arc<Node>> = cands.iter().map(|c| Arc::clone(&c.node)).collect();
         let spaces = if idle {
@@ -252,6 +270,7 @@ impl Targets {
         }
         let mut t = Targets { groups };
         t.sort(SortBy::Disk);
+        work.stage(3, 3, "done");
         t
     }
 
@@ -343,7 +362,7 @@ mod tests {
         home: PathBuf,
         scanner: Scanner,
         root: Arc<crate::scan::Node>,
-        policy: Policy,
+        hold: PathBuf,
     }
 
     fn sandbox(setup: impl FnOnce(&Path)) -> Sandbox {
@@ -354,13 +373,13 @@ mod tests {
         let scanner = Scanner::new(2);
         let root = scanner.scan_root(&home);
         assert!(scanner.wait_idle(Duration::from_secs(20)));
-        let policy = Policy::new(&home, &d.path().join("hold"));
+        let hold = d.path().join("hold");
         Sandbox {
             _d: d,
             home,
             scanner,
             root,
-            policy,
+            hold,
         }
     }
 
@@ -376,16 +395,20 @@ mod tests {
         }
     }
 
+    fn source(s: &Sandbox, entries: &[ToolEntry], closed: HashSet<String>) -> BuildSource {
+        BuildSource {
+            root: Arc::clone(&s.root),
+            home: s.home.clone(),
+            view: s.scanner.view(),
+            scan_idle: s.scanner.is_idle(),
+            policy: Arc::new(Policy::new(&s.home, &s.hold)),
+            entries: entries.to_vec(),
+            closed,
+        }
+    }
+
     fn build(s: &Sandbox, entries: &[ToolEntry]) -> Targets {
-        Targets::build(
-            &s.root,
-            &s.home,
-            &s.scanner.view(),
-            s.scanner.is_idle(),
-            &s.policy,
-            entries,
-            &HashSet::new(),
-        )
+        Targets::build(&source(s, entries, HashSet::new()), &Work::new())
     }
 
     fn project(home: &Path) {
@@ -619,15 +642,7 @@ mod tests {
     fn a_closed_group_hides_its_rows_but_a_filter_shows_the_matches() {
         let s = sandbox(project);
         let closed: HashSet<String> = [format!("{:?}:~/shop", SectionKind::Projects)].into();
-        let t = Targets::build(
-            &s.root,
-            &s.home,
-            &s.scanner.view(),
-            s.scanner.is_idle(),
-            &s.policy,
-            &[],
-            &closed,
-        );
+        let t = Targets::build(&source(&s, &[], closed), &Work::new());
         let rows = |q: &str| {
             t.lines(&filter::parse(q))
                 .iter()
@@ -674,5 +689,93 @@ mod tests {
         let (g, r) = t.find(&s.home.join("api/target")).unwrap();
         assert_eq!(t.row(g, r).row.name, "target");
         assert!(t.find(&s.home.join("nope")).is_none());
+    }
+}
+
+/// Timing check on a big clone-heavy tree. Slow, so it only runs on request:
+/// `cargo test --release stress_ -- --ignored --nocapture`
+#[cfg(test)]
+mod stress {
+    use super::*;
+    use crate::scan::Scanner;
+    use std::time::{Duration, Instant};
+
+    fn clonefile(from: &std::path::Path, to: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let f = std::ffi::CString::new(from.as_os_str().as_bytes()).unwrap();
+        let t = std::ffi::CString::new(to.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::clonefile(f.as_ptr(), t.as_ptr(), 0) };
+        assert_eq!(rc, 0, "clonefile failed (needs APFS)");
+    }
+
+    #[test]
+    #[ignore]
+    fn stress_one_build_on_a_clone_heavy_tree() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().canonicalize().unwrap().join("home");
+        let (projects, pkgs, files) = (12usize, 300usize, 8usize);
+        std::fs::create_dir_all(home.join("Library/Caches/Store")).unwrap();
+        // A store of package files, cloned into every project's node_modules.
+        for p in 0..pkgs {
+            let dir = home.join("Library/Caches/Store").join(format!("pkg{p}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..files {
+                std::fs::write(dir.join(format!("f{f}.js")), vec![b'x'; 5000]).unwrap();
+            }
+        }
+        for proj in 0..projects {
+            let root = home.join(format!("dev/proj{proj}"));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("package.json"), "{}").unwrap();
+            for p in 0..pkgs {
+                let dir = root.join(format!("node_modules/pkg{p}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                for f in 0..files {
+                    clonefile(
+                        &home.join(format!("Library/Caches/Store/pkg{p}/f{f}.js")),
+                        &dir.join(format!("f{f}.js")),
+                    );
+                }
+            }
+        }
+        let scanner = Scanner::new(8);
+        let t = Instant::now();
+        let root = scanner.scan_root(&home);
+        assert!(scanner.wait_idle(Duration::from_secs(600)));
+        println!("scan: {:?}", t.elapsed());
+        let policy = Policy::new(&home, &d.path().join("hold"));
+        let entries = [ToolEntry {
+            id: "store".into(),
+            tool: "Tool".into(),
+            label: "Store".into(),
+            path: home.join("Library/Caches/Store"),
+            regen: String::new(),
+            mode: Mode::Folder,
+            note: None,
+        }];
+        let src = BuildSource {
+            root: Arc::clone(&root),
+            home: home.clone(),
+            view: scanner.view(),
+            scan_idle: true,
+            policy: Arc::new(policy),
+            entries: entries.to_vec(),
+            closed: HashSet::new(),
+        };
+        let work = Work::new();
+        let t = Instant::now();
+        let built = Targets::build(&src, &work);
+        println!(
+            "build: {:?} for {} rows ({} clone files)",
+            t.elapsed(),
+            built.groups.iter().map(|g| g.rows.len()).sum::<usize>(),
+            projects * pkgs * files
+        );
+        let t = Instant::now();
+        let sp = scanner.space(&root);
+        println!(
+            "space(root) as the Explorer asks on the UI thread: {:?} ({sp:?})",
+            t.elapsed()
+        );
     }
 }

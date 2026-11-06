@@ -18,7 +18,7 @@ use super::{
 use crate::anim;
 use crate::app::{App, GraphMode, MarkState, SortBy};
 use crate::filter::{self, Query};
-use crate::fmt::{eighths_bar, human_size};
+use crate::fmt::{eighths_bar, human_size, marquee};
 use crate::glyphs::Glyphs;
 use crate::scan::Row;
 use crate::targets::{Line, RowKind, SectionKind, TRow};
@@ -175,8 +175,34 @@ fn totals_line(app: &App, width: usize) -> TextLine<'static> {
     ))
 }
 
-/// Scan activity, the tool lookup, and a warning when the scan root is not
-/// the home folder (then caches outside it are not listed).
+/// "reading space numbers 2/3 ██▌   ": what a piece of background work is
+/// doing, with a filled bar when its steps are known and a moving one when not.
+fn work_text(
+    snap: &crate::bg::WorkSnapshot,
+    fallback: &str,
+    tick: u64,
+    bar_w: usize,
+    g: &Glyphs,
+) -> String {
+    let phase = if snap.phase.is_empty() {
+        fallback
+    } else {
+        snap.phase.as_str()
+    };
+    match snap.fraction() {
+        Some(f) => format!(
+            "{phase} {}/{} {}",
+            snap.done.min(snap.total),
+            snap.total,
+            eighths_bar(f, bar_w, g)
+        ),
+        None => format!("{phase} {}", marquee(tick, bar_w, g)),
+    }
+}
+
+/// Scan activity, the tool lookup and the list build (each with a bar), and
+/// warnings when the scan root is not the home folder or Full Disk Access is
+/// missing (then caches outside what was scanned are not listed).
 fn status_line(app: &App, width: usize) -> TextLine<'static> {
     let g = &app.glyphs;
     let idx = anim::spinner_frame(app.tick, g.spinner().len());
@@ -192,20 +218,37 @@ fn status_line(app: &App, width: usize) -> TextLine<'static> {
             g.spinner()[idx].to_string(),
             Style::default().fg(ACCENT),
         ));
-        spans.push(Span::raw(format!(" scanning{}", g.ellipsis())));
+        spans.push(Span::raw(format!(
+            " scanning{} {} files {}",
+            g.ellipsis(),
+            app.scanner.stats().files,
+            marquee(app.tick, 8, g)
+        )));
     }
     if app.tools_looking() {
         spans.push(Span::raw(format!(
-            " {} looking for installed tools{}",
+            " {} tools: {}",
             g.dot(),
-            g.ellipsis()
+            work_text(
+                &app.tools_work.snapshot(),
+                "looking for installed tools",
+                app.tick,
+                8,
+                g
+            )
         )));
     }
-    if app.targets_building() && app.targets.groups.is_empty() {
+    if app.targets_building() {
         spans.push(Span::raw(format!(
-            " {} building the list{}",
+            " {} list: {}",
             g.dot(),
-            g.ellipsis()
+            work_text(
+                &app.build_work.snapshot(),
+                "building the list",
+                app.tick,
+                8,
+                g
+            )
         )));
     }
     if app.fda_missing {

@@ -58,10 +58,8 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('[') => Some(Action::GrowGraph),
         KeyCode::Char(']') => Some(Action::ShrinkGraph),
         KeyCode::Tab => Some(Action::FocusToggle),
-        KeyCode::Char('1') => Some(Action::GoTo(Screen::Home)),
-        KeyCode::Char('2') => Some(Action::GoTo(Screen::Explorer)),
-        KeyCode::Char('3') => Some(Action::GoTo(Screen::Holding)),
-        KeyCode::Char('4') => Some(Action::GoTo(Screen::Targets)),
+        // A digit is the page's position in the menu, always.
+        KeyCode::Char(c @ '1'..='9') => Some(Action::Menu(usize::from(c as u8 - b'0'))),
         KeyCode::Char('r') if app.screen == Screen::Holding => Some(Action::RestoreSelected),
         KeyCode::Char('D') if app.screen == Screen::Holding => Some(Action::DeleteSelectedForever),
         KeyCode::Char('E') if app.screen == Screen::Holding => Some(Action::EmptyAll),
@@ -196,10 +194,14 @@ mod tests {
             (ch('['), Some(Action::GrowGraph)),
             (ch(']'), Some(Action::ShrinkGraph)),
             (key(KeyCode::Tab), Some(Action::FocusToggle)),
-            (ch('1'), Some(Action::GoTo(Screen::Home))),
-            (ch('2'), Some(Action::GoTo(Screen::Explorer))),
-            (ch('3'), Some(Action::GoTo(Screen::Holding))),
-            (ch('4'), Some(Action::GoTo(Screen::Targets))),
+            (ch('1'), Some(Action::Menu(1))),
+            (ch('2'), Some(Action::Menu(2))),
+            (ch('3'), Some(Action::Menu(3))),
+            (ch('4'), Some(Action::Menu(4))),
+            (ch('5'), Some(Action::Menu(5))),
+            (ch('6'), Some(Action::Menu(6))),
+            (ch('7'), Some(Action::Menu(7))),
+            (ch('0'), None),
             (key(KeyCode::Esc), Some(Action::Quit)),
             // Dialog-only and holding-only keys do nothing here.
             (ch('x'), None),
@@ -565,5 +567,27 @@ mod tests {
     fn a_review_of_folders_only_still_confirms_with_enter() {
         let d = review_with(2, 0);
         assert_eq!(dialog_key(KeyCode::Enter, &d), Some(Action::Confirm));
+    }
+
+    #[test]
+    fn a_digit_key_is_the_menu_position_of_a_page() {
+        let e = env(FILES);
+        for (i, entry) in crate::app::SIDEBAR.iter().enumerate() {
+            let digit = char::from_digit(i as u32 + 1, 10).unwrap();
+            assert_eq!(
+                map_key(ch(digit), &e.app),
+                Some(Action::Menu(i + 1)),
+                "{} is entry {}",
+                entry.label,
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn digits_are_text_while_typing_a_filter() {
+        let mut e = env(FILES);
+        e.app.update(Action::FilterOpen);
+        assert_eq!(map_key(ch('5'), &e.app), Some(Action::FilterChar('5')));
     }
 }

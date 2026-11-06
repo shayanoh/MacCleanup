@@ -6,7 +6,7 @@ use ratatui::layout::Rect;
 
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
-use crate::bg::Latest;
+use crate::bg::{Latest, Work};
 use crate::catalog::{CommandRunner, CommandSpec, SystemRunner, ToolEntry, discover_tools};
 use crate::filter;
 use crate::fmt::both_usage;
@@ -15,7 +15,7 @@ use crate::jobs::{CommandEvent, CommandJob, DeleteEvent, DeleteJob, DeleteMode, 
 use crate::safety::{Policy, Safety};
 use crate::scan::{Node, Row, Scanner, Space, file_space, locate};
 use crate::softdelete::{HeldItem, Holding};
-use crate::targets::{Line, SectionKind, TRow, Targets};
+use crate::targets::{BuildSource, Line, SectionKind, TRow, Targets};
 use crate::usage::Usage;
 use crate::volume;
 
@@ -123,6 +123,8 @@ pub enum Action {
     CycleSort,
     FocusToggle,
     GoTo(Screen),
+    /// A digit key: the page at this position (1-based) in the menu.
+    Menu(usize),
     Click {
         x: u16,
         y: u16,
@@ -389,6 +391,11 @@ pub struct App {
     targets_synced: bool,
     /// The list being built on a thread (a full walk of the scan tree).
     targets_job: Latest<(Targets, bool)>,
+    /// Something changed while a build ran: build once more when it lands.
+    targets_stale: bool,
+    /// What the list build and the tool lookup are doing (for progress bars).
+    pub build_work: Arc<Work>,
+    pub tools_work: Arc<Work>,
     /// Tool commands marked for the review (the second kind of selection).
     pub tool_marks: BTreeSet<String>,
     /// Set-wise space of the whole selection, worked out on a thread.
@@ -514,6 +521,9 @@ impl App {
             closed_groups: HashSet::new(),
             targets_synced: false,
             targets_job: Latest::new(),
+            targets_stale: false,
+            build_work: Work::new(),
+            tools_work: Work::new(),
             tool_marks: BTreeSet::new(),
             set_space: Latest::new(),
             set_exact: true,
@@ -850,6 +860,7 @@ impl App {
                 self.goto(screen);
                 self.focus = Focus::Main;
             }
+            Action::Menu(n) => self.menu(n),
             Action::Rescan => self.rescan(false),
             Action::RescanAll => self.rescan(true),
             Action::Click { x, y } => self.click(x, y),
@@ -1001,6 +1012,23 @@ impl App {
                 self.request_holders();
             }
             _ => {}
+        }
+    }
+
+    /// A digit key: open the page at that position in the menu, or say that
+    /// a planned page is not built yet. Positions outside the menu do nothing.
+    fn menu(&mut self, n: usize) {
+        let Some(entry) = n.checked_sub(1).and_then(|i| SIDEBAR.get(i)) else {
+            return;
+        };
+        match entry.screen {
+            Some(screen) => {
+                self.goto(screen);
+                self.focus = Focus::Main;
+            }
+            None => {
+                self.notice = Some(format!("{} is coming in a later release", entry.label));
+            }
         }
     }
 
@@ -1594,8 +1622,10 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let runner = Arc::clone(&self.runner);
         let home = self.policy.home().to_path_buf();
+        let work = Arc::clone(&self.tools_work);
+        work.begin("looking for installed tools", 0);
         std::thread::spawn(move || {
-            let _ = tx.send(discover_tools(&home, runner.as_ref()));
+            let _ = tx.send(discover_tools(&home, runner.as_ref(), &work));
         });
         self.tools_rx = Some(rx);
     }
@@ -1617,24 +1647,38 @@ impl App {
     /// scan tree and reads the clone tables). The result is picked up by the
     /// next tick; the cursor stays on the same line.
     pub fn rebuild_targets(&mut self) {
-        let root = Arc::clone(&self.stack[0]);
-        let home = self.policy.home().to_path_buf();
-        let view = self.scanner.view();
-        let idle = self.scanner.is_idle();
-        let policy = Arc::clone(&self.policy);
-        let entries = self.tool_entries.clone();
-        let closed = self.closed_groups.clone();
+        // One build at a time: starting another would make the running one
+        // stale, so with a steady stream of requests nothing would ever land.
+        // Remember the request and build again when the running one is done.
+        if self.targets_job.pending {
+            self.targets_stale = true;
+            return;
+        }
+        self.targets_stale = false;
+        let src = BuildSource {
+            root: Arc::clone(&self.stack[0]),
+            home: self.policy.home().to_path_buf(),
+            view: self.scanner.view(),
+            scan_idle: self.scanner.is_idle(),
+            policy: Arc::clone(&self.policy),
+            entries: self.tool_entries.clone(),
+            closed: self.closed_groups.clone(),
+        };
+        let work = Arc::clone(&self.build_work);
+        work.begin("starting", 3);
         self.targets_job.spawn(move || {
-            (
-                Targets::build(&root, &home, &view, idle, &policy, &entries, &closed),
-                idle,
-            )
+            let idle = src.scan_idle;
+            (Targets::build(&src, &work), idle)
         });
     }
 
     /// Take in a finished list build, if there is one.
     fn poll_targets(&mut self) {
-        if !self.targets_job.poll() {
+        let landed = self.targets_job.poll();
+        if self.targets_stale && !self.targets_job.pending {
+            self.rebuild_targets();
+        }
+        if !landed {
             return;
         }
         let Some((mut built, idle)) = self.targets_job.value.take() else {
@@ -1661,6 +1705,11 @@ impl App {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// How many list builds have been started (to catch a request storm).
+    pub fn targets_job_spawned(&self) -> u64 {
+        self.targets_job.spawned
     }
 
     /// Is the list still being built?
@@ -4448,6 +4497,45 @@ mod tests {
     }
 
     #[test]
+    fn waiting_for_the_list_never_starts_a_pile_of_builds() {
+        let mut e = env_with(TARGET_FILES, |_| {});
+        e.app.update(Action::GoTo(Screen::Targets));
+        for _ in 0..60 {
+            e.app.update(Action::Tick);
+        }
+        assert!(
+            e.app.targets_job_spawned() <= 2,
+            "one build at a time, not one per tick: {}",
+            e.app.targets_job_spawned()
+        );
+        e.app.settle_targets();
+        assert!(!e.app.tlines.is_empty(), "and the list does land");
+    }
+
+    #[test]
+    fn a_change_during_a_build_is_picked_up_by_exactly_one_more_build() {
+        let mut e = env_with(TARGET_FILES, |_| {});
+        e.app.update(Action::GoTo(Screen::Targets));
+        let before = e.app.targets_job_spawned();
+        for _ in 0..10 {
+            e.app.rebuild_targets(); // asked again and again while one runs
+        }
+        e.app.settle_targets();
+        for _ in 0..30 {
+            e.app.update(Action::Tick);
+        }
+        e.app.settle_targets();
+        // One follow-up for the requests made mid-build, one more when the
+        // tool lookup lands: never one per request.
+        assert!(
+            e.app.targets_job_spawned() <= before + 3,
+            "{} builds",
+            e.app.targets_job_spawned()
+        );
+        assert!(!e.app.targets_building());
+    }
+
+    #[test]
     fn the_list_is_built_off_the_ui_thread() {
         let mut e = env_with(TARGET_FILES, |_| {});
         e.app.update(Action::GoTo(Screen::Targets));
@@ -4458,5 +4546,46 @@ mod tests {
         );
         e.app.settle_targets();
         assert!(!e.app.tlines.is_empty());
+    }
+
+    #[test]
+    fn menu_digits_open_the_page_at_that_position() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        for (i, entry) in SIDEBAR.iter().enumerate() {
+            app.update(Action::Menu(i + 1));
+            match entry.screen {
+                Some(screen) => {
+                    assert_eq!(app.screen, screen, "{}", entry.label);
+                    assert_eq!(app.focus, Focus::Main);
+                }
+                None => assert_eq!(
+                    app.notice.as_deref(),
+                    Some(format!("{} is coming in a later release", entry.label).as_str())
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn menu_digits_outside_the_menu_do_nothing() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        let before = app.screen;
+        for n in [0, SIDEBAR.len() + 1, 99] {
+            app.update(Action::Menu(n));
+            assert_eq!(app.screen, before);
+            assert!(app.notice.is_none());
+        }
+    }
+
+    #[test]
+    fn menu_digits_do_nothing_while_a_dialog_is_open() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        app.dialog = Some(Dialog::Notice("hi".to_string()));
+        let before = app.screen;
+        app.update(Action::Menu(7));
+        assert_eq!(app.screen, before);
     }
 }

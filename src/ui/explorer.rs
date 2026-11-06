@@ -71,7 +71,11 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         let idx = anim::spinner_frame(app.tick, g.spinner().len());
         Line::from(vec![
             Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
-            Span::raw(format!(" scanning{} {totals}", g.ellipsis())),
+            Span::raw(format!(" scanning{} {totals} ", g.ellipsis())),
+            Span::styled(
+                crate::fmt::marquee(app.tick, 10, &g),
+                Style::default().fg(ACCENT),
+            ),
         ])
     };
     frame.render_widget(

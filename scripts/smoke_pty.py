@@ -285,7 +285,7 @@ wait_gone("still holds 1 item")
 assert pid_alive(), "Esc must keep the app running"
 
 step("holding screen and restore")
-send(b"3")
+send(b"7")
 wait_for("1 items")
 send(b"r")
 wait_for("Restored")
@@ -299,8 +299,8 @@ with open(os.path.join(home, "late.bin"), "wb") as f:
 send(b"R")
 wait_for("late.bin")
 
-step("caches & projects: 4 opens it, space marks a row, d reviews, Esc cancels, space unmarks")
-send(b"4")
+step("caches & projects: 5 opens it, space marks a row, d reviews, Esc cancels, space unmarks")
+send(b"5")
 wait_for("PROJECTS")
 wait_for("node_modules")
 wait_for("Details")
