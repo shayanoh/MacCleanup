@@ -726,8 +726,20 @@ mod tests {
         let pidfile = dir.path().join("child.pid");
         let ctl = RunControl::new();
         let c = std::sync::Arc::clone(&ctl);
+        let seen = pidfile.clone();
         let canceller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
+            // Cancel once the shell has started its grandchild (it writes
+            // the pid), not after a guessed delay: a busy machine is slow.
+            let until = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < until
+                && std::fs::read_to_string(&seen).is_ok_and(|t| t.trim().parse::<i32>().is_err())
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            while Instant::now() < until && !seen.exists() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(50));
             c.cancel();
         });
         // A shell that starts a grandchild and waits for it.
