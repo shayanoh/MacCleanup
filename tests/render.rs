@@ -117,6 +117,20 @@ fn render(app: &mut App, w: u16, h: u16) -> String {
     out
 }
 
+/// Open the review and wait until its space figures are worked out.
+fn open_review(app: &mut App) {
+    app.update(Action::OpenReview);
+    for _ in 0..400 {
+        match &app.dialog {
+            Some(Dialog::Review(r)) if !r.space_ready => {
+                app.update(Action::Tick);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => return,
+        }
+    }
+}
+
 fn mark(app: &mut App, name: &str) {
     let idx = app
         .rows
@@ -237,7 +251,7 @@ fn ascii_mode_has_only_ascii_cells() {
     e.app.graph = GraphMode::Treemap;
     assert_ascii("treemap with a mark", render_cells(&mut e.app, 120, 30));
 
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     assert!(matches!(e.app.dialog, Some(Dialog::Review(_))));
     assert_ascii("review", render_cells(&mut e.app, 120, 30));
     e.app.update(Action::ConfirmIrreversible);
@@ -253,7 +267,7 @@ fn review_dialog_shows_total_and_keys() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "big");
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("Enter"), "{text}");
     assert!(text.contains("Esc"), "{text}");
@@ -266,7 +280,7 @@ fn review_dialog_shows_total_and_keys() {
 fn irreversible_dialog_warns() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "big");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("cannot be undone"), "{text}");
@@ -277,7 +291,7 @@ fn irreversible_dialog_warns() {
 fn deleting_dialog_shows_progress() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "big");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     // Render before ticking so the dialog is still in the working state.
     let text = render(&mut e.app, 120, 30);
@@ -296,7 +310,7 @@ fn deleting_dialog_shows_progress() {
 fn finish_dialog_shows_congratulation() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "big");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
@@ -322,7 +336,7 @@ fn finish_dialog_shows_congratulation() {
 fn finish_dialog_explains_when_nothing_was_freed() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
@@ -345,7 +359,7 @@ fn finish_dialog_explains_when_nothing_was_freed() {
 fn holding_screen_lists_items() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -408,7 +422,7 @@ fn layout_is_published_for_mouse_mapping() {
 #[test]
 fn notice_text_replaces_footer_hints() {
     let mut e = explorer(GlyphMode::Nerd);
-    e.app.update(Action::OpenReview); // nothing marked: sets a notice
+    open_review(&mut e.app); // nothing marked: sets a notice
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("Nothing marked yet"), "{text}");
 }
@@ -575,7 +589,7 @@ fn home_scan_line_shows_on_disk_size_too() {
 fn review_dialog_shows_on_disk_total() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 120, 30);
     // small.txt: 1.5 KB logical, 4.1 KB on disk.
     assert!(text.contains("1.5 KB"), "{text}");
@@ -598,7 +612,7 @@ fn marked_footer_shows_on_disk_size() {
 fn sidebar_pending_shows_on_disk_size() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -630,7 +644,7 @@ fn home_pending_and_folders_show_on_disk_size() {
 fn holding_screen_shows_on_disk_size() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -651,7 +665,7 @@ fn holding_screen_shows_on_disk_size() {
 fn finish_dialog_shows_on_disk_amounts() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
@@ -723,7 +737,7 @@ fn dialogs_grow_in_when_animations_are_on() {
     }
     let before = render(&mut e.app, 120, 30).matches('╭').count();
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
 
     let first = render(&mut e.app, 120, 30);
     assert!(
@@ -755,7 +769,7 @@ fn dialogs_grow_in_when_animations_are_on() {
 fn no_grow_animation_when_animations_are_off() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("Review before moving"), "{text}");
 }
@@ -766,7 +780,7 @@ fn finished_with_freed_space(animations: bool, freed: bool) -> Env {
     let mut e = make_app_full(FILES, GlyphMode::Nerd, animations, |_| {});
     e.app.update(Action::GoTo(Screen::Explorer));
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
@@ -824,7 +838,7 @@ fn confetti_is_ascii_in_ascii_mode() {
     let mut e = make_app_full(FILES, GlyphMode::Ascii, true, |_| {});
     e.app.update(Action::GoTo(Screen::Explorer));
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::ConfirmIrreversible);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
@@ -847,7 +861,7 @@ fn confetti_is_ascii_in_ascii_mode() {
 fn emptying_shows_a_deleting_dialog_with_a_progress_bar() {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -1047,7 +1061,7 @@ fn a_long_query_does_not_break_the_layout() {
 fn with_held_item() -> Env {
     let mut e = explorer(GlyphMode::Nerd);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -1108,7 +1122,7 @@ fn quitting_with_items_shows_the_warning_dialog() {
 fn the_quit_warning_is_ascii_in_ascii_mode() {
     let mut e = explorer(GlyphMode::Ascii);
     mark(&mut e.app, "small.txt");
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     e.app.update(Action::Confirm);
     for _ in 0..500 {
         if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
@@ -1184,7 +1198,7 @@ fn review_dialog_says_what_frees_now_and_what_stays() {
     let mut e = shared_app(GlyphMode::Nerd);
     select_row(&mut e.app, "proj");
     e.app.update(Action::ToggleMark);
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 140, 34);
     assert!(text.contains("frees about"), "{text}");
     assert!(text.contains("right now"), "{text}");
@@ -1217,7 +1231,7 @@ fn review_explains_data_shared_only_among_the_marked_files() {
     let mut e = clone_pair_app();
     select_row(&mut e.app, "dup");
     e.app.update(Action::ToggleMark);
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 140, 36);
     assert!(
         text.contains("shared only among these files"),
@@ -1369,7 +1383,7 @@ const TARGET_FILES: &[(&str, usize)] = &[
 fn wait_tools(app: &mut App) {
     for _ in 0..2000 {
         app.update(Action::Tick);
-        if !app.tools_looking() && app.scanner.is_idle() {
+        if !app.tools_looking() && !app.targets_building() && app.scanner.is_idle() {
             app.update(Action::Tick);
             return;
         }
@@ -1565,9 +1579,10 @@ fn the_review_shows_the_command_block_with_the_explicit_key() {
         note: None,
     }];
     e.app.rebuild_targets();
+    e.app.settle_targets();
     cursor_on_row(&mut e.app, "Spotify");
     e.app.update(Action::ToggleMark);
-    e.app.update(Action::OpenReview);
+    open_review(&mut e.app);
     let text = render(&mut e.app, 150, 40);
     assert!(text.contains("Tool cleanup commands"), "{text}");
     assert!(text.contains("tool clean"), "{text}");
@@ -1586,4 +1601,123 @@ fn tools_still_being_looked_up_are_said_so() {
     assert!(e.app.tools_looking());
     let text = render(&mut e.app, 140, 36);
     assert!(text.contains("looking for installed tools"), "{text}");
+}
+
+#[test]
+fn the_explorer_footer_counts_marked_tool_cleanups() {
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let home = e.app.policy.home().to_path_buf();
+    e.app.tool_entries = vec![ToolEntry {
+        id: "cmd".to_string(),
+        tool: "Tool".to_string(),
+        label: "Spotify".to_string(),
+        path: home.join("Library/Caches/Spotify"),
+        regen: "again".to_string(),
+        mode: Mode::Command(CommandSpec::new("/opt/x/bin/tool", &["clean"])),
+        note: None,
+    }];
+    e.app.rebuild_targets();
+    e.app.settle_targets();
+    cursor_on_row(&mut e.app, "Spotify");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let text = render(&mut e.app, 150, 40);
+    assert!(text.contains("1 tool cleanup"), "{text}");
+}
+
+fn rooted_app(root_rel: &str) -> Env {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let home = base.join("home");
+    fs::create_dir_all(&home).unwrap();
+    for (rel, size) in TARGET_FILES {
+        write(&home.join(rel), *size);
+    }
+    let hold = base.join("hold");
+    let scanner = Scanner::new(2);
+    let root = scanner.scan_root(&home.join(root_rel));
+    assert!(scanner.wait_idle(Duration::from_secs(20)));
+    let policy = Policy::new(&home, &hold);
+    let holding = Holding::open(hold).unwrap();
+    let free = volume::free_space(&home).unwrap();
+    let app = App::new(
+        scanner,
+        root,
+        policy,
+        holding,
+        Accounting::new(free),
+        Glyphs::new(GlyphMode::Nerd),
+        false,
+    )
+    .with_runner(std::sync::Arc::new(NoTools));
+    Env { _dir: dir, app }
+}
+
+#[test]
+fn a_narrowed_scan_root_and_missing_full_disk_access_are_announced() {
+    let mut e = rooted_app("shop");
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    e.app.fda_missing = true;
+    let text = render(&mut e.app, 190, 40);
+    assert!(text.contains("scan root is"), "{text}");
+    assert!(text.contains("Full Disk Access"), "{text}");
+    // A full home scan says neither.
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let text = render(&mut e.app, 190, 40);
+    assert!(!text.contains("scan root is"), "{text}");
+    assert!(!text.contains("Full Disk Access"), "{text}");
+}
+
+#[test]
+fn y_is_refused_while_a_marked_command_is_hidden_by_a_short_terminal() {
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let home = e.app.policy.home().to_path_buf();
+    let entries: Vec<ToolEntry> = (0..8)
+        .map(|i| {
+            let rel = format!("Library/Caches/Cmd{i}");
+            fs::create_dir_all(home.join(&rel)).unwrap();
+            fs::write(home.join(&rel).join("f"), vec![b'x'; 1000]).unwrap();
+            ToolEntry {
+                id: format!("cmd{i}"),
+                tool: "Tool".to_string(),
+                label: format!("Cmd{i}"),
+                path: home.join(&rel),
+                regen: "again".to_string(),
+                mode: Mode::Command(CommandSpec::new("/opt/x/bin/tool", &[&format!("clean{i}")])),
+                note: None,
+            }
+        })
+        .collect();
+    e.app.tool_entries = entries;
+    e.app.update(Action::RescanAll);
+    wait_tools(&mut e.app);
+    e.app.rebuild_targets();
+    e.app.settle_targets();
+    for i in 0..8 {
+        cursor_on_row(&mut e.app, &format!("Cmd{i}"));
+        e.app.update(Action::ToggleMark);
+    }
+    assert_eq!(e.app.tool_marks.len(), 8);
+    open_review(&mut e.app);
+    // A short terminal cannot show eight commands.
+    let text = render(&mut e.app, 100, 20);
+    assert!(text.contains("more command"), "{text}");
+    e.app.update(Action::Confirm);
+    assert!(
+        matches!(e.app.dialog, Some(Dialog::Review(_))),
+        "must stay open"
+    );
+    assert_eq!(e.app.tool_marks.len(), 8, "nothing ran");
+    // A tall terminal shows them all and the key works again.
+    let text = render(&mut e.app, 140, 60);
+    assert!(text.contains("clean7"), "{text}");
+    e.app.update(Action::Confirm);
+    assert!(
+        matches!(e.app.dialog, Some(Dialog::Deleting(_))),
+        "{:?}",
+        e.app.dialog
+    );
 }

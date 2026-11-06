@@ -98,6 +98,8 @@ pub struct UiLayout {
     pub list_top: u16,
     /// How many list rows are visible.
     pub list_rows: u16,
+    /// The review dialog cannot show every tool command at this terminal size.
+    pub review_clipped: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,6 +192,8 @@ pub struct Review {
     /// Tool commands to run after the folders are moved.
     pub commands: Vec<ReviewCommand>,
     pub total: Usage,
+    /// False while the set-wise numbers are still being worked out.
+    pub space_ready: bool,
     /// Where the marked items' disk space would go: freed now, held by
     /// snapshots, or shared with clones and hard links that stay.
     pub space: Space,
@@ -383,6 +387,8 @@ pub struct App {
     /// Keys of the groups the user folded (kept across rebuilds).
     closed_groups: HashSet<String>,
     targets_synced: bool,
+    /// The list being built on a thread (a full walk of the scan tree).
+    targets_job: Latest<(Targets, bool)>,
     /// Tool commands marked for the review (the second kind of selection).
     pub tool_marks: BTreeSet<String>,
     /// Set-wise space of the whole selection, worked out on a thread.
@@ -507,6 +513,7 @@ impl App {
             tools_started: false,
             closed_groups: HashSet::new(),
             targets_synced: false,
+            targets_job: Latest::new(),
             tool_marks: BTreeSet::new(),
             set_space: Latest::new(),
             set_exact: true,
@@ -824,7 +831,10 @@ impl App {
                     SortBy::Frees => SortBy::Name,
                 };
                 if self.screen == Screen::Targets {
-                    self.rebuild_targets();
+                    // Only the order changes: no need to build the list again.
+                    let keep = self.sel_of(self.tcursor);
+                    self.targets.sort(self.sort);
+                    self.rebuild_tlines(keep);
                 } else {
                     self.refresh_rows();
                 }
@@ -879,7 +889,17 @@ impl App {
             self.refresh_free();
         }
         self.poll_discovery();
-        self.set_space.poll();
+        self.poll_targets();
+        if self.set_space.poll() || !self.set_space.pending {
+            // A review opened while the numbers were being worked out.
+            if let (Some(Dialog::Review(r)), Some(j)) = (&mut self.dialog, self.set_space.value)
+                && !r.space_ready
+                && !self.set_space.pending
+            {
+                r.space = j.base;
+                r.space_ready = true;
+            }
+        }
         self.holders.poll();
         if self.scanner.is_idle() && !self.set_exact && !self.set_space.pending {
             // The scan finished since the numbers were worked out: redo them.
@@ -912,7 +932,18 @@ impl App {
     fn confirm(&mut self) {
         match self.dialog.take() {
             Some(Dialog::QuitWarning(_)) => self.should_quit = true,
-            Some(Dialog::Review(r)) => self.run_delete(r, DeleteMode::SoftOnly),
+            Some(Dialog::Review(r)) => {
+                if !r.commands.is_empty() && self.layout.review_clipped {
+                    // Never run a command the review could not show.
+                    self.notice = Some(
+                        "Some commands do not fit on screen. Make the terminal taller, or Esc."
+                            .to_string(),
+                    );
+                    self.dialog = Some(Dialog::Review(r));
+                } else {
+                    self.run_delete(r, DeleteMode::SoftOnly);
+                }
+            }
             Some(Dialog::Irreversible(r)) => self.run_delete(r, DeleteMode::SoftThenEmpty),
             Some(Dialog::ConfirmForever(t)) => self.run_forever(t),
             Some(Dialog::Deleting(p)) => self.dialog = Some(Dialog::Deleting(p)),
@@ -1412,14 +1443,17 @@ impl App {
         });
         let total = items.iter().map(|i| i.usage).sum();
         // The same figure the footer shows, unless it is still being worked out.
-        let space = match (self.set_space.pending, self.set_space.value) {
-            (false, Some(j)) => j.base,
-            _ => joint_of(&self.scanner.view(), self.joint_inputs()).base,
+        // (never worked out here: that can take long on a big tree, so a
+        // review opened mid-calculation fills the figure in when it lands).
+        let (space, space_ready) = match (self.set_space.pending, self.set_space.value) {
+            (false, Some(j)) => (j.base, true),
+            _ => (Space::default(), false),
         };
         self.dialog = Some(Dialog::Review(Review {
             items,
             commands,
             total,
+            space_ready,
             space,
         }));
     }
@@ -1579,21 +1613,59 @@ impl App {
         }
     }
 
-    /// Build the list again from the scan, keeping the cursor on the same line.
+    /// Build the list again from the scan on a thread (it walks the whole
+    /// scan tree and reads the clone tables). The result is picked up by the
+    /// next tick; the cursor stays on the same line.
     pub fn rebuild_targets(&mut self) {
-        let keep = self.sel_of(self.tcursor);
         let root = Arc::clone(&self.stack[0]);
-        self.targets = Targets::build(
-            &root,
-            self.policy.home(),
-            &self.scanner,
-            &self.policy,
-            &self.tool_entries,
-            &self.closed_groups,
-        );
-        self.targets.sort(self.sort);
-        self.targets_synced = self.scanner.is_idle();
+        let home = self.policy.home().to_path_buf();
+        let view = self.scanner.view();
+        let idle = self.scanner.is_idle();
+        let policy = Arc::clone(&self.policy);
+        let entries = self.tool_entries.clone();
+        let closed = self.closed_groups.clone();
+        self.targets_job.spawn(move || {
+            (
+                Targets::build(&root, &home, &view, idle, &policy, &entries, &closed),
+                idle,
+            )
+        });
+    }
+
+    /// Take in a finished list build, if there is one.
+    fn poll_targets(&mut self) {
+        if !self.targets_job.poll() {
+            return;
+        }
+        let Some((mut built, idle)) = self.targets_job.value.take() else {
+            return;
+        };
+        let keep = self.sel_of(self.tcursor);
+        // Folds and sorting may have changed while it was being built.
+        for g in &mut built.groups {
+            g.open = !self.closed_groups.contains(&g.key());
+        }
+        built.sort(self.sort);
+        self.targets = built;
+        self.targets_synced = idle;
         self.rebuild_tlines(keep);
+    }
+
+    /// Wait for the list build to land. Blocks: for tests and tools, never
+    /// for the UI loop.
+    pub fn settle_targets(&mut self) {
+        for _ in 0..4000 {
+            self.poll_targets();
+            if !self.targets_job.pending {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Is the list still being built?
+    pub fn targets_building(&self) -> bool {
+        self.targets_job.pending
     }
 
     fn rebuild_tlines(&mut self, keep: Option<LineKey>) {
@@ -2386,6 +2458,7 @@ mod tests {
             main: Rect::new(16, 0, 80, 20),
             list_top: 3,
             list_rows: 10,
+            ..UiLayout::default()
         };
     }
 
@@ -3535,7 +3608,7 @@ mod tests {
         let app = &mut e.app;
         select(app, "proj");
         app.update(Action::ToggleMark);
-        app.update(Action::OpenReview);
+        crate::testutil::open_review_ready(app);
         match &app.dialog {
             Some(Dialog::Review(r)) => {
                 assert_eq!(r.space.shared_outside, 8192);
@@ -3551,7 +3624,7 @@ mod tests {
         let app = &mut e.app;
         select(app, "a");
         app.update(Action::ToggleMark);
-        app.update(Action::OpenReview);
+        crate::testutil::open_review_ready(app);
         match &app.dialog {
             Some(Dialog::Review(r)) => {
                 assert_eq!(r.space.shared_outside, 0);
@@ -3570,7 +3643,7 @@ mod tests {
         app.update(Action::Into);
         select(app, "pkg");
         app.update(Action::ToggleMark);
-        app.update(Action::OpenReview);
+        crate::testutil::open_review_ready(app);
         match &app.dialog {
             Some(Dialog::Review(r)) => {
                 assert_eq!((r.space.frees_now, r.space.shared_outside), (0, 8192));
@@ -3771,7 +3844,9 @@ mod tests {
         let mut e = env_with(TARGET_FILES, |_| {});
         e.app.update(Action::GoTo(Screen::Targets));
         assert!(e.app.tools_looking(), "discovery runs in the background");
-        // Project artifacts are already listed while tools are still looked up.
+        // Project artifacts are listed once the list is built, even while
+        // the installed tools are still being looked up.
+        e.app.settle_targets();
         assert!(line_names(&e.app).contains(&"node_modules".to_string()));
         wait_tools(&mut e.app);
         assert!(!e.app.tools_looking());
@@ -4015,6 +4090,7 @@ mod tests {
             mk("folder", "p1/node_modules", Mode::Folder),
         ];
         e.app.rebuild_targets();
+        e.app.settle_targets();
     }
 
     #[test]
@@ -4173,6 +4249,7 @@ mod tests {
             mk("other", "Library/Caches/Other"),
         ];
         e.app.rebuild_targets();
+        e.app.settle_targets();
         e.app.focus = Focus::Main;
         e
     }
@@ -4353,5 +4430,33 @@ mod tests {
             e.app.update(Action::Tick);
         }
         assert!(e.app.should_quit);
+    }
+
+    #[test]
+    fn a_review_opened_mid_calculation_fills_its_figures_in_later() {
+        let mut e = shared_app();
+        let nm = e.home.join("p1/node_modules");
+        mark_target(&mut e.app, &nm);
+        assert!(e.app.set_space.pending, "the figures are being worked out");
+        e.app.update(Action::OpenReview);
+        assert!(
+            !review_of(&e.app).space_ready,
+            "nothing is computed on the UI thread"
+        );
+        wait_sets(&mut e.app);
+        assert!(review_of(&e.app).space_ready);
+    }
+
+    #[test]
+    fn the_list_is_built_off_the_ui_thread() {
+        let mut e = env_with(TARGET_FILES, |_| {});
+        e.app.update(Action::GoTo(Screen::Targets));
+        assert!(e.app.targets_building());
+        assert!(
+            e.app.tlines.is_empty(),
+            "the first paint does not wait for the walk"
+        );
+        e.app.settle_targets();
+        assert!(!e.app.tlines.is_empty());
     }
 }

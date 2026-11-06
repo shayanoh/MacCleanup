@@ -130,7 +130,7 @@ pub fn clone_file(from: &Path, to: &Path) {
 pub fn wait_tools(app: &mut App) {
     for _ in 0..2000 {
         app.update(Action::Tick);
-        if !app.tools_looking() && app.scanner.is_idle() {
+        if !app.tools_looking() && !app.targets_building() && app.scanner.is_idle() {
             app.update(Action::Tick);
             return;
         }
@@ -149,4 +149,18 @@ pub fn wait_sets(app: &mut App) {
         std::thread::sleep(Duration::from_millis(5));
     }
     panic!("background space work did not finish");
+}
+
+/// Open the review and wait until its space figures are worked out.
+pub fn open_review_ready(app: &mut App) {
+    app.update(Action::OpenReview);
+    for _ in 0..400 {
+        match &app.dialog {
+            Some(crate::app::Dialog::Review(r)) if !r.space_ready => {
+                app.update(Action::Tick);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => return,
+        }
+    }
 }

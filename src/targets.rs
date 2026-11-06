@@ -10,7 +10,7 @@ use crate::app::{SortBy, cmp_rows};
 use crate::catalog::{ArtifactKind, CommandSpec, Mode, ToolEntry, detect_artifacts};
 use crate::filter::Query;
 use crate::safety::{Policy, Safety};
-use crate::scan::{Node, Row, Scanner, locate};
+use crate::scan::{Node, Row, SpaceView, locate};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SectionKind {
@@ -140,7 +140,8 @@ impl Targets {
     pub fn build(
         root: &Arc<Node>,
         home: &Path,
-        scanner: &Scanner,
+        view: &SpaceView,
+        scan_idle: bool,
         policy: &Policy,
         entries: &[ToolEntry],
         closed: &HashSet<String>,
@@ -205,10 +206,10 @@ impl Targets {
         });
 
         // Numbers: one pass over the clone tables when the scan is idle.
-        let idle = scanner.is_idle();
+        let idle = scan_idle;
         let nodes: Vec<Arc<Node>> = cands.iter().map(|c| Arc::clone(&c.node)).collect();
         let spaces = if idle {
-            scanner.spaces_of(&nodes)
+            view.spaces_of(&nodes)
         } else {
             Vec::new()
         };
@@ -379,7 +380,8 @@ mod tests {
         Targets::build(
             &s.root,
             &s.home,
-            &s.scanner,
+            &s.scanner.view(),
+            s.scanner.is_idle(),
             &s.policy,
             entries,
             &HashSet::new(),
@@ -617,7 +619,15 @@ mod tests {
     fn a_closed_group_hides_its_rows_but_a_filter_shows_the_matches() {
         let s = sandbox(project);
         let closed: HashSet<String> = [format!("{:?}:~/shop", SectionKind::Projects)].into();
-        let t = Targets::build(&s.root, &s.home, &s.scanner, &s.policy, &[], &closed);
+        let t = Targets::build(
+            &s.root,
+            &s.home,
+            &s.scanner.view(),
+            s.scanner.is_idle(),
+            &s.policy,
+            &[],
+            &closed,
+        );
         let rows = |q: &str| {
             t.lines(&filter::parse(q))
                 .iter()

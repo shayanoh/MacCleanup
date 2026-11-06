@@ -134,15 +134,65 @@ fn quit_warning(frame: &mut Frame, area: Rect, g: &Glyphs, w: &QuitWarning, scal
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
+/// Lines of the review that are neither folders nor commands.
+const REVIEW_FIXED: usize = 12;
+
+/// How the review fits a terminal: the commands come first, because every
+/// command that will run must be visible. Folders give way before commands
+/// do; commands drop their "via" line before they are cut; and when even
+/// that is not enough the review says so (and `y` is refused).
+#[derive(Clone, Copy, Debug)]
+pub struct ReviewLayout {
+    pub width: u16,
+    pub height: u16,
+    /// Commands take one line each (the "via <program>" line is dropped).
+    pub compact: bool,
+    pub shown_items: usize,
+    pub shown_commands: usize,
+    /// Some command cannot be shown at this size.
+    pub clipped: bool,
+}
+
+pub fn review_layout(area: Rect, r: &Review) -> ReviewLayout {
     let width = area.width.saturating_sub(4).min(96);
-    let command_lines = if r.commands.is_empty() {
-        0
+    let n = r.commands.len();
+    let full = if n == 0 { 0 } else { n * 2 + 2 };
+    let compact_lines = if n == 0 { 0 } else { n + 2 };
+    let max_h = area.height.saturating_sub(2) as usize;
+    let height = (r.items.len() + full + 14).min(max_h).max(13);
+    let inner = height.min(max_h).saturating_sub(2);
+    let (compact, cmd_lines, clipped) = if REVIEW_FIXED + full <= inner {
+        (false, full, false)
+    } else if REVIEW_FIXED + compact_lines <= inner {
+        (true, compact_lines, false)
     } else {
-        r.commands.len() * 2 + 2
+        (true, compact_lines, n > 0)
     };
-    let wanted = (r.items.len() + command_lines) as u16 + 14;
-    let height = wanted.min(area.height.saturating_sub(2)).max(13);
+    let shown_commands = if clipped {
+        inner.saturating_sub(REVIEW_FIXED + 3)
+    } else {
+        n
+    };
+    let used = if clipped {
+        shown_commands + 3
+    } else {
+        cmd_lines
+    };
+    let room = inner.saturating_sub(REVIEW_FIXED + used);
+    let shown_items = r.items.len().min(if n == 0 { room.max(1) } else { room });
+    ReviewLayout {
+        width,
+        height: height as u16,
+        compact,
+        shown_items,
+        shown_commands,
+        clipped,
+    }
+}
+
+fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
+    let lay = review_layout(area, r);
+    let (width, height) = (lay.width, lay.height);
     let Some(inner) = popup(
         frame,
         area,
@@ -159,7 +209,6 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
     ) else {
         return;
     };
-    let room = (inner.height as usize).saturating_sub(12 + command_lines);
     let name_w = (inner.width as usize).saturating_sub(34);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -171,7 +220,7 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
         ),
         Style::default().fg(DIM),
     )));
-    let shown = r.items.len().min(room.max(1));
+    let shown = lay.shown_items;
     for item in r.items.iter().take(shown) {
         lines.push(Line::from(vec![
             Span::styled(
@@ -205,7 +254,7 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
             ),
             Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
         )));
-        for c in &r.commands {
+        for c in r.commands.iter().take(lay.shown_commands) {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", g.dot()), Style::default().fg(DANGER)),
                 Span::styled(
@@ -217,12 +266,24 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
                     Style::default().fg(DIM),
                 ),
             ]));
+            if !lay.compact {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    via {}",
+                        fit_start(&c.spec.program, (inner.width as usize).saturating_sub(8), g)
+                    ),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+        if lay.clipped {
             lines.push(Line::from(Span::styled(
                 format!(
-                    "    via {}",
-                    fit_start(&c.spec.program, (inner.width as usize).saturating_sub(8), g)
+                    "{} and {} more command(s): make the terminal taller to see them (y is off)",
+                    g.ellipsis(),
+                    r.commands.len() - lay.shown_commands
                 ),
-                Style::default().fg(DIM),
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
             )));
         }
     }
@@ -242,7 +303,12 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
         ));
     }
     let sp = r.space;
-    if sp.frees_now >= sp.footprint {
+    if !r.space_ready {
+        lines.push(Line::from(Span::styled(
+            format!("Working out what this frees{}", g.ellipsis()),
+            Style::default().fg(DIM),
+        )));
+    } else if sp.frees_now >= sp.footprint {
         lines.push(Line::from(Span::styled(
             "Deleting for good frees all of it right now.",
             Style::default().fg(SAFE),
@@ -288,6 +354,8 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
             g,
             &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],
         ));
+    } else if lay.clipped {
+        lines.push(key_line(g, &[("Esc", "Cancel")]));
     } else {
         // Commands cannot be undone, so Enter does nothing here.
         lines.push(key_line(
@@ -634,5 +702,67 @@ mod tests {
             assert!(r.width <= 80 && r.height <= 12 && r.width >= 3);
         }
         assert_eq!(grown(Rect::new(0, 0, 0, 0), 80, 12, 0.5).area(), 0);
+    }
+}
+
+#[cfg(test)]
+mod review_layout_tests {
+    use super::*;
+    use crate::app::{Review, ReviewCommand, ReviewItem};
+    use crate::catalog::CommandSpec;
+    use crate::safety::Safety;
+    use crate::usage::Usage;
+
+    fn review(items: usize, commands: usize) -> Review {
+        Review {
+            items: (0..items)
+                .map(|i| ReviewItem {
+                    path: format!("/x/{i}").into(),
+                    usage: Usage::default(),
+                    safety: Safety::Safe,
+                })
+                .collect(),
+            commands: (0..commands)
+                .map(|i| ReviewCommand {
+                    id: format!("c{i}"),
+                    tool: "t".to_string(),
+                    line: format!("tool{i} clean"),
+                    spec: CommandSpec::new("tool", &["clean"]),
+                    up_to: 0,
+                })
+                .collect(),
+            total: Usage::default(),
+            space: Default::default(),
+            space_ready: true,
+        }
+    }
+
+    #[test]
+    fn plenty_of_room_shows_everything_in_full() {
+        let l = review_layout(Rect::new(0, 0, 140, 50), &review(3, 2));
+        assert!(!l.clipped && !l.compact);
+        assert_eq!((l.shown_items, l.shown_commands), (3, 2));
+    }
+
+    #[test]
+    fn many_commands_on_a_short_terminal_drop_the_via_lines_first() {
+        let l = review_layout(Rect::new(0, 0, 140, 30), &review(2, 10));
+        assert!(l.compact, "{l:?}");
+        assert!(!l.clipped, "{l:?}");
+        assert_eq!(l.shown_commands, 10);
+    }
+
+    #[test]
+    fn when_the_commands_cannot_fit_the_review_says_so() {
+        let l = review_layout(Rect::new(0, 0, 140, 20), &review(2, 10));
+        assert!(l.clipped, "{l:?}");
+        assert!(l.shown_commands < 10);
+    }
+
+    #[test]
+    fn folders_alone_never_count_as_clipped() {
+        let l = review_layout(Rect::new(0, 0, 140, 16), &review(200, 0));
+        assert!(!l.clipped);
+        assert!(l.shown_items >= 1);
     }
 }

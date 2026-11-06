@@ -71,6 +71,7 @@ const SAFE_DIR_NAMES: &[&str] = &["node_modules", ".next", ".turbo", "DerivedDat
 /// music, saved media, downloaded models, synced files. Matched as lowercase
 /// fragments of the folder name (bundle ids included).
 const OFFLINE_DATA_HINTS: &[&str] = &[
+    // Music, video, reading and chat apps that keep downloads or media.
     "spotify",
     "telegram",
     "keepcoder",
@@ -86,23 +87,41 @@ const OFFLINE_DATA_HINTS: &[&str] = &[
     "podcast",
     "com.apple.music",
     "com.apple.tv",
+    "steam",
+    // Sync clients: the cache can be the only local copy of a file.
     "dropbox",
     "onedrive",
     "drivefs",
+    "pcloud",
+    "syncthing",
     "lightroom",
+    // Downloaded machine-learning models: large and slow to fetch again.
     "huggingface",
     "whisper",
     "torch",
     "lm-studio",
     "ollama",
+    "mlx",
+    "transformers",
+    "gpt4all",
+    "diffusers",
+    "modelscope",
 ];
 
 /// Does a cache folder with this name probably hold offline downloads or
 /// saved media that is slow or impossible to get back? Such folders may still
-/// be deleted, but they are never shown as safe.
+/// be deleted, but they are never shown as safe. A hint counts only where a
+/// word starts (`plex` matches `com.plexapp.x`, not `perplexity`).
 pub fn keeps_offline_data(name: &str) -> bool {
     let name = name.to_lowercase();
-    !name.is_empty() && OFFLINE_DATA_HINTS.iter().any(|h| name.contains(h))
+    OFFLINE_DATA_HINTS.iter().any(|hint| {
+        name.match_indices(hint).any(|(at, _)| {
+            name[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric())
+        })
+    })
 }
 
 /// Canonicalize as much of `path` as exists, then append the rest unchanged.
@@ -383,10 +402,35 @@ mod tests {
             "spotify",
             "com.spotify.client",
             "ru.keepcoder.Telegram",
+            "com.plexapp.plexmediaserver",
+            "SteamPlayer",
+            "steam",
+            "org.signalapp.Signal",
+            "huggingface",
+            "mlx",
+            "transformers",
+            "gpt4all",
+            "diffusers",
+            "modelscope",
+            "pCloud Drive",
+            "com.getdropbox.dropbox",
         ] {
             assert!(keeps_offline_data(name), "{name}");
         }
         for name in ["Homebrew", "go-build", "", "uv"] {
+            assert!(!keeps_offline_data(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn offline_data_hint_matches_the_start_of_a_word_not_any_substring() {
+        // These only contain a hint in the middle of a word.
+        for name in [
+            "ai.perplexity.mac",
+            "Complex",
+            "com.example.Mastorch",
+            "Designal",
+        ] {
             assert!(!keeps_offline_data(name), "{name}");
         }
     }

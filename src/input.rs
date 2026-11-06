@@ -533,6 +533,7 @@ mod tests {
                 })
                 .collect(),
             total: Usage::default(),
+            space_ready: true,
             space: Default::default(),
         })
     }

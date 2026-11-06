@@ -103,12 +103,59 @@ pub struct Candidate {
     pub project: PathBuf,
 }
 
+/// Folders that hold installed software, not projects: editors' extensions,
+/// Node and Rust version managers, app bundles, pnpm's global folder. A
+/// `node_modules` in there is part of the software and cannot be reinstalled
+/// with `npm install`, so nothing inside is ever offered.
+fn is_install_tree(node: &Node) -> bool {
+    const NAMES: &[&str] = &[
+        ".vscode",
+        ".vscode-server",
+        ".cursor",
+        ".nvm",
+        ".fnm",
+        ".volta",
+        ".rustup",
+        ".cargo",
+        ".pyenv",
+        ".rbenv",
+        ".asdf",
+        ".sdkman",
+    ];
+    const UNDER: &[(&str, &str)] = &[
+        ("Library", "Application Support"),
+        ("Library", "pnpm"),
+        ("share", "fnm"),
+        ("share", "nvm"),
+        ("share", "pnpm"),
+    ];
+    let name = node.name.to_string_lossy();
+    if NAMES.contains(&name.as_ref())
+        || name.ends_with(".app")
+        || name.ends_with(".framework")
+        || name.ends_with(".xcodeproj")
+        || name.ends_with(".xcworkspace")
+    {
+        return true;
+    }
+    let parent = node
+        .path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    UNDER.iter().any(|(p, n)| *p == parent && *n == name)
+}
+
 /// Walk the scanned folders and list every project artifact. A folder that
 /// matched is not entered, so nested copies are not listed on their own.
 pub fn detect_artifacts(root: &Arc<Node>) -> Vec<Candidate> {
     let mut out = Vec::new();
     let mut stack = vec![Arc::clone(root)];
     while let Some(node) = stack.pop() {
+        if is_install_tree(&node) {
+            continue;
+        }
         let name = node.name.to_string_lossy();
         let kind = node.path.parent().and_then(|project| {
             ALL.iter()
@@ -122,6 +169,11 @@ pub fn detect_artifacts(root: &Arc<Node>) -> Vec<Candidate> {
                 kind,
                 node: Arc::clone(&node),
             });
+            continue;
+        }
+        // Whatever sits inside an unmatched `node_modules` is a dependency
+        // (or a global package), never a project of its own.
+        if name == "node_modules" {
             continue;
         }
         stack.extend(node.children());
@@ -255,6 +307,46 @@ mod tests {
             found(r),
             vec![("ios/build".to_string(), ArtifactKind::XcodeBuild)]
         );
+    }
+
+    #[test]
+    fn never_offers_app_or_tool_install_trees() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        for project in [
+            ".vscode/extensions/ext-1.0",
+            ".cursor/extensions/ext-2.0",
+            ".nvm/versions/node/v20.0.0/lib/node_modules/npm",
+            ".local/share/fnm/node-versions/v22.0.0/installation/lib/node_modules/npm",
+            ".volta/tools/image/node/20/lib/node_modules/npm",
+            ".cargo/registry/src/x",
+            "Applications/Foo.app/Contents/Resources/app",
+            "Library/Application Support/Code/x",
+            "Library/pnpm/global/5",
+        ] {
+            write(&r.join(project).join("package.json"), 10);
+            write(&r.join(project).join("node_modules/dep/index.js"), 100);
+        }
+        // A real project next to them is still found.
+        write(&r.join("dev/shop/package.json"), 10);
+        write(&r.join("dev/shop/node_modules/dep/index.js"), 100);
+        assert_eq!(
+            found(r),
+            vec![(
+                "dev/shop/node_modules".to_string(),
+                ArtifactKind::NodeModules
+            )]
+        );
+    }
+
+    #[test]
+    fn a_global_package_inside_node_modules_is_not_a_project() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        // lib/node_modules/<pkg>/node_modules with no project marker beside lib.
+        write(&r.join("lib/node_modules/pkg/package.json"), 10);
+        write(&r.join("lib/node_modules/pkg/node_modules/dep/i.js"), 10);
+        assert!(found(r).is_empty());
     }
 
     #[test]

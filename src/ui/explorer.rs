@@ -162,12 +162,15 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 
     // Marked summary.
-    let marked = format!(
+    let mut marked = format!(
         "marked: {} items, {} (not deleted yet)",
         app.marks.len(),
         both_usage(app.marked())
     );
-    let style = if app.marks.is_empty() {
+    if !app.tool_marks.is_empty() {
+        marked.push_str(&format!(" + {} tool cleanup(s)", app.tool_marks.len()));
+    }
+    let style = if app.marks.is_empty() && app.tool_marks.is_empty() {
         Style::default().fg(DIM)
     } else {
         Style::default()

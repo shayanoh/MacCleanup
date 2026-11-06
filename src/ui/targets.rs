@@ -106,6 +106,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.tlines.is_empty() {
         let msg = if app.filter.active() {
             "(nothing matches the filter)".to_string()
+        } else if app.targets_building() {
+            format!("(building the list{})", g.ellipsis())
         } else if app.scanner.is_idle() {
             "(nothing to clean was found in the scan)".to_string()
         } else {
@@ -198,6 +200,22 @@ fn status_line(app: &App, width: usize) -> TextLine<'static> {
             g.dot(),
             g.ellipsis()
         )));
+    }
+    if app.targets_building() && app.targets.groups.is_empty() {
+        spans.push(Span::raw(format!(
+            " {} building the list{}",
+            g.dot(),
+            g.ellipsis()
+        )));
+    }
+    if app.fda_missing {
+        spans.push(Span::styled(
+            format!(
+                " {} Full Disk Access is missing: some caches cannot be listed",
+                g.warn()
+            ),
+            Style::default().fg(Color::Yellow),
+        ));
     }
     if app.stack[0].path != app.policy.home() {
         spans.push(Span::styled(
