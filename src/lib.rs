@@ -6,4 +6,5 @@ pub mod perms;
 pub mod safety;
 pub mod scan;
 pub mod softdelete;
+pub mod treemap;
 pub mod volume;
