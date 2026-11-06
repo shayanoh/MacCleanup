@@ -17,12 +17,13 @@ pub fn removal_spec(cli: &DockerCli, data: &DockerData, id: &str) -> Option<Comm
     if let Some(raw) = id.strip_prefix("image:") {
         let image = data.images.iter().find(|i| i.id == raw)?;
         let mut args = vec!["image", "rm"];
-        if image.tags.len() > 1 {
-            // An id with several tags is refused unless forced; removing
-            // every tag removes the image when the last one goes.
-            args.extend(image.tags.iter().map(String::as_str));
-        } else {
+        if image.tags.is_empty() {
             args.push(raw);
+        } else {
+            // By tag: readable in the review, and an id with several tags is
+            // refused unless forced. Removing every tag removes the image
+            // when the last one goes.
+            args.extend(image.tags.iter().map(String::as_str));
         }
         return Some(cli.cli(&args));
     }
@@ -91,10 +92,15 @@ mod tests {
     fn containers_volumes_and_single_tag_images_are_removed_by_name_or_id() {
         assert_eq!(args("container:c1")[1..], ["container", "rm", "c1"]);
         assert_eq!(args("volume:data")[1..], ["volume", "rm", "data"]);
-        assert_eq!(args("image:sha256:one")[1..], ["image", "rm", "sha256:one"]);
+        assert_eq!(
+            args("image:sha256:one")[1..],
+            ["image", "rm", "a:1"],
+            "a tagged image is removed by its tag: readable in the review"
+        );
         assert_eq!(
             args("image:sha256:none")[1..],
-            ["image", "rm", "sha256:none"]
+            ["image", "rm", "sha256:none"],
+            "a dangling one has only its id"
         );
     }
 
