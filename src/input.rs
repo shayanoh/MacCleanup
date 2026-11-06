@@ -33,12 +33,14 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Esc => Some(if app.filter.active() {
             Action::FilterClear
-        } else if app.stack.len() > 1 {
+        } else if app.screen == Screen::Explorer && app.stack.len() > 1 {
             Action::Out
         } else {
             Action::Quit
         }),
-        KeyCode::Char('/') if app.screen == Screen::Explorer => Some(Action::FilterOpen),
+        KeyCode::Char('/') if matches!(app.screen, Screen::Explorer | Screen::Targets) => {
+            Some(Action::FilterOpen)
+        }
         KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
         KeyCode::Char('h') | KeyCode::Left => Some(Action::Out),
@@ -58,6 +60,7 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('1') => Some(Action::GoTo(Screen::Home)),
         KeyCode::Char('2') => Some(Action::GoTo(Screen::Explorer)),
         KeyCode::Char('3') => Some(Action::GoTo(Screen::Holding)),
+        KeyCode::Char('4') => Some(Action::GoTo(Screen::Targets)),
         KeyCode::Char('r') if app.screen == Screen::Holding => Some(Action::RestoreSelected),
         KeyCode::Char('D') if app.screen == Screen::Holding => Some(Action::DeleteSelectedForever),
         KeyCode::Char('E') if app.screen == Screen::Holding => Some(Action::EmptyAll),
@@ -188,6 +191,7 @@ mod tests {
             (ch('1'), Some(Action::GoTo(Screen::Home))),
             (ch('2'), Some(Action::GoTo(Screen::Explorer))),
             (ch('3'), Some(Action::GoTo(Screen::Holding))),
+            (ch('4'), Some(Action::GoTo(Screen::Targets))),
             (key(KeyCode::Esc), Some(Action::Quit)),
             // Dialog-only and holding-only keys do nothing here.
             (ch('x'), None),

@@ -9,6 +9,7 @@ pub mod graph;
 pub mod holding;
 pub mod home;
 pub mod sidebar;
+pub mod targets;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -25,7 +26,7 @@ use crate::safety::Safety;
 
 pub const MIN_WIDTH: u16 = 60;
 pub const MIN_HEIGHT: u16 = 14;
-pub const SIDEBAR_WIDTH: u16 = 16;
+pub const SIDEBAR_WIDTH: u16 = 22;
 
 pub const ACCENT: Color = Color::Cyan;
 pub const DIM: Color = Color::DarkGray;
@@ -212,6 +213,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Home => home::render(frame, main, app),
         Screen::Explorer => explorer::render(frame, main, app),
+        Screen::Targets => targets::render(frame, main, app),
         Screen::Holding => holding::render(frame, main, app),
     }
     wipe(frame, main, app);
@@ -283,7 +285,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         &[
             "j/k choose",
             "enter open",
-            "1/2/3 jump",
+            "1/2/3/4 jump",
             "tab focus list",
             "q quit",
         ]
@@ -307,6 +309,16 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 "[ ] resize",
                 "s sort",
                 "g/G top/bottom",
+                "tab menu",
+                "q quit",
+            ],
+            Screen::Targets => &[
+                "j/k move",
+                "h/l fold/open",
+                "/ filter",
+                "r rescan",
+                "t graph type",
+                "s sort",
                 "tab menu",
                 "q quit",
             ],

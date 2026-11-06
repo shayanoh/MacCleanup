@@ -58,7 +58,10 @@ pub fn env_with(files: &[(&str, usize)], setup: impl FnOnce(&Path)) -> Env {
         Accounting::new(free),
         Glyphs::new(GlyphMode::Nerd),
         false,
-    );
+    )
+    .with_runner(std::sync::Arc::new(
+        crate::catalog::command::FakeRunner::new(&[]),
+    ));
     // The app starts on Home; most tests exercise the explorer.
     app.update(Action::GoTo(Screen::Explorer));
     Env {
@@ -121,4 +124,17 @@ pub fn clone_file(from: &Path, to: &Path) {
         .unwrap()
         .success();
     assert!(ok, "cp -c failed: this test needs an APFS volume");
+}
+
+/// Tick until the background look for installed tools has finished.
+pub fn wait_tools(app: &mut App) {
+    for _ in 0..2000 {
+        app.update(Action::Tick);
+        if !app.tools_looking() && app.scanner.is_idle() {
+            app.update(Action::Tick);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("tool discovery did not finish");
 }

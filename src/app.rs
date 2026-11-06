@@ -1,11 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use ratatui::layout::Rect;
 
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
+use crate::catalog::{CommandRunner, SystemRunner, ToolEntry, discover_tools};
 use crate::filter;
 use crate::fmt::both_usage;
 use crate::glyphs::Glyphs;
@@ -13,6 +14,7 @@ use crate::jobs::{DeleteEvent, DeleteJob, DeleteMode, Phase};
 use crate::safety::{Policy, Safety};
 use crate::scan::{Node, Row, Scanner, Space, file_space, locate};
 use crate::softdelete::{HeldItem, Holding};
+use crate::targets::{Line, SectionKind, TRow, Targets};
 use crate::usage::Usage;
 use crate::volume;
 
@@ -20,6 +22,7 @@ use crate::volume;
 pub enum Screen {
     Home,
     Explorer,
+    Targets,
     Holding,
 }
 
@@ -54,7 +57,7 @@ pub struct SidebarEntry {
     pub screen: Option<Screen>,
 }
 
-pub const SIDEBAR: [SidebarEntry; 8] = [
+pub const SIDEBAR: [SidebarEntry; 7] = [
     SidebarEntry {
         label: "Home",
         screen: Some(Screen::Home),
@@ -72,15 +75,11 @@ pub const SIDEBAR: [SidebarEntry; 8] = [
         screen: None,
     },
     SidebarEntry {
-        label: "Caches",
-        screen: None,
+        label: "Caches & Projects",
+        screen: Some(Screen::Targets),
     },
     SidebarEntry {
         label: "Docker",
-        screen: None,
-    },
-    SidebarEntry {
-        label: "Projects",
         screen: None,
     },
     SidebarEntry {
@@ -258,6 +257,14 @@ pub struct Detail {
     pub complete: bool,
 }
 
+/// What a Caches & Projects line stands for (survives a rebuild of the list).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LineKey {
+    Section(SectionKind),
+    Group(String),
+    Row(PathBuf),
+}
+
 pub struct App {
     pub screen: Screen,
     pub focus: Focus,
@@ -306,6 +313,19 @@ pub struct App {
     pub holding: Arc<Holding>,
     rows_synced_done: bool,
     pending_select: Option<PathBuf>,
+    /// The Caches & Projects list: built groups, the visible lines and the cursor.
+    pub targets: Targets,
+    pub tlines: Vec<Line>,
+    pub tcursor: usize,
+    pub toffset: usize,
+    /// Tool caches found by asking the installed tools (empty until looked up).
+    pub tool_entries: Vec<ToolEntry>,
+    tools_rx: Option<mpsc::Receiver<Vec<ToolEntry>>>,
+    tools_started: bool,
+    /// Keys of the groups the user folded (kept across rebuilds).
+    closed_groups: HashSet<String>,
+    targets_synced: bool,
+    pub runner: Arc<dyn CommandRunner>,
     job: Option<DeleteJob>,
     job_mode: DeleteMode,
     job_free_before: u64,
@@ -407,6 +427,16 @@ impl App {
             holding: Arc::new(holding),
             rows_synced_done: false,
             pending_select: None,
+            targets: Targets::default(),
+            tlines: Vec::new(),
+            tcursor: 0,
+            toffset: 0,
+            tool_entries: Vec::new(),
+            tools_rx: None,
+            tools_started: false,
+            closed_groups: HashSet::new(),
+            targets_synced: false,
+            runner: Arc::new(SystemRunner),
             job: None,
             job_mode: DeleteMode::SoftOnly,
             job_free_before: 0,
@@ -416,6 +446,12 @@ impl App {
         app.refresh_rows();
         app.refresh_held();
         app
+    }
+
+    /// Use another way of running tool commands (tests pass a fake).
+    pub fn with_runner(mut self, runner: Arc<dyn CommandRunner>) -> App {
+        self.runner = runner;
+        self
     }
 
     pub fn current(&self) -> &Arc<Node> {
@@ -469,6 +505,7 @@ impl App {
         let vis = self.visible_rows();
         self.offset = window(self.cursor, self.offset, vis);
         self.held_offset = window(self.held_cursor, self.held_offset, vis);
+        self.toffset = window(self.tcursor, self.toffset, vis);
     }
 
     /// Re-list the current directory, keeping the cursor on the same path.
@@ -515,6 +552,15 @@ impl App {
     /// Re-apply the query. While typing the selection jumps to the first
     /// match; `keep_selection` keeps the same row selected when it survives.
     fn refilter(&mut self, keep_selection: bool) {
+        if self.screen == Screen::Targets {
+            let keep = keep_selection.then(|| self.sel_of(self.tcursor)).flatten();
+            self.rebuild_tlines(keep);
+            if !keep_selection {
+                self.tcursor = 0;
+                self.toffset = 0;
+            }
+            return;
+        }
         let keep = keep_selection
             .then(|| self.selected_row().map(|r| r.path.clone()))
             .flatten();
@@ -532,7 +578,7 @@ impl App {
     }
 
     fn filter_open(&mut self) {
-        if self.screen != Screen::Explorer {
+        if !matches!(self.screen, Screen::Explorer | Screen::Targets) {
             return;
         }
         self.focus = Focus::Main;
@@ -695,7 +741,11 @@ impl App {
                     SortBy::Disk => SortBy::Frees,
                     SortBy::Frees => SortBy::Name,
                 };
-                self.refresh_rows();
+                if self.screen == Screen::Targets {
+                    self.rebuild_targets();
+                } else {
+                    self.refresh_rows();
+                }
             }
             Action::FocusToggle => {
                 self.focus = match self.focus {
@@ -745,6 +795,13 @@ impl App {
         if self.tick.is_multiple_of(20) {
             self.refresh_free();
         }
+        self.poll_discovery();
+        if self.screen == Screen::Targets {
+            let idle = self.scanner.is_idle();
+            if (!idle && self.tick.is_multiple_of(10)) || (idle && !self.targets_synced) {
+                self.rebuild_targets();
+            }
+        }
         if self.screen == Screen::Explorer {
             let done = self.current().is_done();
             let busy_refresh = !done && self.tick.is_multiple_of(10);
@@ -774,11 +831,19 @@ impl App {
 
     fn goto(&mut self, screen: Screen) {
         self.filter.editing = false;
+        // The filter belongs to one list; it does not follow to another screen.
+        if (self.screen == Screen::Targets || screen == Screen::Targets) && self.screen != screen {
+            self.reset_filter();
+        }
         self.screen = screen;
         self.transition_start = self.tick;
         match screen {
             Screen::Holding => self.refresh_held(),
             Screen::Explorer => self.refresh_rows(),
+            Screen::Targets => {
+                self.start_discovery();
+                self.rebuild_targets();
+            }
             Screen::Home => {}
         }
         self.refresh_detail();
@@ -787,7 +852,12 @@ impl App {
     fn move_by(&mut self, delta: i64) {
         match (self.focus, self.screen) {
             (Focus::Sidebar, _) => {
-                let order = [Screen::Home, Screen::Explorer, Screen::Holding];
+                let order = [
+                    Screen::Home,
+                    Screen::Explorer,
+                    Screen::Targets,
+                    Screen::Holding,
+                ];
                 let idx = order.iter().position(|s| *s == self.screen).unwrap_or(0) as i64;
                 let next = (idx + delta.signum()).clamp(0, order.len() as i64 - 1) as usize;
                 if order[next] != self.screen {
@@ -803,6 +873,10 @@ impl App {
                 self.held_cursor = step(self.held_cursor, delta, self.held.len());
                 self.ensure_visible();
             }
+            (_, Screen::Targets) => {
+                self.tcursor = step(self.tcursor, delta, self.tlines.len());
+                self.ensure_visible();
+            }
             _ => {}
         }
     }
@@ -816,7 +890,8 @@ impl App {
             self.notice = Some("A scan is still running. Wait for it to finish.".to_string());
             return;
         }
-        let whole = all || self.screen == Screen::Home || self.stack.len() == 1;
+        let whole =
+            all || matches!(self.screen, Screen::Home | Screen::Targets) || self.stack.len() == 1;
         if whole {
             let root_path = self.stack[0].path.clone();
             let Some(root) = self.scanner.rescan_all(&root_path) else {
@@ -852,6 +927,10 @@ impl App {
             self.focus = Focus::Main;
             return;
         }
+        if self.screen == Screen::Targets {
+            self.target_into();
+            return;
+        }
         if self.screen != Screen::Explorer {
             return;
         }
@@ -871,6 +950,10 @@ impl App {
     }
 
     fn leave(&mut self) {
+        if self.focus == Focus::Main && self.screen == Screen::Targets {
+            self.target_out();
+            return;
+        }
         if self.focus != Focus::Main || self.screen != Screen::Explorer || self.stack.len() <= 1 {
             return;
         }
@@ -1038,9 +1121,186 @@ impl App {
                         self.held_cursor = idx;
                     }
                 }
+                Screen::Targets => {
+                    let idx = self.toffset + i;
+                    if idx < self.tlines.len() {
+                        if idx == self.tcursor {
+                            self.target_into();
+                        } else {
+                            self.tcursor = idx;
+                        }
+                    }
+                }
                 Screen::Home => {}
             }
         }
+    }
+
+    // --- Caches & Projects ---------------------------------------------
+
+    /// Is the look for installed tools still running?
+    pub fn tools_looking(&self) -> bool {
+        self.tools_rx.is_some()
+    }
+
+    /// Ask the installed tools where their caches are, once, on a thread.
+    fn start_discovery(&mut self) {
+        if self.tools_started {
+            return;
+        }
+        self.tools_started = true;
+        let (tx, rx) = mpsc::channel();
+        let runner = Arc::clone(&self.runner);
+        let home = self.policy.home().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(discover_tools(&home, runner.as_ref()));
+        });
+        self.tools_rx = Some(rx);
+    }
+
+    fn poll_discovery(&mut self) {
+        let Some(rx) = &self.tools_rx else { return };
+        match rx.try_recv() {
+            Ok(entries) => {
+                self.tool_entries = entries;
+                self.tools_rx = None;
+                self.rebuild_targets();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.tools_rx = None,
+        }
+    }
+
+    /// Build the list again from the scan, keeping the cursor on the same line.
+    pub fn rebuild_targets(&mut self) {
+        let keep = self.sel_of(self.tcursor);
+        let root = Arc::clone(&self.stack[0]);
+        self.targets = Targets::build(
+            &root,
+            self.policy.home(),
+            &self.scanner,
+            &self.policy,
+            &self.tool_entries,
+            &self.closed_groups,
+        );
+        self.targets.sort(self.sort);
+        self.targets_synced = self.scanner.is_idle();
+        self.rebuild_tlines(keep);
+    }
+
+    fn rebuild_tlines(&mut self, keep: Option<LineKey>) {
+        self.tlines = self.targets.lines(&filter::parse(&self.filter.query));
+        let found = keep.and_then(|k| self.index_of(&k));
+        self.tcursor = found
+            .unwrap_or(self.tcursor)
+            .min(self.tlines.len().saturating_sub(1));
+        self.ensure_visible();
+    }
+
+    /// What a line stands for, so the cursor can follow it across rebuilds.
+    fn sel_of(&self, idx: usize) -> Option<LineKey> {
+        Some(match *self.tlines.get(idx)? {
+            Line::Section(k) => LineKey::Section(k),
+            Line::Group(g) => LineKey::Group(self.targets.groups.get(g)?.key()),
+            Line::Row { group, row } => LineKey::Row(
+                self.targets
+                    .groups
+                    .get(group)?
+                    .rows
+                    .get(row)?
+                    .row
+                    .path
+                    .clone(),
+            ),
+        })
+    }
+
+    fn index_of(&self, key: &LineKey) -> Option<usize> {
+        self.tlines.iter().position(|l| match (*l, key) {
+            (Line::Section(a), LineKey::Section(b)) => a == *b,
+            (Line::Group(g), LineKey::Group(k)) => {
+                self.targets.groups.get(g).is_some_and(|x| x.key() == *k)
+            }
+            (Line::Row { group, row }, LineKey::Row(p)) => self
+                .targets
+                .groups
+                .get(group)
+                .and_then(|g| g.rows.get(row))
+                .is_some_and(|r| r.row.path == *p),
+            _ => false,
+        })
+    }
+
+    /// The row under the cursor on the Caches & Projects screen.
+    pub fn selected_target(&self) -> Option<&TRow> {
+        match *self.tlines.get(self.tcursor)? {
+            Line::Row { group, row } => self.targets.groups.get(group)?.rows.get(row),
+            _ => None,
+        }
+    }
+
+    /// `l`, Enter or a second click: open a folded group, or show a row in the Explorer.
+    fn target_into(&mut self) {
+        match self.tlines.get(self.tcursor).copied() {
+            Some(Line::Group(g)) => self.set_fold(g, true),
+            Some(Line::Row { .. }) => {
+                if let Some(path) = self.selected_target().map(|t| t.row.path.clone()) {
+                    self.show_in_explorer(&path);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `h`: fold the group the cursor is in (and move to its header).
+    fn target_out(&mut self) {
+        match self.tlines.get(self.tcursor).copied() {
+            Some(Line::Group(g)) | Some(Line::Row { group: g, .. }) => self.set_fold(g, false),
+            _ => {}
+        }
+    }
+
+    fn set_fold(&mut self, group: usize, open: bool) {
+        let Some(key) = self.targets.groups.get(group).map(|g| g.key()) else {
+            return;
+        };
+        if open {
+            self.closed_groups.remove(&key);
+        } else {
+            self.closed_groups.insert(key.clone());
+        }
+        if let Some(g) = self.targets.groups.get_mut(group) {
+            g.open = open;
+        }
+        self.rebuild_tlines(Some(LineKey::Group(key)));
+    }
+
+    /// Go to the Explorer showing `path`'s folder with `path` selected.
+    fn show_in_explorer(&mut self, path: &Path) {
+        let Some(stack) = path.parent().and_then(|dir| self.stack_to(dir)) else {
+            self.notice = Some("That folder is not in the scan".to_string());
+            return;
+        };
+        self.stack = stack;
+        self.pending_select = Some(path.to_path_buf());
+        self.cursor = 0;
+        self.offset = 0;
+        self.rows.clear();
+        self.goto(Screen::Explorer);
+        self.focus = Focus::Main;
+    }
+
+    /// The chain of scanned folders from the scan root down to `dir`.
+    fn stack_to(&self, dir: &Path) -> Option<Vec<Arc<Node>>> {
+        let root = &self.stack[0];
+        let rel = dir.strip_prefix(&root.path).ok()?;
+        let mut chain = vec![Arc::clone(root)];
+        for c in rel.components() {
+            let cur = chain.last()?;
+            let next = cur.subdir(&cur.path.join(c))?;
+            chain.push(next);
+        }
+        Some(chain)
     }
 
     // --- soft delete -------------------------------------------------
@@ -1619,6 +1879,8 @@ mod tests {
         assert_eq!(app.screen, Screen::Home);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Explorer);
+        app.update(Action::Down);
+        assert_eq!(app.screen, Screen::Targets);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Holding);
         app.update(Action::Into);
@@ -2875,5 +3137,196 @@ mod tests {
                 .clone();
             assert_eq!(app.weight(&plain), plain.frees.unwrap());
         }
+    }
+
+    // --- Caches & Projects screen ------------------------------------
+
+    use crate::targets::{Line, SectionKind};
+    use crate::testutil::{env_with, wait_tools};
+
+    const TARGET_FILES: &[(&str, usize)] = &[
+        ("shop/package.json", 10),
+        ("shop/node_modules/a/i.js", 30_000),
+        ("shop/.next/c", 10_000),
+        ("api/Cargo.toml", 10),
+        ("api/target/x", 90_000),
+        ("Library/Caches/Spotify/blob", 50_000),
+    ];
+
+    fn targets_app() -> crate::testutil::Env {
+        let mut e = env_with(TARGET_FILES, |_| {});
+        e.app.update(Action::GoTo(Screen::Targets));
+        wait_tools(&mut e.app);
+        e
+    }
+
+    fn line_names(app: &App) -> Vec<String> {
+        app.tlines
+            .iter()
+            .map(|l| match *l {
+                Line::Section(SectionKind::Projects) => "PROJECTS".to_string(),
+                Line::Section(SectionKind::Tools) => "TOOLS".to_string(),
+                Line::Group(g) => app.targets.groups[g].title.clone(),
+                Line::Row { group, row } => app
+                    .targets
+                    .row(group, row)
+                    .row
+                    .name
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .collect()
+    }
+
+    fn put_cursor_on(app: &mut App, name: &str) {
+        let at = line_names(app)
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("no line {name} in {:?}", line_names(app)));
+        app.tcursor = at;
+    }
+
+    #[test]
+    fn targets_screen_lists_projects_before_tools() {
+        let e = targets_app();
+        let names = line_names(&e.app);
+        assert_eq!(names[0], "PROJECTS");
+        let tools = names.iter().position(|n| n == "TOOLS").unwrap();
+        assert!(names[..tools].contains(&"~/shop".to_string()));
+        assert!(names[..tools].contains(&"target".to_string()));
+        assert!(names[tools..].contains(&"App caches".to_string()));
+        assert!(names[tools..].contains(&"Spotify".to_string()));
+    }
+
+    #[test]
+    fn tool_discovery_never_blocks_the_screen_switch() {
+        let mut e = env_with(TARGET_FILES, |_| {});
+        e.app.update(Action::GoTo(Screen::Targets));
+        assert!(e.app.tools_looking(), "discovery runs in the background");
+        // Project artifacts are already listed while tools are still looked up.
+        assert!(line_names(&e.app).contains(&"node_modules".to_string()));
+        wait_tools(&mut e.app);
+        assert!(!e.app.tools_looking());
+    }
+
+    #[test]
+    fn h_folds_a_group_and_l_unfolds_it() {
+        let mut e = targets_app();
+        let app = &mut e.app;
+        put_cursor_on(app, "target");
+        app.focus = Focus::Main;
+        app.update(Action::Out);
+        assert_eq!(
+            line_names(app)[app.tcursor],
+            "~/api",
+            "cursor moves to the group"
+        );
+        assert!(!line_names(app).contains(&"target".to_string()));
+        app.update(Action::Into);
+        assert!(line_names(app).contains(&"target".to_string()));
+    }
+
+    #[test]
+    fn a_fold_survives_a_rebuild() {
+        let mut e = targets_app();
+        let app = &mut e.app;
+        put_cursor_on(app, "~/api");
+        app.focus = Focus::Main;
+        app.update(Action::Out);
+        app.update(Action::Tick);
+        for _ in 0..30 {
+            app.update(Action::Tick);
+        }
+        assert!(!line_names(app).contains(&"target".to_string()));
+    }
+
+    #[test]
+    fn enter_on_a_row_opens_it_in_the_explorer() {
+        let mut e = targets_app();
+        let app = &mut e.app;
+        put_cursor_on(app, "node_modules");
+        app.focus = Focus::Main;
+        app.update(Action::Into);
+        assert_eq!(app.screen, Screen::Explorer);
+        assert_eq!(app.current().path, e.home.join("shop"));
+        assert_eq!(app.selected_row().unwrap().name, "node_modules");
+    }
+
+    #[test]
+    fn sort_cycle_on_targets_follows_the_header_order() {
+        let mut e = targets_app();
+        let app = &mut e.app;
+        assert_eq!(app.sort, SortBy::Disk);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            app.update(Action::CycleSort);
+            seen.push(app.sort);
+        }
+        assert_eq!(
+            seen,
+            [SortBy::Frees, SortBy::Name, SortBy::Size, SortBy::Disk]
+        );
+        app.update(Action::CycleSort);
+        app.update(Action::CycleSort);
+        assert_eq!(app.sort, SortBy::Name);
+        let names = line_names(app);
+        let api = names.iter().position(|n| n == "~/api").unwrap();
+        let shop = names.iter().position(|n| n == "~/shop").unwrap();
+        assert!(api < shop, "A to Z by name");
+    }
+
+    #[test]
+    fn the_sidebar_has_one_caches_and_projects_entry() {
+        let labels: Vec<_> = SIDEBAR.iter().map(|s| s.label).collect();
+        assert_eq!(labels.iter().filter(|l| l.contains("Caches")).count(), 1);
+        assert!(!labels.contains(&"Projects"));
+        let entry = SIDEBAR
+            .iter()
+            .find(|s| s.label == "Caches & Projects")
+            .unwrap();
+        assert_eq!(entry.screen, Some(Screen::Targets));
+    }
+
+    #[test]
+    fn the_filter_narrows_target_rows_and_clear_restores_them() {
+        let mut e = targets_app();
+        let app = &mut e.app;
+        app.focus = Focus::Main;
+        app.update(Action::FilterOpen);
+        assert!(app.filter.editing);
+        for c in "spot".chars() {
+            app.update(Action::FilterChar(c));
+        }
+        let names = line_names(app);
+        assert_eq!(names, ["TOOLS", "App caches", "Spotify"]);
+        app.update(Action::FilterClear);
+        assert!(line_names(app).len() > 3);
+    }
+
+    #[test]
+    fn leaving_targets_drops_its_filter() {
+        let mut e = targets_app();
+        let app = &mut e.app;
+        app.focus = Focus::Main;
+        app.update(Action::FilterOpen);
+        app.update(Action::FilterChar('x'));
+        app.update(Action::GoTo(Screen::Explorer));
+        assert!(!app.filter.active());
+        assert_eq!(app.rows.len(), app.all_rows.len());
+    }
+
+    #[test]
+    fn rescan_on_targets_rescans_everything() {
+        let mut e = targets_app();
+        let app = &mut e.app;
+        app.focus = Focus::Main;
+        app.update(Action::Rescan);
+        assert_eq!(app.stack.len(), 1);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("Rescanning everything")
+        );
     }
 }

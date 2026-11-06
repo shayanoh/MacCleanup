@@ -105,6 +105,11 @@ impl Policy {
         }
     }
 
+    /// The home folder this policy protects around.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
     /// Lexical classification of an absolute path (no filesystem access).
     pub fn classify(&self, path: &Path) -> Safety {
         if !path.is_absolute() || has_parent_dir(path) {
