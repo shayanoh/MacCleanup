@@ -1,6 +1,6 @@
 # MacCleanup: Design
 
-Status: draft for approval. Date: 2026-11-06.
+Status: approved 2026-11-06. Milestone 1 (explorer, safety layer, soft delete, graphs, accounting, finish screen) is implemented; the other feature areas are planned. Date: 2026-11-06.
 Convention: **[User]** = decided by the user. **[My call]** = decided by the author, open to change.
 
 ## 1. Intent and why
