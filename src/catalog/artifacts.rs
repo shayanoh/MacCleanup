@@ -18,9 +18,15 @@ pub enum ArtifactKind {
     DartTool,
     Pods,
     FlutterBuild,
+    GradleBuild,
+    GradleCache,
+    MavenTarget,
+    SwiftBuild,
+    PythonBuild,
+    PythonDist,
 }
 
-const ALL: [ArtifactKind; 8] = [
+const ALL: [ArtifactKind; 14] = [
     ArtifactKind::NodeModules,
     ArtifactKind::Next,
     ArtifactKind::Turbo,
@@ -29,6 +35,12 @@ const ALL: [ArtifactKind; 8] = [
     ArtifactKind::DartTool,
     ArtifactKind::Pods,
     ArtifactKind::FlutterBuild,
+    ArtifactKind::GradleBuild,
+    ArtifactKind::GradleCache,
+    ArtifactKind::MavenTarget,
+    ArtifactKind::SwiftBuild,
+    ArtifactKind::PythonBuild,
+    ArtifactKind::PythonDist,
 ];
 
 impl ArtifactKind {
@@ -38,10 +50,16 @@ impl ArtifactKind {
             ArtifactKind::NodeModules => "node_modules",
             ArtifactKind::Next => ".next",
             ArtifactKind::Turbo => ".turbo",
-            ArtifactKind::RustTarget => "target",
-            ArtifactKind::XcodeBuild | ArtifactKind::FlutterBuild => "build",
+            ArtifactKind::RustTarget | ArtifactKind::MavenTarget => "target",
+            ArtifactKind::XcodeBuild
+            | ArtifactKind::FlutterBuild
+            | ArtifactKind::GradleBuild
+            | ArtifactKind::PythonBuild => "build",
             ArtifactKind::DartTool => ".dart_tool",
             ArtifactKind::Pods => "Pods",
+            ArtifactKind::GradleCache => ".gradle",
+            ArtifactKind::SwiftBuild => ".build",
+            ArtifactKind::PythonDist => "dist",
         }
     }
 
@@ -55,7 +73,34 @@ impl ArtifactKind {
             ArtifactKind::DartTool => ".dart_tool",
             ArtifactKind::Pods => "Pods",
             ArtifactKind::FlutterBuild => "build (Flutter)",
+            ArtifactKind::GradleBuild => "build (Gradle)",
+            ArtifactKind::GradleCache => ".gradle",
+            ArtifactKind::MavenTarget => "target (Maven)",
+            ArtifactKind::SwiftBuild => ".build",
+            ArtifactKind::PythonBuild => "build (Python)",
+            ArtifactKind::PythonDist => "dist (Python)",
         }
+    }
+
+    /// Final products live in some of these folders (programs, packages):
+    /// the build output is split into intermediate files and products, and
+    /// the products are only deleted when marked on their own.
+    pub fn split_kind(&self) -> Option<super::split::SplitKind> {
+        use super::split::SplitKind;
+        match self {
+            ArtifactKind::RustTarget => Some(SplitKind::RustTarget),
+            ArtifactKind::SwiftBuild => Some(SplitKind::Swift),
+            ArtifactKind::XcodeBuild => Some(SplitKind::Xcode),
+            ArtifactKind::FlutterBuild => Some(SplitKind::Flutter),
+            ArtifactKind::GradleBuild => Some(SplitKind::Gradle),
+            ArtifactKind::MavenTarget => Some(SplitKind::Maven),
+            _ => None,
+        }
+    }
+
+    /// A folder that is nothing but final products (bulk marks leave it alone).
+    pub fn keeps_by_default(&self) -> bool {
+        matches!(self, ArtifactKind::PythonDist)
     }
 
     /// How the folder comes back after it is deleted.
@@ -68,6 +113,12 @@ impl ArtifactKind {
             ArtifactKind::DartTool => "recreated by flutter pub get",
             ArtifactKind::Pods => "reinstall with pod install",
             ArtifactKind::FlutterBuild => "rebuilt by the next flutter build",
+            ArtifactKind::GradleBuild => "rebuilt by the next gradle build",
+            ArtifactKind::GradleCache => "recreated by the next gradle run",
+            ArtifactKind::MavenTarget => "rebuilt by mvn package",
+            ArtifactKind::SwiftBuild => "rebuilt by swift build (dependencies are fetched again)",
+            ArtifactKind::PythonBuild => "rebuilt by python -m build",
+            ArtifactKind::PythonDist => "the built wheels and sdists; rebuilt by python -m build",
         }
     }
 
@@ -82,6 +133,19 @@ impl ArtifactKind {
                 dir.join("pubspec.yaml").is_file()
             }
             ArtifactKind::Pods => dir.join("Podfile").is_file(),
+            ArtifactKind::GradleBuild | ArtifactKind::GradleCache => [
+                "build.gradle",
+                "build.gradle.kts",
+                "settings.gradle",
+                "settings.gradle.kts",
+            ]
+            .iter()
+            .any(|f| dir.join(f).is_file()),
+            ArtifactKind::MavenTarget => dir.join("pom.xml").is_file(),
+            ArtifactKind::SwiftBuild => dir.join("Package.swift").is_file(),
+            ArtifactKind::PythonBuild | ArtifactKind::PythonDist => {
+                dir.join("pyproject.toml").is_file() || dir.join("setup.py").is_file()
+            }
             ArtifactKind::XcodeBuild => fs::read_dir(dir).is_ok_and(|rd| {
                 rd.flatten().any(|e| {
                     let name = e.file_name();
@@ -636,6 +700,46 @@ mod tests {
                 "outer/inner".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn gradle_maven_swift_and_python_build_output_is_found_by_its_marker() {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        write(&r.join("android/build.gradle.kts"), 10);
+        write(&r.join("android/build/outputs/a.apk"), 10);
+        write(&r.join("android/settings.gradle"), 10);
+        write(&r.join("android/.gradle/caches/x"), 10);
+        write(&r.join("jvm/pom.xml"), 10);
+        write(&r.join("jvm/target/a.jar"), 10);
+        write(&r.join("swift/Package.swift"), 10);
+        write(&r.join("swift/.build/release/x"), 10);
+        write(&r.join("py/pyproject.toml"), 10);
+        write(&r.join("py/build/lib/x"), 10);
+        write(&r.join("py/dist/x.whl"), 10);
+        // Same folder names without their marker are left alone.
+        write(&r.join("nope/build/x"), 10);
+        write(&r.join("nope/dist/x"), 10);
+        write(&r.join("nope/target/x"), 10);
+        write(&r.join("nope/.build/x"), 10);
+        assert_eq!(
+            found(r),
+            vec![
+                ("android/.gradle".to_string(), ArtifactKind::GradleCache),
+                ("android/build".to_string(), ArtifactKind::GradleBuild),
+                ("jvm/target".to_string(), ArtifactKind::MavenTarget),
+                ("py/build".to_string(), ArtifactKind::PythonBuild),
+                ("py/dist".to_string(), ArtifactKind::PythonDist),
+                ("swift/.build".to_string(), ArtifactKind::SwiftBuild),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dist_folder_is_a_kept_output_not_an_intermediate() {
+        assert!(ArtifactKind::PythonDist.keeps_by_default());
+        assert!(!ArtifactKind::PythonBuild.keeps_by_default());
+        assert!(!ArtifactKind::NodeModules.keeps_by_default());
     }
 
     #[test]

@@ -1915,3 +1915,80 @@ fn the_graph_follows_the_filter_and_folds_do_not_remove_projects_from_it() {
     let _ = render(&mut e.app, 160, 40);
     assert_eq!(e.app.graph_hits.len(), 1, "only App caches matches");
 }
+
+fn rust_project_screen(mode: GlyphMode) -> Env {
+    use std::os::unix::fs::PermissionsExt;
+    let mut e = make_app_with(
+        &[
+            ("api/Cargo.toml", 10),
+            ("api/target/debug/deps/f", 400_000),
+            ("api/target/debug/incremental/f", 200_000),
+            ("api/target/debug/myapp", 80_000),
+        ],
+        mode,
+        |home| {
+            fs::set_permissions(
+                home.join("api/target/debug/myapp"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        },
+    );
+    e.app.update(Action::GoTo(Screen::Targets));
+    wait_tools(&mut e.app);
+    e
+}
+
+#[test]
+fn binaries_are_listed_apart_from_intermediate_files_and_marked_as_kept() {
+    let mut e = rust_project_screen(GlyphMode::Nerd);
+    let text = render(&mut e.app, 170, 40);
+    assert!(text.contains("target/debug/deps"), "{text}");
+    assert!(text.contains("target/debug/incremental"), "{text}");
+    let bin = text
+        .lines()
+        .find(|l| l.contains("target/debug/myapp"))
+        .unwrap();
+    assert!(bin.contains("(kept)"), "{bin}");
+    // The intermediate rows are not kept.
+    let deps = text
+        .lines()
+        .find(|l| l.contains("target/debug/deps"))
+        .unwrap();
+    assert!(!deps.contains("(kept)"), "{deps}");
+}
+
+#[test]
+fn the_detail_pane_explains_that_a_product_is_kept_unless_marked() {
+    let mut e = rust_project_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "target/debug/myapp");
+    let text = render(&mut e.app, 170, 40);
+    // The text wraps in the narrow pane, so look for its start.
+    assert!(text.contains("a finished product"), "{text}");
+    assert!(text.contains("kept unless"), "{text}");
+}
+
+#[test]
+fn marking_the_project_header_leaves_the_binary_unmarked_on_screen() {
+    let mut e = rust_project_screen(GlyphMode::Nerd);
+    e.app.focus = maccleanup::app::Focus::Main;
+    let at = e
+        .app
+        .tlines
+        .iter()
+        .position(|l| matches!(l, maccleanup::targets::Line::Group(g) if e.app.targets.groups[*g].title == "~/api"))
+        .unwrap();
+    e.app.tcursor = at;
+    e.app.update(Action::ToggleMark);
+    assert_eq!(e.app.marks.len(), 2, "deps and incremental, not the binary");
+    let text = render(&mut e.app, 170, 40);
+    assert!(text.contains("marked 2"), "{text}");
+}
+
+#[test]
+fn product_rows_are_ascii_in_ascii_mode() {
+    let mut e = rust_project_screen(GlyphMode::Ascii);
+    for c in render_cells(&mut e.app, 170, 40) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}

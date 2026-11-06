@@ -424,12 +424,20 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
         MarkState::Covered(_) => (g.marked(), Style::default().fg(DIM)),
         MarkState::Unmarked => (g.unmarked(), Style::default().fg(Color::Magenta)),
     };
-    let icon = if is_command { g.command() } else { g.folder() };
+    let icon = if is_command {
+        g.command()
+    } else if r.is_dir {
+        g.folder()
+    } else {
+        g.file()
+    };
     let name_style = match &state {
         MarkState::Marked => Style::default()
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD),
         MarkState::Covered(_) => Style::default().fg(DIM),
+        // A finished product stands out: it is kept unless marked on its own.
+        MarkState::Unmarked if t.kept => Style::default().fg(Color::Cyan),
         MarkState::Unmarked => Style::default().fg(Color::Blue),
     };
     let name = r.name.to_string_lossy().into_owned();
@@ -465,7 +473,11 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
         ),
     ];
     spans.extend(highlight(
-        &fit_pad(&format!("  {name}"), c.name_w, g),
+        &fit_pad(
+            &format!("  {name}{}", if t.kept { "  (kept)" } else { "" }),
+            c.name_w,
+            g,
+        ),
         &query
             .matches(&name)
             .unwrap_or_default()

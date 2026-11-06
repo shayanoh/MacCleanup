@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use crate::app::{SortBy, cmp_rows};
 use crate::bg::Work;
+use crate::catalog::split::{SplitKind, split};
 use crate::catalog::{ArtifactKind, CommandSpec, Mode, ToolEntry, detect_artifacts};
 use crate::filter::Query;
 use crate::safety::{Policy, Safety};
-use crate::scan::{Node, Row, SpaceView, locate};
+use crate::scan::{Node, Row, SpaceView, file_space, locate};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SectionKind {
@@ -111,7 +112,12 @@ pub struct Targets {
 /// A candidate before it becomes a row.
 struct Cand {
     path: PathBuf,
-    node: Arc<Node>,
+    /// The scanned folder; `None` for a single file (a built binary).
+    node: Option<Arc<Node>>,
+    /// Does this folder split into intermediate files and products?
+    split: Option<SplitKind>,
+    /// A product: bulk marks leave it alone.
+    kept: bool,
     /// Lower wins when two candidates share a path (tools before artifacts).
     priority: u8,
     section: SectionKind,
@@ -133,6 +139,10 @@ fn project_kind(k: ArtifactKind) -> &'static str {
         ArtifactKind::DartTool | ArtifactKind::FlutterBuild => "Flutter",
         ArtifactKind::Pods => "CocoaPods",
         ArtifactKind::XcodeBuild => "Xcode",
+        ArtifactKind::GradleBuild | ArtifactKind::GradleCache => "Gradle",
+        ArtifactKind::MavenTarget => "Maven",
+        ArtifactKind::SwiftBuild => "Swift",
+        ArtifactKind::PythonBuild | ArtifactKind::PythonDist => "Python",
     }
 }
 
@@ -142,6 +152,83 @@ pub fn display_path(home: &Path, p: &Path) -> String {
         Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
         Ok(rel) => format!("~/{}", rel.to_string_lossy()),
         Err(_) => p.to_string_lossy().into_owned(),
+    }
+}
+
+/// A build folder that splits becomes one candidate per part; anything else
+/// (or a folder with nothing recognisable inside) stays as it is.
+fn expand_split(c: Cand) -> Vec<Cand> {
+    let parts = match (&c.split, &c.node, &c.kind) {
+        (Some(kind), Some(node), RowKind::Folder) => split(*kind, node),
+        _ => Vec::new(),
+    };
+    if parts.is_empty() {
+        return vec![c];
+    }
+    parts
+        .into_iter()
+        .map(|p| Cand {
+            // A project's rows are named from the project root; a tool's rows
+            // from the tool's own folder.
+            name: if c.section == SectionKind::Projects {
+                format!("{}/{}", c.name, p.name)
+            } else {
+                p.name
+            },
+            regen: if p.kept {
+                "a finished product, kept unless you mark this row; rebuilt by the next build"
+                    .to_string()
+            } else {
+                "intermediate files, recreated by the next build".to_string()
+            },
+            path: p.path,
+            node: p.node,
+            split: None,
+            kept: p.kept,
+            priority: c.priority,
+            section: c.section,
+            group: c.group.clone(),
+            label: c.label.clone(),
+            subtitle: c.subtitle.clone(),
+            member: c.member,
+            kind: RowKind::Folder,
+            note: c.note.clone(),
+        })
+        .collect()
+}
+
+/// The Explorer-style row for a candidate: a scanned folder, or a single file.
+fn row_for(c: &Cand, space: Option<crate::scan::Space>) -> Option<Row> {
+    match &c.node {
+        Some(node) => Some(Row {
+            name: c.name.clone().into(),
+            path: c.path.clone(),
+            is_dir: true,
+            size: node.size(),
+            disk: space.map_or_else(|| node.disk(), |s| s.footprint),
+            files: node.files(),
+            scanning: !node.is_done(),
+            node: Some(Arc::clone(node)),
+            space,
+            frees: space.map(|s| s.frees_now),
+        }),
+        None => {
+            use std::os::unix::fs::MetadataExt;
+            let md = std::fs::symlink_metadata(&c.path).ok()?;
+            let sp = file_space(&c.path).ok();
+            Some(Row {
+                name: c.name.clone().into(),
+                path: c.path.clone(),
+                is_dir: false,
+                size: md.len(),
+                disk: sp.map_or(md.blocks() * 512, |s| s.footprint),
+                files: 1,
+                scanning: false,
+                node: None,
+                space: sp,
+                frees: sp.map(|s| s.frees_now),
+            })
+        }
     }
 }
 
@@ -177,7 +264,10 @@ impl Targets {
             };
             cands.push(Cand {
                 path: e.path.clone(),
-                node,
+                node: Some(node),
+                split: (e.id == "xcode-derived" && e.mode == Mode::Folder)
+                    .then_some(SplitKind::DerivedData),
+                kept: false,
                 priority: 0,
                 section: SectionKind::Tools,
                 group: e.tool.clone(),
@@ -205,7 +295,9 @@ impl Targets {
                     |rel| rel.to_string_lossy().into_owned(),
                 ),
                 path: c.path,
-                node: c.node,
+                node: Some(c.node),
+                split: c.kind.split_kind(),
+                kept: c.kind.keeps_by_default(),
                 priority: 1,
                 section: SectionKind::Projects,
                 group: display_path(home, &c.root),
@@ -241,15 +333,32 @@ impl Targets {
             true
         });
 
+        // Build folders that hold products: one row per intermediate folder,
+        // and one per product, so the products can be kept.
+        let cands: Vec<Cand> = cands.into_iter().flat_map(expand_split).collect();
+
         // Numbers: one pass over the clone tables when the scan is idle.
         work.stage(2, 3, "reading space numbers");
         let idle = scan_idle;
-        let nodes: Vec<Arc<Node>> = cands.iter().map(|c| Arc::clone(&c.node)).collect();
-        let spaces = if idle {
+        let nodes: Vec<Arc<Node>> = cands.iter().filter_map(|c| c.node.clone()).collect();
+        let node_spaces = if idle {
             view.spaces_of(&nodes)
         } else {
             Vec::new()
         };
+        // Which entry of `node_spaces` belongs to which candidate.
+        let mut next_node = 0usize;
+        let spaces: Vec<Option<crate::scan::Space>> = cands
+            .iter()
+            .map(|c| {
+                if c.node.is_some() {
+                    next_node += 1;
+                    node_spaces.get(next_node - 1).copied()
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let mut groups: Vec<Group> = Vec::new();
         // What each project group holds, to write its subtitle at the end.
@@ -258,18 +367,8 @@ impl Targets {
             (std::collections::BTreeSet<String>, bool),
         > = std::collections::HashMap::new();
         for (i, c) in cands.into_iter().enumerate() {
-            let space = spaces.get(i).copied();
-            let row = Row {
-                name: c.name.clone().into(),
-                path: c.path.clone(),
-                is_dir: true,
-                size: c.node.size(),
-                disk: space.map_or_else(|| c.node.disk(), |s| s.footprint),
-                files: c.node.files(),
-                scanning: !c.node.is_done(),
-                node: Some(Arc::clone(&c.node)),
-                space,
-                frees: space.map(|s| s.frees_now),
+            let Some(row) = row_for(&c, spaces[i]) else {
+                continue; // a file that vanished since the scan
             };
             if c.section == SectionKind::Projects {
                 let e = ecos.entry(c.group.clone()).or_default();
@@ -282,7 +381,7 @@ impl Targets {
                 safety: policy.classify(&c.path),
                 regen: c.regen,
                 note: c.note,
-                kept: false,
+                kept: c.kept,
             };
             match groups
                 .iter_mut()
@@ -562,6 +661,169 @@ mod tests {
         assert!(mono.subtitle.contains("workspace"), "{}", mono.subtitle);
         let other = t.groups.iter().find(|g| g.title == "~/other").unwrap();
         assert_eq!(other.subtitle, "Node");
+    }
+
+    fn exe(path: &Path, bytes: usize) {
+        use std::os::unix::fs::PermissionsExt;
+        write(path, bytes);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn rust_project(h: &Path) {
+        write(&h.join("api/Cargo.toml"), 10);
+        for profile in ["debug", "release"] {
+            write(&h.join(format!("api/target/{profile}/deps/f")), 40_000);
+            write(
+                &h.join(format!("api/target/{profile}/incremental/f")),
+                20_000,
+            );
+            exe(&h.join(format!("api/target/{profile}/myapp")), 8_000);
+        }
+        write(&h.join("api/target/release/bundle/dmg/a.dmg"), 9_000);
+    }
+
+    fn names_of(t: &Targets, title: &str) -> Vec<(String, bool, bool)> {
+        let g = t.groups.iter().find(|g| g.title == title).unwrap();
+        let mut v: Vec<_> = g
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.row.name.to_string_lossy().into_owned(),
+                    r.kept,
+                    r.row.is_dir,
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_rust_target_lists_intermediate_folders_and_the_binaries_separately() {
+        let s = sandbox(rust_project);
+        let t = build(&s, &[]);
+        assert_eq!(
+            names_of(&t, "~/api"),
+            [
+                ("target/debug/deps".to_string(), false, true),
+                ("target/debug/incremental".to_string(), false, true),
+                ("target/debug/myapp".to_string(), true, false),
+                ("target/release/bundle".to_string(), true, true),
+                ("target/release/deps".to_string(), false, true),
+                ("target/release/incremental".to_string(), false, true),
+                ("target/release/myapp".to_string(), true, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_binary_row_has_the_files_own_numbers_and_a_kept_marker() {
+        let s = sandbox(rust_project);
+        let t = build(&s, &[]);
+        let g = t.groups.iter().find(|g| g.title == "~/api").unwrap();
+        let bin = g
+            .rows
+            .iter()
+            .find(|r| r.row.name == "target/release/myapp")
+            .unwrap();
+        assert!(!bin.row.is_dir && bin.row.node.is_none());
+        assert_eq!(bin.row.size, 8_000);
+        assert!(bin.row.disk >= 8_000);
+        assert_eq!(
+            bin.row.frees,
+            Some(bin.row.disk),
+            "a plain file frees what it holds"
+        );
+        assert!(bin.regen.contains("kept"), "{}", bin.regen);
+    }
+
+    #[test]
+    fn a_target_that_cannot_be_split_is_still_one_row() {
+        let s = sandbox(|h| {
+            write(&h.join("api/Cargo.toml"), 10);
+            write(&h.join("api/target/x"), 10_000);
+        });
+        let t = build(&s, &[]);
+        assert_eq!(names_of(&t, "~/api"), [("target".to_string(), false, true)]);
+    }
+
+    #[test]
+    fn a_dist_folder_is_one_kept_row() {
+        let s = sandbox(|h| {
+            write(&h.join("py/pyproject.toml"), 10);
+            write(&h.join("py/build/lib/x"), 5_000);
+            write(&h.join("py/dist/pkg.whl"), 5_000);
+        });
+        let t = build(&s, &[]);
+        assert_eq!(
+            names_of(&t, "~/py"),
+            [
+                ("build".to_string(), false, true),
+                ("dist".to_string(), true, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_data_is_split_into_products_and_intermediates() {
+        let s = sandbox(|h| {
+            write(
+                &h.join(
+                    "Library/Developer/Xcode/DerivedData/App-abc/Build/Products/Debug/App.app/App",
+                ),
+                9_000,
+            );
+            write(
+                &h.join(
+                    "Library/Developer/Xcode/DerivedData/App-abc/Build/Intermediates.noindex/x",
+                ),
+                4_000,
+            );
+            write(
+                &h.join("Library/Developer/Xcode/DerivedData/App-abc/Logs/l"),
+                100,
+            );
+        });
+        let e = entry(
+            &s.home,
+            "xcode-derived",
+            "Xcode",
+            "Library/Developer/Xcode/DerivedData",
+            Mode::Folder,
+        );
+        let t = build(&s, &[e]);
+        assert_eq!(
+            names_of(&t, "Xcode"),
+            [
+                (
+                    "App-abc/Build/Intermediates.noindex".to_string(),
+                    false,
+                    true
+                ),
+                ("App-abc/Build/Products".to_string(), true, true),
+                ("App-abc/Logs".to_string(), false, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_members_with_split_output_keep_root_relative_names() {
+        let s = sandbox(|h| {
+            write(&h.join("mono/package.json"), 10);
+            write(&h.join("mono/pnpm-workspace.yaml"), 10);
+            write(&h.join("mono/src-tauri/Cargo.toml"), 10);
+            write(&h.join("mono/src-tauri/target/release/deps/f"), 9_000);
+            exe(&h.join("mono/src-tauri/target/release/app"), 5_000);
+        });
+        let t = build(&s, &[]);
+        assert_eq!(
+            names_of(&t, "~/mono"),
+            [
+                ("src-tauri/target/release/app".to_string(), true, false),
+                ("src-tauri/target/release/deps".to_string(), false, true),
+            ]
+        );
     }
 
     #[test]
@@ -887,5 +1149,58 @@ mod stress {
             "space(root) as the Explorer asks on the UI thread: {:?} ({sp:?})",
             t.elapsed()
         );
+    }
+
+    /// Look at real projects (read-only): `MC_REAL_ROOTS=dir1:dir2 cargo test
+    /// --release real_projects -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_projects_listing() {
+        let Some(roots) = std::env::var_os("MC_REAL_ROOTS") else {
+            return;
+        };
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        for root in std::env::split_paths(&roots) {
+            let scanner = Scanner::new(8);
+            let t = Instant::now();
+            let node = scanner.scan_root(&root);
+            assert!(scanner.wait_idle(Duration::from_secs(900)));
+            let scan = t.elapsed();
+            let policy = Policy::new(&home, &home.join("ToBeDeleted-test-nonexistent"));
+            let src = BuildSource {
+                root: Arc::clone(&node),
+                home: home.clone(),
+                view: scanner.view(),
+                scan_idle: true,
+                policy: Arc::new(policy),
+                entries: Vec::new(),
+                closed: HashSet::new(),
+            };
+            let t = Instant::now();
+            let built = Targets::build(&src, &Work::new());
+            println!(
+                "== {} (scan {scan:?}, build {:?})",
+                root.display(),
+                t.elapsed()
+            );
+            if built.groups.is_empty() {
+                println!("   (nothing listed)");
+            }
+            for g in &built.groups {
+                println!("   {} [{}] {} rows", g.title, g.subtitle, g.rows.len());
+                for r in g.rows.iter().take(14) {
+                    println!(
+                        "      {}{}  {} (frees {:?})",
+                        r.row.name.to_string_lossy(),
+                        if r.kept { " (kept)" } else { "" },
+                        crate::fmt::human_size(r.row.disk),
+                        r.row.frees.map(crate::fmt::human_size)
+                    );
+                }
+                if g.rows.len() > 14 {
+                    println!("      ... and {} more", g.rows.len() - 14);
+                }
+            }
+        }
     }
 }

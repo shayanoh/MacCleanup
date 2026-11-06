@@ -1236,7 +1236,8 @@ impl App {
             .enumerate()
             .filter(|(i, g)| keep(*i, g))
             .flat_map(|(_, g)| g.rows.iter())
-            .filter(|r| !r.is_command())
+            // Commands and finished products are never swept up by a bulk mark.
+            .filter(|r| !r.is_command() && !r.kept)
             .map(|r| (r.row.path.clone(), Usage::new(r.row.size, r.row.disk)))
             .collect()
     }
@@ -4687,5 +4688,99 @@ mod tests {
         app.graph_hits = vec![(Rect::new(70, 3, 10, 2), (g, r))];
         app.update(Action::Click { x: 71, y: 3 });
         assert_eq!(app.tcursor, before);
+    }
+
+    // --- products are kept unless marked on their own -------------------
+
+    fn rust_app() -> crate::testutil::Env {
+        use std::os::unix::fs::PermissionsExt;
+        let mut e = env_with(
+            &[
+                ("api/Cargo.toml", 10),
+                ("api/target/debug/deps/f", 40_000),
+                ("api/target/debug/incremental/f", 20_000),
+                ("api/target/debug/myapp", 8_000),
+                ("api/target/release/deps/f", 30_000),
+                ("api/target/release/myapp", 9_000),
+            ],
+            |home| {
+                for p in ["api/target/debug/myapp", "api/target/release/myapp"] {
+                    std::fs::set_permissions(home.join(p), std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+            },
+        );
+        e.app.update(Action::GoTo(Screen::Targets));
+        wait_tools(&mut e.app);
+        e.app.focus = Focus::Main;
+        e
+    }
+
+    #[test]
+    fn marking_a_project_marks_the_intermediate_folders_and_keeps_the_binaries() {
+        let mut e = rust_app();
+        put_cursor_on(&mut e.app, "~/api");
+        e.app.update(Action::ToggleMark);
+        let t = e.home.join("api/target");
+        for p in ["debug/deps", "debug/incremental", "release/deps"] {
+            assert!(e.app.marks.contains_key(&t.join(p)), "{p}");
+        }
+        for p in ["debug/myapp", "release/myapp"] {
+            assert!(!e.app.marks.contains_key(&t.join(p)), "{p} is kept");
+        }
+        // A second press takes the same set out again.
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.is_empty());
+    }
+
+    #[test]
+    fn a_whole_section_mark_keeps_the_binaries_too() {
+        let mut e = rust_app();
+        let at = e
+            .app
+            .tlines
+            .iter()
+            .position(|l| matches!(l, Line::Section(SectionKind::Projects)))
+            .unwrap();
+        e.app.tcursor = at;
+        e.app.update(Action::ToggleMark);
+        assert!(!e.app.marks.is_empty());
+        assert!(e.app.marks.keys().all(|p| !p.ends_with("myapp")));
+    }
+
+    #[test]
+    fn a_binary_is_deleted_only_when_its_own_row_is_marked() {
+        let mut e = rust_app();
+        let bin = e.home.join("api/target/release/myapp");
+        mark_target(&mut e.app, &bin);
+        assert!(e.app.marks.contains_key(&bin));
+        wait_sets(&mut e.app);
+        assert!(e.app.joint_frees().unwrap() >= 9_000, "the file is counted");
+        e.app.update(Action::OpenReview);
+        let r = review_of(&e.app);
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].path, bin);
+        // Moving it works like any other mark.
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        assert!(!bin.exists());
+        assert!(
+            e.home.join("api/target/debug/myapp").exists(),
+            "the others stay"
+        );
+    }
+
+    #[test]
+    fn marking_the_whole_target_in_the_explorer_covers_every_row_in_it() {
+        let mut e = rust_app();
+        let target = e.home.join("api/target");
+        e.app.update(Action::GoTo(Screen::Explorer));
+        e.app.update(Action::Into); // api
+        select(&mut e.app, "target");
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::GoTo(Screen::Targets));
+        e.app.settle_targets();
+        let bin = e.home.join("api/target/debug/myapp");
+        assert_eq!(e.app.mark_state(&bin), MarkState::Covered(target));
     }
 }
