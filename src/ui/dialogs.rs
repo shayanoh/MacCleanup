@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     match &app.dialog {
         None => {}
         Some(Dialog::QuitWarning(w)) => quit_warning(frame, area, g, w, scale),
-        Some(Dialog::Review(r)) => review(frame, area, g, r, scale),
+        Some(Dialog::Review(r)) => review(frame, area, g, r, app.review_scroll, scale),
         Some(Dialog::Irreversible(r)) => irreversible(frame, area, g, r, scale),
         Some(Dialog::ConfirmForever(t)) => confirm_forever(frame, area, g, t, scale),
         Some(Dialog::Deleting(p)) => deleting(frame, area, app, p, scale),
@@ -190,7 +190,7 @@ pub fn review_layout(area: Rect, r: &Review) -> ReviewLayout {
     }
 }
 
-fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
+fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, scale: f64) {
     let lay = review_layout(area, r);
     let (width, height) = (lay.width, lay.height);
     let Some(inner) = popup(
@@ -221,7 +221,9 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
         Style::default().fg(DIM),
     )));
     let shown = lay.shown_items;
-    for item in r.items.iter().take(shown) {
+    // The list is a window onto the items; it never starts past the last full page.
+    let start = scroll.min(r.items.len().saturating_sub(shown));
+    for item in r.items.iter().skip(start).take(shown) {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{} ", safety_dot(g, item.safety)),
@@ -241,7 +243,16 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
     }
     if r.items.len() > shown {
         lines.push(Line::from(Span::styled(
-            format!("{} and {} more", g.ellipsis(), r.items.len() - shown),
+            fit(
+                &format!(
+                    "{}-{} of {}   j/k, arrows, PgUp/PgDn, Ctrl-F/B or the wheel scroll",
+                    start + 1,
+                    (start + shown).min(r.items.len()),
+                    r.items.len()
+                ),
+                inner.width as usize,
+                g,
+            ),
             Style::default().fg(DIM),
         )));
     }

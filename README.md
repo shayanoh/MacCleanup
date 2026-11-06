@@ -77,7 +77,7 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `q`, `Esc` | Quit (`Esc` first clears an active filter, then goes up a folder; quitting asks first if ToBeDeleted still holds items) |
 | mouse | Click rows, menu entries, and treemap boxes or bars (a click on the graph selects that row in the list); scroll with the wheel |
 
-In the review dialog: `Enter` moves items to ToBeDeleted, `x` offers "move, then empty now" (irreversible), `Esc` cancels. Irreversible actions need an explicit `y`; `Enter` never confirms them. When the review contains tool commands, only `y` runs it.
+In the review dialog the item list scrolls when it is longer than the window: `j`/`k`, the arrows, `PageUp`/`PageDown`, `Ctrl-F`/`Ctrl-B`, `Home`/`End` or the mouse wheel (a line under the list says which items you are looking at, e.g. `11-20 of 57`). Tool commands are never scrolled away: they keep their own space. `Enter` moves items to ToBeDeleted, `x` offers "move, then empty now" (irreversible), `Esc` cancels. Irreversible actions need an explicit `y`; `Enter` never confirms them. When the review contains tool commands, only `y` runs it.
 
 ## Safety
 

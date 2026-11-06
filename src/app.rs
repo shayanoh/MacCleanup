@@ -100,6 +100,8 @@ pub struct UiLayout {
     pub list_rows: u16,
     /// The review dialog cannot show every tool command at this terminal size.
     pub review_clipped: bool,
+    /// How many items of the review list fit at this terminal size.
+    pub review_rows: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,6 +367,8 @@ pub struct App {
     pub tick: u64,
     pub notice: Option<String>,
     pub layout: UiLayout,
+    /// First item of the review list that is shown (the list scrolls).
+    pub review_scroll: usize,
     /// Where a click on the graph lands, written by the UI every frame.
     pub graph_hits: Vec<(Rect, (usize, usize))>,
     pub animations: bool,
@@ -504,6 +508,7 @@ impl App {
             notice: None,
             layout: UiLayout::default(),
             graph_hits: Vec::new(),
+            review_scroll: 0,
             animations,
             glyphs,
             transition_start: 0,
@@ -800,6 +805,18 @@ impl App {
                     self.focus = Focus::Main;
                 }
             }
+            // A long review list scrolls; nothing else moves while it is open.
+            Action::Up
+            | Action::Down
+            | Action::PageUp
+            | Action::PageDown
+            | Action::Top
+            | Action::Bottom
+            | Action::Scroll(_)
+                if matches!(self.dialog, Some(Dialog::Review(_))) =>
+            {
+                self.scroll_review(action)
+            }
             // Everything below is blocked while a dialog is open.
             _ if self.dialog.is_some() => {}
             Action::FilterOpen => self.filter_open(),
@@ -871,6 +888,27 @@ impl App {
             Action::DeleteSelectedForever => self.ask_delete_forever(),
             Action::EmptyAll => self.ask_empty_all(),
         }
+    }
+
+    /// Scroll the review's item list (never past the last full page).
+    fn scroll_review(&mut self, action: Action) {
+        let Some(Dialog::Review(r)) = &self.dialog else {
+            return;
+        };
+        let visible = self.layout.review_rows.max(1);
+        let max = r.items.len().saturating_sub(visible);
+        let now = self.review_scroll.min(max) as i64;
+        let next = match action {
+            Action::Up => now - 1,
+            Action::Down => now + 1,
+            Action::PageUp => now - visible as i64,
+            Action::PageDown => now + visible as i64,
+            Action::Top => 0,
+            Action::Bottom => max as i64,
+            Action::Scroll(n) => now + i64::from(n),
+            _ => now,
+        };
+        self.review_scroll = next.clamp(0, max as i64) as usize;
     }
 
     /// Quitting while a delete is running would kill it half-way, so wait
@@ -1454,6 +1492,7 @@ impl App {
             return;
         }
         let commands = self.review_commands();
+        self.review_scroll = 0;
         if self.marks.is_empty() && commands.is_empty() {
             self.notice = Some("Nothing marked yet. Press space to mark items.".to_string());
             return;
@@ -4782,5 +4821,109 @@ mod tests {
         e.app.settle_targets();
         let bin = e.home.join("api/target/debug/myapp");
         assert_eq!(e.app.mark_state(&bin), MarkState::Covered(target));
+    }
+
+    // --- scrolling the review list ---------------------------------------
+
+    /// A sandbox whose review lists `n` marked files.
+    fn review_with_items(n: usize) -> crate::testutil::Env {
+        let files: Vec<(String, usize)> = (0..n).map(|i| (format!("f{i:03}.bin"), 1000)).collect();
+        let refs: Vec<(&str, usize)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        let mut e = env(&refs);
+        let paths: Vec<_> = e
+            .app
+            .rows
+            .iter()
+            .map(|r| (r.path.clone(), r.size, r.disk))
+            .collect();
+        for (p, size, disk) in paths {
+            e.app.marks.insert(p, Usage::new(size, disk));
+        }
+        e.app.update(Action::OpenReview);
+        e
+    }
+
+    fn scroll_of(app: &App) -> usize {
+        app.review_scroll
+    }
+
+    #[test]
+    fn a_review_starts_at_the_top_and_scrolls_by_line_and_by_page() {
+        let mut e = review_with_items(60);
+        let app = &mut e.app;
+        app.layout.review_rows = 10; // what the UI reports for this terminal
+        assert_eq!(scroll_of(app), 0);
+        app.update(Action::Down);
+        assert_eq!(scroll_of(app), 1);
+        app.update(Action::Up);
+        app.update(Action::Up);
+        assert_eq!(scroll_of(app), 0, "never above the first item");
+        app.update(Action::PageDown);
+        assert_eq!(scroll_of(app), 10);
+        app.update(Action::PageUp);
+        assert_eq!(scroll_of(app), 0);
+        app.update(Action::Scroll(3));
+        assert_eq!(scroll_of(app), 3);
+        app.update(Action::Scroll(-1));
+        assert_eq!(scroll_of(app), 2);
+    }
+
+    #[test]
+    fn the_review_scroll_stops_at_the_last_full_page() {
+        let mut e = review_with_items(60);
+        let app = &mut e.app;
+        app.layout.review_rows = 10;
+        app.update(Action::Bottom);
+        assert_eq!(scroll_of(app), 50, "60 items, 10 visible");
+        app.update(Action::Down);
+        app.update(Action::PageDown);
+        app.update(Action::Scroll(99));
+        assert_eq!(scroll_of(app), 50);
+        app.update(Action::Top);
+        assert_eq!(scroll_of(app), 0);
+    }
+
+    #[test]
+    fn a_short_review_does_not_scroll() {
+        let mut e = review_with_items(4);
+        let app = &mut e.app;
+        app.layout.review_rows = 10;
+        app.update(Action::Bottom);
+        app.update(Action::Down);
+        assert_eq!(scroll_of(app), 0);
+    }
+
+    #[test]
+    fn scrolling_the_review_leaves_the_list_behind_it_alone() {
+        let mut e = review_with_items(30);
+        let app = &mut e.app;
+        app.layout.review_rows = 5;
+        let cursor = app.cursor;
+        app.update(Action::Down);
+        app.update(Action::PageDown);
+        assert_eq!(app.cursor, cursor, "the explorer cursor does not move");
+        assert!(matches!(app.dialog, Some(Dialog::Review(_))), "still open");
+    }
+
+    #[test]
+    fn every_review_opens_at_the_top_again() {
+        let mut e = review_with_items(60);
+        let app = &mut e.app;
+        app.layout.review_rows = 10;
+        app.update(Action::Bottom);
+        app.update(Action::Cancel);
+        app.update(Action::OpenReview);
+        assert_eq!(scroll_of(app), 0);
+    }
+
+    #[test]
+    fn other_dialogs_do_not_scroll_anything() {
+        let mut e = review_with_items(60);
+        let app = &mut e.app;
+        app.layout.review_rows = 10;
+        app.dialog = Some(Dialog::Notice("hi".into()));
+        app.update(Action::Down);
+        app.update(Action::Bottom);
+        assert_eq!(scroll_of(app), 0);
     }
 }

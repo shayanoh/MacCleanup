@@ -1992,3 +1992,103 @@ fn product_rows_are_ascii_in_ascii_mode() {
         assert!(c.is_ascii(), "non-ascii cell {c:?}");
     }
 }
+
+fn review_of_many(n: usize) -> Env {
+    let files: Vec<(String, usize)> = (0..n).map(|i| (format!("item{i:03}.bin"), 1000)).collect();
+    let refs: Vec<(&str, usize)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+    let mut e = make_app(&refs, GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let rows: Vec<_> = e
+        .app
+        .rows
+        .iter()
+        .map(|r| (r.path.clone(), r.size, r.disk))
+        .collect();
+    for (p, size, disk) in rows {
+        e.app
+            .marks
+            .insert(p, maccleanup::usage::Usage::new(size, disk));
+    }
+    open_review(&mut e.app);
+    e
+}
+
+#[test]
+fn a_long_review_shows_a_window_and_says_where_it_is() {
+    let mut e = review_of_many(60);
+    let text = render(&mut e.app, 100, 30);
+    // Sorted by size then path: item000 is first, item059 is far down.
+    assert!(text.contains("item000.bin"), "{text}");
+    assert!(!text.contains("item059.bin"), "only a window fits:\n{text}");
+    assert!(text.contains("of 60"), "the position is shown:\n{text}");
+    assert!(text.contains("1-"), "{text}");
+}
+
+#[test]
+fn scrolling_the_review_reaches_every_item() {
+    let mut e = review_of_many(60);
+    let _ = render(&mut e.app, 100, 30); // lets the UI report how many rows fit
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..200 {
+        let text = render(&mut e.app, 100, 30);
+        for i in 0..60 {
+            if text.contains(&format!("item{i:03}.bin")) {
+                seen.insert(i);
+            }
+        }
+        if seen.len() == 60 {
+            break;
+        }
+        e.app.update(Action::PageDown);
+    }
+    assert_eq!(
+        seen.len(),
+        60,
+        "every item was visible at some point: {seen:?}"
+    );
+}
+
+#[test]
+fn the_review_scrolls_back_up_and_the_end_shows_the_last_item() {
+    let mut e = review_of_many(60);
+    let _ = render(&mut e.app, 100, 30);
+    e.app.update(Action::Bottom);
+    let text = render(&mut e.app, 100, 30);
+    assert!(text.contains("item059.bin"), "{text}");
+    assert!(!text.contains("item000.bin"), "{text}");
+    assert!(text.contains("of 60"), "{text}");
+    e.app.update(Action::Top);
+    let text = render(&mut e.app, 100, 30);
+    assert!(text.contains("item000.bin"), "{text}");
+}
+
+#[test]
+fn a_short_review_has_no_scroll_hint() {
+    let mut e = review_of_many(3);
+    let text = render(&mut e.app, 100, 30);
+    assert!(!text.contains("of 3"), "{text}");
+    assert!(text.contains("item002.bin"), "{text}");
+}
+
+#[test]
+fn the_scroll_hint_is_ascii_in_ascii_mode() {
+    let files: Vec<(String, usize)> = (0..60).map(|i| (format!("item{i:03}.bin"), 1000)).collect();
+    let refs: Vec<(&str, usize)> = files.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+    let mut e = make_app(&refs, GlyphMode::Ascii);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let rows: Vec<_> = e
+        .app
+        .rows
+        .iter()
+        .map(|r| (r.path.clone(), r.size, r.disk))
+        .collect();
+    for (p, size, disk) in rows {
+        e.app
+            .marks
+            .insert(p, maccleanup::usage::Usage::new(size, disk));
+    }
+    open_review(&mut e.app);
+    for c in render_cells(&mut e.app, 100, 30) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}

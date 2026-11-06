@@ -22,8 +22,8 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         return match key.code {
             KeyCode::Char('c') => Some(Action::Quit),
             // Page keys: Ctrl-F / Ctrl-B as in vim, plus Ctrl-D / Ctrl-U.
-            KeyCode::Char('f' | 'd') if app.dialog.is_none() => Some(Action::PageDown),
-            KeyCode::Char('b' | 'u') if app.dialog.is_none() => Some(Action::PageUp),
+            KeyCode::Char('f' | 'd') if pages(app) => Some(Action::PageDown),
+            KeyCode::Char('b' | 'u') if pages(app) => Some(Action::PageUp),
             _ => None,
         };
     }
@@ -96,6 +96,24 @@ fn filter_key(key: KeyEvent) -> Option<Action> {
     }
 }
 
+/// Page keys act on the list, or on the review's item list while it is open.
+fn pages(app: &App) -> bool {
+    matches!(app.dialog, None | Some(Dialog::Review(_)))
+}
+
+/// Keys that scroll a long review list.
+fn review_scroll_key(code: KeyCode) -> Option<Action> {
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
+        KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
+        KeyCode::PageDown => Some(Action::PageDown),
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::Home => Some(Action::Top),
+        KeyCode::End | KeyCode::Char('G') => Some(Action::Bottom),
+        _ => None,
+    }
+}
+
 fn dialog_key(code: KeyCode, dialog: &Dialog) -> Option<Action> {
     match dialog {
         Dialog::QuitWarning(_) => match code {
@@ -106,12 +124,14 @@ fn dialog_key(code: KeyCode, dialog: &Dialog) -> Option<Action> {
         },
         // Tool commands cannot be undone: only an explicit `y` runs them.
         Dialog::Review(r) if !r.commands.is_empty() => match code {
+            code if review_scroll_key(code).is_some() => review_scroll_key(code),
             KeyCode::Char('y') => Some(Action::Confirm),
             KeyCode::Char('x') if !r.items.is_empty() => Some(Action::ConfirmIrreversible),
             KeyCode::Esc | KeyCode::Char('n') => Some(Action::Cancel),
             _ => None,
         },
         Dialog::Review(_) => match code {
+            code if review_scroll_key(code).is_some() => review_scroll_key(code),
             KeyCode::Enter => Some(Action::Confirm),
             KeyCode::Char('x') => Some(Action::ConfirmIrreversible),
             KeyCode::Esc | KeyCode::Char('n') => Some(Action::Cancel),
@@ -133,8 +153,19 @@ fn dialog_key(code: KeyCode, dialog: &Dialog) -> Option<Action> {
 
 /// Translate a mouse event: left click selects, wheel scrolls.
 pub fn map_mouse(ev: MouseEvent, app: &App) -> Option<Action> {
-    if app.dialog.is_some() || app.too_small {
+    if app.too_small {
         return None;
+    }
+    if app.dialog.is_some() {
+        // Only a review has something to scroll; clicks never reach the list behind it.
+        if !matches!(app.dialog, Some(Dialog::Review(_))) {
+            return None;
+        }
+        return match ev.kind {
+            MouseEventKind::ScrollDown => Some(Action::Scroll(3)),
+            MouseEventKind::ScrollUp => Some(Action::Scroll(-3)),
+            _ => None,
+        };
     }
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => Some(Action::Click {
@@ -256,7 +287,11 @@ mod tests {
         assert_eq!(map_key(ch('x'), app), Some(Action::ConfirmIrreversible));
         assert_eq!(map_key(key(KeyCode::Esc), app), Some(Action::Cancel));
         assert_eq!(map_key(ch('y'), app), None);
-        assert_eq!(map_key(ch('j'), app), None);
+        // The item list scrolls; the rest of the screen stays out of reach.
+        assert_eq!(map_key(ch('j'), app), Some(Action::Down));
+        for blocked in [' ', 's', 'h', 'l', 'd', 't', '/', 'r', '5'] {
+            assert_eq!(map_key(ch(blocked), app), None, "{blocked:?}");
+        }
     }
 
     #[test]
@@ -618,5 +653,88 @@ mod tests {
         e.app.dialog = Some(Dialog::Notice("x".into()));
         assert_eq!(map_key(k('f'), &e.app), None);
         assert_eq!(map_key(k('b'), &e.app), None);
+    }
+
+    fn review_dialog(items: usize, commands: usize) -> Dialog {
+        review_with(items, commands)
+    }
+
+    #[test]
+    fn the_review_list_scrolls_with_every_navigation_key() {
+        for commands in [0, 1] {
+            let d = review_dialog(60, commands);
+            for (code, want) in [
+                (KeyCode::Char('j'), Action::Down),
+                (KeyCode::Down, Action::Down),
+                (KeyCode::Char('k'), Action::Up),
+                (KeyCode::Up, Action::Up),
+                (KeyCode::PageDown, Action::PageDown),
+                (KeyCode::PageUp, Action::PageUp),
+                (KeyCode::Home, Action::Top),
+                (KeyCode::End, Action::Bottom),
+                (KeyCode::Char('G'), Action::Bottom),
+            ] {
+                assert_eq!(
+                    dialog_key(code, &d),
+                    Some(want),
+                    "{code:?} with {commands} commands"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_f_and_ctrl_b_page_the_review_list_too() {
+        let mut e = env(FILES);
+        let k = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        e.app.dialog = Some(review_dialog(60, 0));
+        assert_eq!(map_key(k('f'), &e.app), Some(Action::PageDown));
+        assert_eq!(map_key(k('b'), &e.app), Some(Action::PageUp));
+        assert_eq!(map_key(k('d'), &e.app), Some(Action::PageDown));
+        assert_eq!(map_key(k('u'), &e.app), Some(Action::PageUp));
+        // Other dialogs have nothing to scroll.
+        e.app.dialog = Some(Dialog::Notice("x".into()));
+        assert_eq!(map_key(k('f'), &e.app), None);
+    }
+
+    #[test]
+    fn scrolling_the_review_never_confirms_or_cancels_it() {
+        let d = review_dialog(60, 0);
+        assert_eq!(dialog_key(KeyCode::Enter, &d), Some(Action::Confirm));
+        assert_eq!(
+            dialog_key(KeyCode::Char('x'), &d),
+            Some(Action::ConfirmIrreversible)
+        );
+        assert_eq!(dialog_key(KeyCode::Esc, &d), Some(Action::Cancel));
+        let d = review_dialog(60, 1);
+        assert_eq!(
+            dialog_key(KeyCode::Enter, &d),
+            None,
+            "Enter still never runs a command"
+        );
+    }
+
+    #[test]
+    fn the_mouse_wheel_scrolls_the_review_but_clicks_do_not_reach_the_list_behind_it() {
+        let mut e = env(FILES);
+        e.app.dialog = Some(review_dialog(60, 0));
+        assert_eq!(
+            map_mouse(mouse(MouseEventKind::ScrollDown, 5, 7), &e.app),
+            Some(Action::Scroll(3))
+        );
+        assert_eq!(
+            map_mouse(mouse(MouseEventKind::ScrollUp, 5, 7), &e.app),
+            Some(Action::Scroll(-3))
+        );
+        assert_eq!(
+            map_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 7), &e.app),
+            None
+        );
+        // Other dialogs ignore the wheel as before.
+        e.app.dialog = Some(Dialog::Notice("x".into()));
+        assert_eq!(
+            map_mouse(mouse(MouseEventKind::ScrollDown, 5, 7), &e.app),
+            None
+        );
     }
 }

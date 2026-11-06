@@ -209,6 +209,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.layout.list_top = 0;
     app.layout.list_rows = 0;
     app.graph_hits.clear();
+    app.layout.review_rows = match &app.dialog {
+        Some(crate::app::Dialog::Review(r)) => dialogs::review_layout(area, r).shown_items.max(1),
+        _ => 0,
+    };
     app.layout.review_clipped = matches!(
         &app.dialog,
         Some(crate::app::Dialog::Review(r)) if dialogs::review_layout(area, r).clipped
