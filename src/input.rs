@@ -94,7 +94,7 @@ pub fn map_mouse(ev: MouseEvent, app: &App) -> Option<Action> {
 mod tests {
     use super::*;
     use crate::app::{Action, Screen};
-    use crate::testutil::{env, select};
+    use crate::testutil::{env, select, settle};
     use ratatui::crossterm::event::{
         KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
@@ -225,6 +225,7 @@ mod tests {
         e.app.update(Action::ToggleMark);
         e.app.update(Action::OpenReview);
         e.app.update(Action::Confirm);
+        settle(&mut e.app);
         let app = &e.app;
         assert_eq!(map_key(key(KeyCode::Enter), app), Some(Action::Cancel));
         assert_eq!(map_key(key(KeyCode::Esc), app), Some(Action::Cancel));

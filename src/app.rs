@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 use crate::accounting::Accounting;
 use crate::fmt::human_size;
 use crate::glyphs::Glyphs;
-use crate::jobs::DeleteMode;
+use crate::jobs::{DeleteEvent, DeleteJob, DeleteMode};
 use crate::safety::{Policy, Safety};
 use crate::scan::{Node, Row, Scanner};
 use crate::softdelete::{HeldItem, Holding};
@@ -204,6 +204,9 @@ pub struct App {
     pub holding: Arc<Holding>,
     rows_synced_done: bool,
     pending_select: Option<PathBuf>,
+    job: Option<DeleteJob>,
+    job_mode: DeleteMode,
+    job_free_before: u64,
 }
 
 fn sort_rows(rows: &mut [Row], by: SortBy) {
@@ -268,6 +271,9 @@ impl App {
             holding: Arc::new(holding),
             rows_synced_done: false,
             pending_select: None,
+            job: None,
+            job_mode: DeleteMode::SoftOnly,
+            job_free_before: 0,
         };
         app.refresh_rows();
         app.refresh_held();
@@ -393,6 +399,7 @@ impl App {
 
     fn on_tick(&mut self) {
         self.tick += 1;
+        self.poll_job();
         if self.tick.is_multiple_of(20) {
             self.refresh_free();
         }
@@ -578,28 +585,69 @@ impl App {
 
     // --- soft delete -------------------------------------------------
 
-    /// Synchronous delete used until the background job takes over.
+    /// Start the delete on a background thread and show its progress.
     fn run_delete(&mut self, review: Review, mode: DeleteMode) {
-        let free_before = self.free_now;
-        let (mut moved, mut emptied, mut failures) = (0u64, 0u64, 0usize);
-        let mut ids = Vec::new();
-        for item in &review.items {
-            match self.holding.move_in(&self.policy, &item.path, item.size) {
-                Ok(held) => {
-                    moved += item.size;
-                    ids.push(held.id);
+        let items: Vec<(PathBuf, u64)> = review
+            .items
+            .iter()
+            .map(|i| (i.path.clone(), i.size))
+            .collect();
+        let phases = if mode == DeleteMode::SoftThenEmpty {
+            2
+        } else {
+            1
+        };
+        self.job_mode = mode;
+        self.job_free_before = self.free_now;
+        self.dialog = Some(Dialog::Deleting(DeleteProgress {
+            done: 0,
+            total: items.len() * phases,
+            bytes: 0,
+            current: PathBuf::new(),
+        }));
+        self.job = Some(DeleteJob::start(
+            Arc::clone(&self.holding),
+            Arc::clone(&self.policy),
+            items,
+            mode,
+        ));
+    }
+
+    /// Drain the running job's events: update the progress dialog and, when
+    /// it finishes, record the outcome.
+    fn poll_job(&mut self) {
+        let events = self.job.as_ref().map(DeleteJob::poll).unwrap_or_default();
+        let mut finished = None;
+        for event in events {
+            match event {
+                DeleteEvent::Progress {
+                    done,
+                    total,
+                    bytes,
+                    current,
+                } => {
+                    if let Some(Dialog::Deleting(p)) = &mut self.dialog {
+                        *p = DeleteProgress {
+                            done,
+                            total,
+                            bytes,
+                            current,
+                        };
+                    }
                 }
-                Err(_) => failures += 1,
+                DeleteEvent::Failed { .. } => {}
+                DeleteEvent::Finished {
+                    moved_bytes,
+                    emptied_bytes,
+                    failures,
+                } => finished = Some((moved_bytes, emptied_bytes, failures)),
             }
         }
-        if mode == DeleteMode::SoftThenEmpty {
-            for id in ids {
-                if let Ok(bytes) = self.holding.delete_forever(&id) {
-                    emptied += bytes;
-                }
-            }
+        if let Some((moved, emptied, failures)) = finished {
+            self.job = None;
+            let (mode, free_before) = (self.job_mode, self.job_free_before);
+            self.after_delete(mode, moved, emptied, failures, free_before);
         }
-        self.after_delete(mode, moved, emptied, failures, free_before);
     }
 
     /// Record the outcome of a delete and show the right dialog.
@@ -733,7 +781,7 @@ fn step(pos: usize, delta: i64, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{env, names, select};
+    use crate::testutil::{env, names, select, settle};
     use ratatui::layout::Rect;
     use std::fs;
 
@@ -861,6 +909,7 @@ mod tests {
         app.update(Action::ToggleMark);
         app.update(Action::OpenReview);
         app.update(Action::Confirm);
+        settle(app);
         assert!(!home.join("a").exists());
         assert!(!home.join("b.bin").exists());
         assert!(home.join("c/f").exists());
@@ -883,6 +932,7 @@ mod tests {
         assert!(matches!(app.dialog, Some(Dialog::Irreversible(_))));
         assert!(home.join("b.bin").exists(), "nothing deleted yet");
         app.update(Action::Confirm);
+        settle(app);
         assert!(!home.join("b.bin").exists());
         assert!(app.held.is_empty());
         assert_eq!(app.accounting.pending(), 0);
@@ -1047,6 +1097,7 @@ mod tests {
         app.update(Action::ToggleMark);
         app.update(Action::OpenReview);
         app.update(Action::Confirm);
+        settle(app);
         app.update(Action::Cancel); // dismiss the notice
     }
 
@@ -1102,6 +1153,7 @@ mod tests {
         app.update(Action::ToggleMark);
         app.update(Action::OpenReview);
         app.update(Action::Confirm);
+        settle(app);
         app.update(Action::Cancel);
         fs::write(home.join("b.bin"), "new").unwrap();
         app.update(Action::GoTo(Screen::Holding));
@@ -1124,5 +1176,56 @@ mod tests {
         let mut e = env(FILES);
         e.app.update(Action::Quit);
         assert!(e.app.should_quit);
+    }
+
+    #[test]
+    fn confirm_starts_background_job_and_ticks_finish_it() {
+        let mut e = env(FILES);
+        let home = e.home.clone();
+        let app = &mut e.app;
+        select(app, "b.bin");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        app.update(Action::Confirm);
+        assert!(matches!(app.dialog, Some(Dialog::Deleting(_))));
+        settle(app);
+        assert!(matches!(app.dialog, Some(Dialog::Notice(_))));
+        assert!(!home.join("b.bin").exists());
+        assert_eq!(app.accounting.pending(), 2000);
+        assert_eq!(app.held.len(), 1);
+    }
+
+    #[test]
+    fn deleting_dialog_cannot_be_dismissed() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        select(app, "b.bin");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        app.update(Action::Confirm);
+        app.update(Action::Cancel);
+        app.update(Action::Confirm);
+        assert!(matches!(app.dialog, Some(Dialog::Deleting(_))));
+        settle(app);
+    }
+
+    #[test]
+    fn finish_dialog_reports_amounts_for_irreversible_delete() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        select(app, "b.bin");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        app.update(Action::ConfirmIrreversible);
+        app.update(Action::Confirm);
+        settle(app);
+        match &app.dialog {
+            Some(Dialog::Finish(f)) => {
+                assert_eq!(f.moved_bytes, 2000);
+                assert_eq!(f.emptied_bytes, 2000);
+                assert_eq!(f.failures, 0);
+            }
+            other => panic!("expected finish, got {}", other.is_some()),
+        }
     }
 }

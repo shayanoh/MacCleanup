@@ -75,3 +75,15 @@ pub fn select(app: &mut App, name: &str) {
         .position(|r| r.name.to_string_lossy() == name)
         .unwrap_or_else(|| panic!("no row named {name}"));
 }
+
+/// Tick until a running delete job has finished (the dialog leaves `Deleting`).
+pub fn settle(app: &mut App) {
+    for _ in 0..1000 {
+        if !matches!(app.dialog, Some(crate::app::Dialog::Deleting(_))) {
+            return;
+        }
+        app.update(Action::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("delete job did not finish");
+}
