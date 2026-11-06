@@ -2096,6 +2096,10 @@ impl App {
                 self.ensure_visible();
                 self.refresh_detail();
             }
+            Screen::Docker if group < self.docker.lines.len() => {
+                self.docker.cursor = group;
+                self.ensure_visible();
+            }
             Screen::Targets => {
                 // `usize::MAX` stands for the project's header line.
                 let wanted = if row == usize::MAX {

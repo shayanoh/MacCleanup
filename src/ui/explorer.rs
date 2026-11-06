@@ -214,9 +214,10 @@ pub(super) fn cols(inner_width: u16, g: &Glyphs) -> Cols {
     let mark_w = text_width(g.marked()).max(text_width(g.unmarked()));
     let dot_w = text_width(g.safe());
     let prefix_w = 2 + mark_w + 1 + icon_w + 1 + dot_w + 1;
-    // Size, on disk, frees, modified: four 9-wide columns; the share bar goes
-    // first when the pane is narrow.
-    let fixed_no_share = prefix_w + 4 * (1 + 9);
+    // Size, on disk, frees: three 9-wide columns and the 10-wide Modified one
+    // ("Modified ▼" must fit); the share bar goes first when the pane is
+    // narrow.
+    let fixed_no_share = prefix_w + 3 * (1 + 9) + (1 + 10);
     let cw = inner_width.saturating_sub(1) as usize; // last column: scrollbar
     let show_share = cw >= fixed_no_share + 9 + 16;
     let fixed = fixed_no_share + if show_share { 9 } else { 0 };
@@ -275,7 +276,7 @@ pub(super) fn header_line(sort: SortBy, c: &Cols, g: &Glyphs) -> Line<'static> {
         ),
         Span::raw(" "),
         Span::styled(
-            right(&format!("Modified{}", arrow(SortBy::Modified)), 9),
+            right(&format!("Modified{}", arrow(SortBy::Modified)), 10),
             head_style(SortBy::Modified),
         ),
     ];
@@ -321,9 +322,9 @@ pub(super) fn number_spans(
             format!(
                 " {}",
                 if queued {
-                    unknown.clone()
+                    right(g.ellipsis(), 10)
                 } else {
-                    right(&crate::fmt::ago(crate::fmt::now_secs(), r.mtime), 9)
+                    right(&crate::fmt::ago(crate::fmt::now_secs(), r.mtime), 10)
                 }
             ),
             value_style(sort == SortBy::Modified),

@@ -2359,3 +2359,187 @@ fn filtering_by_a_project_shows_its_caches_and_marks_why_the_group_matched() {
     // The graph shows only the matching project.
     assert_eq!(e.app.graph_hits.len(), 1);
 }
+
+// ---- Docker page ---------------------------------------------------------
+
+const DOCKER_DF: &str = include_str!("fixtures/docker/system_df.json");
+const DOCKER_CONTAINERS: &str = include_str!("fixtures/docker/containers.json");
+const DOCKER_CONTAINER_INSPECT: &str = include_str!("fixtures/docker/container_inspect.json");
+const DOCKER_HISTORY: &str = include_str!("fixtures/docker/history.json");
+const DOCKER_INSPECT: &str = include_str!("fixtures/docker/inspect_image.json");
+const DOCKER_CONTEXT: &str = include_str!("fixtures/docker/context_inspect.json");
+
+/// Answers Docker's API calls from fixtures; runs nothing.
+struct FakeDocker {
+    df: String,
+    running: bool,
+}
+
+impl maccleanup::catalog::CommandRunner for FakeDocker {
+    fn run(
+        &self,
+        _: &maccleanup::catalog::CommandSpec,
+        _: &maccleanup::catalog::RunControl,
+    ) -> maccleanup::catalog::CommandResult {
+        maccleanup::catalog::CommandResult {
+            ok: true,
+            cancelled: false,
+            output_tail: String::new(),
+        }
+    }
+    fn query(&self, spec: &maccleanup::catalog::CommandSpec) -> Option<String> {
+        let full = spec.full();
+        let answers: [(&str, &str); 7] = [
+            ("context inspect", DOCKER_CONTEXT),
+            ("/_ping", if self.running { "OK" } else { "" }),
+            ("/system/df", self.df.as_str()),
+            ("/containers/json?all=1", DOCKER_CONTAINERS),
+            ("/containers/c0ffee1/json", DOCKER_CONTAINER_INSPECT),
+            ("/images/sha256:aaa1/history", DOCKER_HISTORY),
+            ("/images/sha256:aaa1/json", DOCKER_INSPECT),
+        ];
+        if full.contains("/_ping") && !self.running {
+            return None;
+        }
+        answers
+            .iter()
+            .find(|(k, _)| full.contains(k))
+            .map(|(_, v)| v.to_string())
+    }
+    fn available(&self, program: &str) -> bool {
+        program.ends_with("docker")
+    }
+}
+
+fn docker_screen_with(mode: GlyphMode, df: &str, running: bool, vm_disk: bool) -> Env {
+    let mut e = make_app_with(&[("a.txt", 10)], mode, |home| {
+        if vm_disk {
+            let raw = home.join("Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw");
+            fs::create_dir_all(raw.parent().unwrap()).unwrap();
+            fs::write(&raw, vec![1u8; 8192]).unwrap();
+        }
+    });
+    e.app.runner = std::sync::Arc::new(FakeDocker {
+        df: df.to_string(),
+        running,
+    });
+    e.app.update(Action::GoTo(Screen::Docker));
+    for _ in 0..2000 {
+        e.app.update(Action::Tick);
+        if !e.app.docker.job.pending {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e
+}
+
+fn docker_screen(mode: GlyphMode) -> Env {
+    docker_screen_with(mode, DOCKER_DF, true, false)
+}
+
+#[test]
+fn docker_page_shows_sections_columns_the_tree_and_tags() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 150, 40);
+    for want in [
+        "IMAGES",
+        "VOLUMES",
+        "BUILD CACHE",
+        "web:latest",
+        "web-1",
+        "pgdata",
+        "unmeasured",
+        "apt-get update",
+        "running",
+        "unused",
+    ] {
+        assert!(t.contains(want), "missing {want:?}:\n{t}");
+    }
+    let header = t
+        .lines()
+        .find(|l| l.contains("Name") && l.contains("Created"))
+        .unwrap_or_else(|| panic!("no header:\n{t}"));
+    let at: Vec<usize> = ["Name", "Size", "Frees", "Last used", "Created"]
+        .iter()
+        .map(|c| {
+            header
+                .find(c)
+                .unwrap_or_else(|| panic!("no {c} in {header}"))
+        })
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?} in {header}");
+    assert!(
+        header.contains("Size ▼"),
+        "sorted by size by default: {header}"
+    );
+}
+
+#[test]
+fn docker_header_arrow_follows_the_sort_key() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    e.app.update(Action::CycleSort);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("Frees ▼") && !t.contains("Size ▼"), "{t}");
+}
+
+#[test]
+fn docker_page_hides_the_side_pane_when_narrow() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let wide = render(&mut e.app, 150, 40);
+    assert!(wide.contains("Details"));
+    let narrow = render(&mut e.app, 70, 30);
+    assert!(!narrow.contains("Details"), "{narrow}");
+    assert!(narrow.contains("IMAGES"));
+}
+
+#[test]
+fn docker_page_says_why_it_cannot_read_docker() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, DOCKER_DF, false, false);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("Docker is not running"), "{t}");
+    assert!(!t.contains("IMAGES"));
+}
+
+#[test]
+fn docker_names_are_cleaned_of_control_characters() {
+    let evil = DOCKER_DF.replace("web:latest", "evil\\u001b[31m:latest");
+    let mut e = docker_screen_with(GlyphMode::Nerd, &evil, true, false);
+    let cells = render_cells(&mut e.app, 150, 40);
+    assert!(cells.iter().all(|c| !c.contains('\u{1b}')), "escape leaked");
+    assert!(render(&mut e.app, 150, 40).contains("evil"));
+}
+
+#[test]
+fn docker_page_is_ascii_in_ascii_mode() {
+    let mut e = docker_screen(GlyphMode::Ascii);
+    for c in render_cells(&mut e.app, 150, 40) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+#[test]
+fn docker_summary_line_shows_marks_and_what_they_free() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("nothing marked"), "{t}");
+    let at = e
+        .app
+        .docker
+        .lines
+        .iter()
+        .position(|l| l.key == "section:cache")
+        .unwrap();
+    e.app.docker.cursor = at;
+    e.app.update(Action::ToggleMark);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("marked 2"), "{t}");
+    assert!(t.contains("frees 1.4 GB"), "{t}");
+}
+
+#[test]
+fn docker_status_line_shows_the_vm_disk() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, DOCKER_DF, true, true);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("VM disk"), "{t}");
+}
