@@ -1821,10 +1821,13 @@ impl App {
                 self.refresh_detail();
             }
             Screen::Targets => {
-                let at = self
-                    .tlines
-                    .iter()
-                    .position(|l| *l == Line::Row { group, row });
+                // `usize::MAX` stands for the project's header line.
+                let wanted = if row == usize::MAX {
+                    Line::Group(group)
+                } else {
+                    Line::Row { group, row }
+                };
+                let at = self.tlines.iter().position(|l| *l == wanted);
                 if let Some(at) = at {
                     self.tcursor = at;
                     self.ensure_visible();

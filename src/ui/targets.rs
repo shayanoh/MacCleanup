@@ -572,53 +572,70 @@ fn render_side(frame: &mut Frame, area: Rect, app: &App) -> Vec<graph::GraphHit>
     hits
 }
 
-/// The rows of the group under the cursor (or of the whole section).
+/// What the graph shows: one box or bar for every project and tool in the
+/// list (the groups, honouring the filter), named by their short label. The
+/// one holding the cursor is highlighted.
 fn graph_data(app: &App) -> GraphData {
-    // Every row of the group (or section) as (group, row, data).
-    let of_group = |gi: usize| {
-        app.targets.groups[gi]
-            .rows
-            .iter()
-            .enumerate()
-            .map(move |(ri, t)| (gi, ri, t))
-    };
-    let line = app.tlines.get(app.tcursor).copied();
-    let (rows, cursor): (Vec<(usize, usize, &TRow)>, Option<usize>) = match line {
-        Some(Line::Row { group, row }) => (of_group(group).collect(), Some(row)),
-        Some(Line::Group(group)) => (of_group(group).collect(), None),
-        Some(Line::Section(kind)) => (
-            (0..app.targets.groups.len())
-                .filter(|gi| app.targets.groups[*gi].section == kind)
-                .flat_map(of_group)
-                .collect(),
-            None,
-        ),
-        None => (Vec::new(), None),
-    };
-    let weights: Vec<u64> = rows
+    let shown: Vec<usize> = app
+        .tlines
         .iter()
-        .map(|(_, _, t)| weight(app.sort, &t.row))
+        .filter_map(|l| match l {
+            Line::Group(g) => Some(*g),
+            _ => None,
+        })
         .collect();
-    let scope = match line {
-        Some(Line::Row { group, .. }) | Some(Line::Group(group)) => {
-            app.targets.groups[group].title.clone()
-        }
-        Some(Line::Section(SectionKind::Projects)) => "projects".to_string(),
-        Some(Line::Section(SectionKind::Tools)) => "tools & caches".to_string(),
-        None => String::new(),
+    let cursor_group = match app.tlines.get(app.tcursor) {
+        Some(Line::Group(g)) | Some(Line::Row { group: g, .. }) => Some(*g),
+        _ => None,
     };
+    let rows: Vec<Row> = shown
+        .iter()
+        .map(|&g| {
+            let grp = &app.targets.groups[g];
+            let mut r = grp.as_row();
+            r.name = grp.label.clone().into();
+            r
+        })
+        .collect();
+    let weights: Vec<u64> = rows.iter().map(|r| weight(app.sort, r)).collect();
     GraphData {
         total: weights.iter().sum(),
-        safeties: rows.iter().map(|(_, _, t)| t.safety).collect(),
-        marked: rows
+        safeties: shown
             .iter()
-            .map(|(_, _, t)| app.row_mark(t) == MarkState::Marked)
+            .map(|&g| {
+                // A project is only as safe as its least safe row.
+                let grp = &app.targets.groups[g];
+                if grp
+                    .rows
+                    .iter()
+                    .all(|t| t.safety == crate::safety::Safety::Safe)
+                {
+                    crate::safety::Safety::Safe
+                } else {
+                    crate::safety::Safety::Caution
+                }
+            })
             .collect(),
-        keys: rows.iter().map(|(g, r, _)| (*g, *r)).collect(),
-        rows: rows.iter().map(|(_, _, t)| t.row.live()).collect(),
+        marked: shown
+            .iter()
+            .map(|&g| {
+                let folders: Vec<&TRow> = app.targets.groups[g]
+                    .rows
+                    .iter()
+                    .filter(|t| !t.is_command() && !t.kept)
+                    .collect();
+                !folders.is_empty()
+                    && folders
+                        .iter()
+                        .all(|t| app.row_mark(t) != MarkState::Unmarked)
+            })
+            .collect(),
+        // A click on a project selects its header line.
+        keys: shown.iter().map(|&g| (g, usize::MAX)).collect(),
+        cursor: cursor_group.and_then(|g| shown.iter().position(|s| *s == g)),
+        scope: "everything listed".to_string(),
         weights,
-        cursor,
-        scope,
+        rows,
     }
 }
 

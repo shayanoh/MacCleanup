@@ -1508,7 +1508,7 @@ fn the_graph_follows_the_group_and_t_switches_its_kind() {
     e.app.update(Action::CycleGraph);
     let text = render(&mut e.app, 140, 36);
     assert!(text.contains("Distribution"), "{text}");
-    assert!(text.contains("selected: target"), "{text}");
+    assert!(text.contains("selected: api"), "{text}");
 }
 
 #[test]
@@ -1837,22 +1837,18 @@ fn the_selected_bar_moves_with_a_click() {
 }
 
 #[test]
-fn clicking_a_box_on_caches_and_projects_selects_the_row() {
+fn clicking_a_box_on_caches_and_projects_selects_the_project() {
     let mut e = targets_screen(GlyphMode::Nerd);
     cursor_on_row(&mut e.app, "target");
     let _ = render(&mut e.app, 150, 40);
-    // The graph shows the group under the cursor; another group's rows are
-    // not in it, but this group's other rows are.
     let hits = e.app.graph_hits.clone();
     assert!(!hits.is_empty());
-    for (rect, (g, r)) in hits {
-        let want = e.app.targets.row(g, r).row.path.clone();
+    for (rect, (g, _)) in hits {
+        let want = e.app.targets.groups[g].title.clone();
         let (x, y) = centre(rect);
         e.app.update(Action::Click { x, y });
-        assert_eq!(
-            e.app.selected_target().map(|t| t.row.path.clone()),
-            Some(want)
-        );
+        let line = e.app.tlines[e.app.tcursor];
+        assert_eq!(line, maccleanup::targets::Line::Group(g), "{want}");
         let _ = render(&mut e.app, 150, 40);
     }
 }
@@ -1863,4 +1859,59 @@ fn nothing_is_clickable_in_a_graph_that_is_hidden() {
     e.app.update(Action::CycleGraph); // hidden
     let _ = render(&mut e.app, 140, 36);
     assert!(e.app.graph_hits.is_empty());
+}
+
+#[test]
+fn the_graph_on_caches_shows_every_listed_project_by_name() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    e.app.update(Action::CycleGraph);
+    e.app.update(Action::CycleGraph); // bars
+    assert_eq!(e.app.graph, GraphMode::Bars);
+    cursor_on_row(&mut e.app, "target");
+    let text = render(&mut e.app, 160, 40);
+    for label in ["api", "shop", "App caches"] {
+        assert!(text.contains(label), "graph label {label}:\n{text}");
+    }
+    assert!(
+        text.contains("selected: api"),
+        "the project of the cursor is highlighted:\n{text}"
+    );
+    // One bar per group in the list, not one per row of a single group.
+    let groups = e.app.targets.groups.len();
+    assert_eq!(e.app.graph_hits.len(), groups);
+}
+
+#[test]
+fn clicking_a_project_in_the_graph_selects_its_header() {
+    use maccleanup::targets::Line;
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let _ = render(&mut e.app, 160, 40);
+    let hits = e.app.graph_hits.clone();
+    assert_eq!(hits.len(), e.app.targets.groups.len());
+    for (rect, (g, _)) in hits {
+        let (x, y) = centre(rect);
+        e.app.update(Action::Click { x, y });
+        assert_eq!(e.app.tlines[e.app.tcursor], Line::Group(g), "group {g}");
+        let _ = render(&mut e.app, 160, 40);
+    }
+}
+
+#[test]
+fn the_graph_follows_the_filter_and_folds_do_not_remove_projects_from_it() {
+    let mut e = targets_screen(GlyphMode::Nerd);
+    cursor_on_row(&mut e.app, "target");
+    e.app.focus = maccleanup::app::Focus::Main;
+    e.app.update(Action::Out); // fold ~/api
+    let _ = render(&mut e.app, 160, 40);
+    assert_eq!(
+        e.app.graph_hits.len(),
+        e.app.targets.groups.len(),
+        "folded, still graphed"
+    );
+    e.app.update(Action::FilterOpen);
+    for c in "spot".chars() {
+        e.app.update(Action::FilterChar(c));
+    }
+    let _ = render(&mut e.app, 160, 40);
+    assert_eq!(e.app.graph_hits.len(), 1, "only App caches matches");
 }

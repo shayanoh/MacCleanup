@@ -21,8 +21,9 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Some(Action::Quit),
-            KeyCode::Char('d') if app.dialog.is_none() => Some(Action::PageDown),
-            KeyCode::Char('u') if app.dialog.is_none() => Some(Action::PageUp),
+            // Page keys: Ctrl-F / Ctrl-B as in vim, plus Ctrl-D / Ctrl-U.
+            KeyCode::Char('f' | 'd') if app.dialog.is_none() => Some(Action::PageDown),
+            KeyCode::Char('b' | 'u') if app.dialog.is_none() => Some(Action::PageUp),
             _ => None,
         };
     }
@@ -589,5 +590,33 @@ mod tests {
         let mut e = env(FILES);
         e.app.update(Action::FilterOpen);
         assert_eq!(map_key(ch('5'), &e.app), Some(Action::FilterChar('5')));
+    }
+
+    #[test]
+    fn ctrl_f_and_ctrl_b_page_like_vim_and_ctrl_d_and_u_still_work() {
+        let e = env(FILES);
+        let k = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert_eq!(map_key(k('f'), &e.app), Some(Action::PageDown));
+        assert_eq!(map_key(k('b'), &e.app), Some(Action::PageUp));
+        assert_eq!(map_key(k('d'), &e.app), Some(Action::PageDown));
+        assert_eq!(map_key(k('u'), &e.app), Some(Action::PageUp));
+        // Ctrl-N is not a page key.
+        assert_eq!(map_key(k('n'), &e.app), None);
+    }
+
+    #[test]
+    fn page_keys_do_nothing_while_a_dialog_is_open_and_are_editing_keys_in_the_filter() {
+        let mut e = env(FILES);
+        let k = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        e.app.update(Action::FilterOpen);
+        assert_eq!(
+            map_key(k('f'), &e.app),
+            None,
+            "Ctrl-F is not text and not a page key while typing"
+        );
+        e.app.update(Action::FilterAccept);
+        e.app.dialog = Some(Dialog::Notice("x".into()));
+        assert_eq!(map_key(k('f'), &e.app), None);
+        assert_eq!(map_key(k('b'), &e.app), None);
     }
 }

@@ -36,6 +36,9 @@ pub struct TRow {
     /// How it comes back after cleaning.
     pub regen: String,
     pub note: Option<String>,
+    /// A final product (a built program) that bulk marks leave alone: it is
+    /// deleted only when the user marks that row itself.
+    pub kept: bool,
 }
 
 impl TRow {
@@ -47,6 +50,8 @@ impl TRow {
 #[derive(Clone)]
 pub struct Group {
     pub title: String,
+    /// The short name the graph shows: the project folder's name, or the tool.
+    pub label: String,
     pub subtitle: String,
     pub section: SectionKind,
     pub rows: Vec<TRow>,
@@ -111,6 +116,7 @@ struct Cand {
     priority: u8,
     section: SectionKind,
     group: String,
+    label: String,
     subtitle: String,
     name: String,
     kind: RowKind,
@@ -173,6 +179,7 @@ impl Targets {
                 priority: 0,
                 section: SectionKind::Tools,
                 group: e.tool.clone(),
+                label: e.tool.clone(),
                 subtitle: String::new(),
                 name: e.label.clone(),
                 kind: match &e.mode {
@@ -194,6 +201,10 @@ impl Targets {
                 priority: 1,
                 section: SectionKind::Projects,
                 group: display_path(home, &c.project),
+                label: c
+                    .project
+                    .file_name()
+                    .map_or_else(|| "~".to_string(), |n| n.to_string_lossy().into_owned()),
                 subtitle: project_kind(c.kind).to_string(),
                 name: c.kind.label().to_string(),
                 kind: RowKind::Folder,
@@ -253,6 +264,7 @@ impl Targets {
                 safety: policy.classify(&c.path),
                 regen: c.regen,
                 note: c.note,
+                kept: false,
             };
             match groups
                 .iter_mut()
@@ -262,6 +274,7 @@ impl Targets {
                 None => groups.push(Group {
                     open: !closed.contains(&format!("{:?}:{}", c.section, c.group)),
                     title: c.group,
+                    label: c.label,
                     subtitle: c.subtitle,
                     section: c.section,
                     rows: vec![trow],
@@ -452,6 +465,30 @@ mod tests {
         names.sort();
         assert_eq!(names, [".next", "node_modules"]);
         assert_eq!(shop.subtitle, "Node");
+    }
+
+    #[test]
+    fn groups_have_a_short_label_for_the_graph() {
+        let s = sandbox(project);
+        let e = entry(
+            &s.home,
+            "spotify",
+            "App caches",
+            "Library/Caches/Spotify",
+            Mode::Folder,
+        );
+        let t = build(&s, &[e]);
+        let label = |title: &str| {
+            t.groups
+                .iter()
+                .find(|g| g.title == title)
+                .unwrap()
+                .label
+                .clone()
+        };
+        assert_eq!(label("~/shop"), "shop");
+        assert_eq!(label("~/api"), "api");
+        assert_eq!(label("App caches"), "App caches");
     }
 
     #[test]
