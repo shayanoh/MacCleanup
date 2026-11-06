@@ -34,7 +34,9 @@ pub fn removal_spec(cli: &DockerCli, data: &DockerData, id: &str) -> Option<Comm
     if let Some(raw) = id.strip_prefix("cache:") {
         data.cache.iter().find(|r| r.id == raw)?;
         let filter = format!("id={raw}");
-        return Some(cli.cli(&["builder", "prune", "-f", "--filter", &filter]));
+        // `-a`: without it Docker keeps "internal" and "frontend" records
+        // whatever the id filter says. The filter still limits it to this one.
+        return Some(cli.cli(&["builder", "prune", "-a", "-f", "--filter", &filter]));
     }
     None
 }
@@ -117,7 +119,7 @@ mod tests {
     fn a_cache_record_is_pruned_by_its_id_without_asking() {
         assert_eq!(
             args("cache:rec1")[1..],
-            ["builder", "prune", "-f", "--filter", "id=rec1"]
+            ["builder", "prune", "-a", "-f", "--filter", "id=rec1"]
         );
     }
 

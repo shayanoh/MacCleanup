@@ -17,6 +17,9 @@ pub struct Accounting {
     moved_total: Usage,
     emptied_total: Usage,
     restored_total: Usage,
+    /// Most that the tool commands (Docker, pnpm, ...) that succeeded could
+    /// free: an estimate, the real figure is in the free-space change.
+    commands_total: u64,
     events: Vec<Event>,
 }
 
@@ -28,6 +31,7 @@ impl Accounting {
             moved_total: Usage::default(),
             emptied_total: Usage::default(),
             restored_total: Usage::default(),
+            commands_total: 0,
             events: Vec::new(),
         }
     }
@@ -63,6 +67,12 @@ impl Accounting {
         self.push("emptied ToBeDeleted", usage);
     }
 
+    /// Tool commands that ran fine, with the most they might have freed.
+    pub fn record_commands(&mut self, up_to: u64) {
+        self.commands_total += up_to;
+        self.push("tool commands", Usage::new(up_to, up_to));
+    }
+
     /// Soft-deleted but not yet freed.
     pub fn pending(&self) -> Usage {
         self.pending
@@ -83,6 +93,15 @@ impl Accounting {
             rows.push(("moved to ToBeDeleted", both_usage(self.moved_total)));
         }
         rows.push(("deleted for good", both_usage(self.emptied_total)));
+        if self.commands_total > 0 {
+            rows.push((
+                "tool commands",
+                format!(
+                    "up to {} (Docker, caches; see space freed)",
+                    human_size(self.commands_total)
+                ),
+            ));
+        }
         if self.restored_total != Usage::default() {
             rows.push(("restored", both_usage(self.restored_total)));
         }
@@ -92,7 +111,14 @@ impl Accounting {
                 format!("{} (empty it to free that space)", both_usage(self.pending)),
             ));
         }
-        rows.push(("space freed", human_size(self.freed(free_now))));
+        rows.push(("free at start", human_size(self.free_at_start)));
+        rows.push(("free now", human_size(free_now)));
+        let change = free_now as i128 - self.free_at_start as i128;
+        let sign = if change < 0 { "-" } else { "+" };
+        rows.push((
+            "space freed",
+            format!("{sign}{}", human_size(change.unsigned_abs() as u64)),
+        ));
         let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
         let mut text = String::from("MacCleanup summary");
         for (label, value) in rows {

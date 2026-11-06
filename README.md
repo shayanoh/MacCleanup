@@ -21,7 +21,7 @@ A colorful, animated terminal app (Rust TUI) for macOS that shows where your dis
 - **Rescan:** `r` rescans the folder you are viewing and updates the totals above it; `R` rescans everything from the scan root.
 - **Graphs:** a treemap (box area equals size, the default) and a bar graph that follow your selection. Cycle treemap, hidden and bars with `t`; resize the panel with `[` (bigger) and `]` (smaller). Graphs and share bars follow the sorted size (on-disk by default). A large treemap box shows what is inside the folder as boxes within it, as deep as there is room. Rest the mouse on a box or bar to highlight it and, after a moment, see a tooltip with its full name, sizes and share.
 - **Motion:** windows grow in, and the congratulations window rains confetti. `--no-animation` turns all of it off.
-- **Quit summary:** when you quit, the app prints what the session did (moved, deleted for good, restored, still pending) and how much space was truly freed.
+- **Quit summary:** when you quit, the app prints what the session did (moved, deleted for good, restored, still pending) and tool commands (Docker, caches), free space at start and now, and how much space was truly freed. The bottom line of every page shows the free space now and at start.
 - **Honest accounting:** the finish screen reports space truly freed (the volume's free space now minus at the start), not just what was moved.
 - **Safety:** a hard-coded protected list, a review screen before every delete, and an extra explicit confirmation for anything irreversible (see below).
 
@@ -92,8 +92,8 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `Tab` | Switch focus between the menu and the list (the menu has focus at startup: `j`/`k` choose a screen, `Enter` opens it) |
 | `1` to `7` | Open the page at that position in the menu (the number is shown beside each entry; planned pages say they are coming) |
 | `h` / `l` (Caches & Projects) | Fold / open the group; `l` or `Enter` on a row shows it in the Explorer |
-| `m` (Caches & Projects) | Mark the selected folder and every folder that shares its data |
-| `m` (Docker) | Mark the stopped containers the selected image or volume needs removed first |
+| `m` (Caches & Projects) | Mark the selected folder and every folder that shares its data; press again to unmark them |
+| `m` (Docker) | Mark the stopped containers the selected image or volume needs removed first; press again to unmark them |
 | `b` (Docker) | Look inside the selected image or volume, read-only (`l` / `Enter` open a folder, `h` up, `Esc` back, `s` sorts, `/` filters) |
 | `J` / `K` (Docker) | Scroll the details pane (the whole command line of a layer or build step) |
 | `r` / `D` / `E` (ToBeDeleted screen) | Restore / delete for good / empty all |

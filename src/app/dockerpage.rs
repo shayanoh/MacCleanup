@@ -266,6 +266,7 @@ impl App {
             .map(|f| f.needs.clone())
             .unwrap_or_default();
         let mut changed = 0;
+        let needs_marked = needs.clone();
         for id in needs {
             let ok = self.docker.facts(&id).is_some_and(|f| f.removable.is_ok());
             if ok && self.tool_marks.insert(id) {
@@ -277,6 +278,16 @@ impl App {
             self.notice = Some(format!(
                 "Marked {changed} container(s) that must go with it"
             ));
+            return;
+        }
+        // All of them were already marked: pressing `m` again undoes it.
+        let undone = needs_marked
+            .iter()
+            .filter(|id| self.tool_marks.remove(*id))
+            .count();
+        if undone > 0 {
+            self.marks_changed();
+            self.notice = Some(format!("Unmarked {undone} container(s)"));
         } else {
             self.notice = Some("Nothing more to mark here".to_string());
         }
@@ -912,7 +923,8 @@ mod tests {
             "only the related ones"
         );
         e.app.update(Action::MarkRelated);
-        assert_eq!(e.app.notice.as_deref(), Some("Nothing more to mark here"));
+        assert_eq!(e.app.notice.as_deref(), Some("Unmarked 1 container(s)"));
+        assert!(!e.app.tool_marks.contains("container:c0ffee2"));
     }
 
     // --- removing: review, order, trim, refusal, finish ----------------

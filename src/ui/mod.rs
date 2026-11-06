@@ -374,8 +374,23 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
     let sep = format!(" {} ", g.dot());
-    let text = fit(&hints.join(&sep), area.width as usize, g);
-    frame.render_widget(Paragraph::new(text).style(Style::default().fg(DIM)), area);
+    // Free disk space, always visible at the right: now and at the start.
+    let free = format!(
+        "free {} (start {})",
+        crate::fmt::human_size(app.free_now),
+        crate::fmt::human_size(app.accounting.free_at_start())
+    );
+    let free_w = (free.chars().count() as u16 + 1).min(area.width / 2);
+    let [left, right] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(free_w)]).areas(area);
+    let text = fit(&hints.join(&sep), left.width as usize, g);
+    frame.render_widget(Paragraph::new(text).style(Style::default().fg(DIM)), left);
+    frame.render_widget(
+        Paragraph::new(fit(&free, right.width as usize, g))
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(DIM)),
+        right,
+    );
 }
 
 #[cfg(test)]

@@ -1806,15 +1806,25 @@ impl App {
             todo.push((t.row.path.clone(), Usage::new(t.row.size, t.row.disk)));
         }
         todo.extend(self.holders_view().into_iter().map(|h| (h.path, h.usage)));
-        for (p, u) in todo {
-            if self.mark_state(&p) == MarkState::Unmarked && self.policy.can_mark(&p) {
-                self.insert_mark(p, u);
+        for (p, u) in &todo {
+            if self.mark_state(p) == MarkState::Unmarked && self.policy.can_mark(p) {
+                self.insert_mark(p.clone(), *u);
                 changed += 1;
             }
         }
         if changed > 0 {
             self.marks_changed();
             self.notice = Some(format!("Marked {changed} related folder(s)"));
+            return;
+        }
+        // Everything related is already marked: pressing `m` again undoes it.
+        let undone = todo
+            .iter()
+            .filter(|(p, _)| self.marks.remove(p).is_some())
+            .count();
+        if undone > 0 {
+            self.marks_changed();
+            self.notice = Some(format!("Unmarked {undone} related folder(s)"));
         } else {
             self.notice = Some("Nothing more to mark here".to_string());
         }
@@ -2531,7 +2541,17 @@ impl App {
         // Commands that failed only because a lock was held, and that have a
         // force variant, can be offered again in their forced form.
         let outcomes = std::mem::take(&mut self.cmd_outcomes);
-        let retry: Vec<ReviewCommand> = std::mem::take(&mut self.pending_meta)
+        let metas = std::mem::take(&mut self.pending_meta);
+        let succeeded: u64 = metas
+            .iter()
+            .zip(&outcomes)
+            .filter(|(_, out)| out.ok)
+            .map(|(meta, _)| meta.up_to)
+            .sum();
+        if succeeded > 0 {
+            self.accounting.record_commands(succeeded);
+        }
+        let retry: Vec<ReviewCommand> = metas
             .into_iter()
             .zip(&outcomes)
             .filter(|(meta, out)| meta.can_force && !meta.force && out.lock_wait)
