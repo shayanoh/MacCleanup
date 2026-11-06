@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use super::command::{CommandRunner, CommandSpec};
 use super::resolve::{Places, resolve_in};
+use crate::safety::keeps_offline_data;
 
 /// How a cache is cleaned.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -363,14 +364,21 @@ fn app_caches(home: &Path, claimed: &[PathBuf]) -> Vec<ToolEntry> {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
+            let offline = keeps_offline_data(&name);
             out.push(ToolEntry {
                 id: format!("app-cache:{rel}"),
                 tool: "App caches".to_string(),
                 label: name,
                 path,
-                regen: "rebuilt by the app as needed".to_string(),
+                regen: if offline {
+                    "hard to rebuild: may hold offline downloads or saved media".to_string()
+                } else {
+                    "rebuilt by the app as needed".to_string()
+                },
                 mode: Mode::Folder,
-                note: None,
+                note: offline.then(|| {
+                    "check this one before you empty ToBeDeleted: offline music, saved media or downloads can live here".to_string()
+                }),
             });
         }
     }
@@ -621,6 +629,31 @@ mod tests {
             !apps.contains(&"go-build"),
             "claimed by the Go entry: {apps:?}"
         );
+    }
+
+    #[test]
+    fn app_caches_that_may_hold_offline_data_say_so() {
+        let h = home();
+        dir(&h.home.join("Library/Caches/Spotify"));
+        dir(&h.home.join("Library/Caches/ru.keepcoder.Telegram"));
+        dir(&h.home.join(".cache/huggingface"));
+        dir(&h.home.join("Library/Caches/SomeEditor"));
+        let entries = find(&h, &FakeRunner::new(&[]));
+        for label in ["Spotify", "ru.keepcoder.Telegram", "huggingface"] {
+            let e = entries.iter().find(|e| e.label == label).unwrap();
+            assert!(
+                e.regen.starts_with("hard to rebuild"),
+                "{label}: {}",
+                e.regen
+            );
+            assert!(
+                e.note.as_deref().unwrap_or("").contains("before you empty"),
+                "{label}"
+            );
+        }
+        let plain = entries.iter().find(|e| e.label == "SomeEditor").unwrap();
+        assert_eq!(plain.regen, "rebuilt by the app as needed");
+        assert!(plain.note.is_none());
     }
 
     #[test]

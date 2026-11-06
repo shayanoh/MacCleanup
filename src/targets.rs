@@ -492,6 +492,40 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_that_may_hold_offline_data_is_caution_and_still_listed() {
+        let s = sandbox(|h| {
+            write(&h.join("Library/Caches/Spotify/blob"), 50_000);
+            write(&h.join("Library/Caches/Plain/blob"), 50_000);
+        });
+        let entries = [
+            entry(
+                &s.home,
+                "spotify",
+                "App caches",
+                "Library/Caches/Spotify",
+                Mode::Folder,
+            ),
+            entry(
+                &s.home,
+                "plain",
+                "App caches",
+                "Library/Caches/Plain",
+                Mode::Folder,
+            ),
+        ];
+        let t = build(&s, &entries);
+        let rows = &t
+            .groups
+            .iter()
+            .find(|g| g.title == "App caches")
+            .unwrap()
+            .rows;
+        let safety = |n: &str| rows.iter().find(|r| r.row.name == n).unwrap().safety;
+        assert_eq!(safety("spotify"), Safety::Caution);
+        assert_eq!(safety("plain"), Safety::Safe);
+    }
+
+    #[test]
     fn command_rows_carry_their_spec() {
         let s = sandbox(project);
         let spec = CommandSpec::new("/x/pnpm", &["store", "prune"]);

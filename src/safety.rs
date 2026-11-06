@@ -67,6 +67,44 @@ const PROTECTED_SECRET_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".kube"];
 const PROTECTED_SUFFIXES: &[&str] = &[".photoslibrary", ".sparsebundle", ".sparseimage"];
 const SAFE_DIR_NAMES: &[&str] = &["node_modules", ".next", ".turbo", "DerivedData"];
 
+/// App cache folders that can hold more than rebuildable scraps: offline
+/// music, saved media, downloaded models, synced files. Matched as lowercase
+/// fragments of the folder name (bundle ids included).
+const OFFLINE_DATA_HINTS: &[&str] = &[
+    "spotify",
+    "telegram",
+    "keepcoder",
+    "whatsapp",
+    "signal",
+    "netflix",
+    "plex",
+    "audible",
+    "kindle",
+    "deezer",
+    "tidal",
+    "soundcloud",
+    "podcast",
+    "com.apple.music",
+    "com.apple.tv",
+    "dropbox",
+    "onedrive",
+    "drivefs",
+    "lightroom",
+    "huggingface",
+    "whisper",
+    "torch",
+    "lm-studio",
+    "ollama",
+];
+
+/// Does a cache folder with this name probably hold offline downloads or
+/// saved media that is slow or impossible to get back? Such folders may still
+/// be deleted, but they are never shown as safe.
+pub fn keeps_offline_data(name: &str) -> bool {
+    let name = name.to_lowercase();
+    !name.is_empty() && OFFLINE_DATA_HINTS.iter().any(|h| name.contains(h))
+}
+
 /// Canonicalize as much of `path` as exists, then append the rest unchanged.
 fn canonicalize_lenient(path: &Path) -> PathBuf {
     if let Ok(p) = path.canonicalize() {
@@ -153,6 +191,19 @@ impl Policy {
             if PROTECTED_LIBRARY_TREE.contains(&second) {
                 return Safety::Protected;
             }
+        }
+
+        // A cache that may hold offline downloads or saved media: deletable,
+        // but never shown as safe.
+        let app_cache = if first == "Library" && comps.len() >= 3 && comps[1] == "Caches" {
+            Some(comps[2].as_str())
+        } else if first == ".cache" && comps.len() >= 2 {
+            Some(comps[1].as_str())
+        } else {
+            None
+        };
+        if app_cache.is_some_and(keeps_offline_data) {
+            return Safety::Caution;
         }
 
         // Known-disposable locations.
@@ -280,6 +331,64 @@ mod tests {
             s.policy.classify(&s.home.join("Documents/notes.txt")),
             Safety::Caution
         );
+    }
+
+    #[test]
+    fn caches_that_may_hold_offline_data_are_not_shown_as_safe() {
+        let s = sandbox();
+        let h = &s.home;
+        for rel in [
+            "Library/Caches/com.spotify.client",
+            "Library/Caches/Spotify/PersistentCache/x",
+            "Library/Caches/ru.keepcoder.Telegram",
+            "Library/Caches/Telegram Desktop",
+            "Library/Caches/net.whatsapp.WhatsApp",
+            "Library/Caches/com.netflix.Netflix",
+            "Library/Caches/com.plexapp.plexmediaserver",
+            "Library/Caches/com.apple.Music",
+            "Library/Caches/com.apple.podcasts",
+            "Library/Caches/com.getdropbox.dropbox",
+            ".cache/huggingface/hub/models--x",
+            ".cache/whisper/medium.pt",
+            ".cache/torch",
+            ".cache/lm-studio",
+        ] {
+            assert_eq!(s.policy.classify(&h.join(rel)), Safety::Caution, "{rel}");
+            // Deletion is never denied; the folder has to exist to be resolved.
+            fs::create_dir_all(h.join(rel)).unwrap();
+            assert!(s.policy.can_mark(&h.join(rel)), "never denied: {rel}");
+        }
+    }
+
+    #[test]
+    fn ordinary_rebuildable_caches_stay_safe() {
+        let s = sandbox();
+        let h = &s.home;
+        for rel in [
+            "Library/Caches/Homebrew",
+            "Library/Caches/go-build",
+            "Library/Caches/pip",
+            "Library/Caches/com.google.Chrome",
+            ".cache/uv",
+            ".npm/_cacache",
+        ] {
+            assert_eq!(s.policy.classify(&h.join(rel)), Safety::Safe, "{rel}");
+        }
+    }
+
+    #[test]
+    fn offline_data_hint_ignores_case_and_matches_bundle_ids() {
+        for name in [
+            "Spotify",
+            "spotify",
+            "com.spotify.client",
+            "ru.keepcoder.Telegram",
+        ] {
+            assert!(keeps_offline_data(name), "{name}");
+        }
+        for name in ["Homebrew", "go-build", "", "uv"] {
+            assert!(!keeps_offline_data(name), "{name}");
+        }
     }
 
     #[test]
