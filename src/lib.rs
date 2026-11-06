@@ -13,4 +13,5 @@ pub mod softdelete;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod treemap;
+pub mod ui;
 pub mod volume;

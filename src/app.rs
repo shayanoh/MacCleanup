@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ratatui::layout::Rect;
 
 use crate::accounting::Accounting;
+use crate::anim::Smooth;
 use crate::fmt::human_size;
 use crate::glyphs::Glyphs;
 use crate::jobs::{DeleteEvent, DeleteJob, DeleteMode};
@@ -191,6 +192,8 @@ pub struct App {
     pub held_offset: usize,
     pub accounting: Accounting,
     pub free_now: u64,
+    /// `free_now` glided toward, for the animated gauge.
+    pub free_shown: Smooth,
     pub total_space: u64,
     pub tick: u64,
     pub notice: Option<String>,
@@ -258,6 +261,7 @@ impl App {
             held_offset: 0,
             accounting,
             free_now,
+            free_shown: Smooth::new(free_now as f64),
             total_space,
             tick: 0,
             notice: None,
@@ -300,7 +304,7 @@ impl App {
         }
     }
 
-    fn ensure_visible(&mut self) {
+    pub fn ensure_visible(&mut self) {
         let vis = self.visible_rows();
         self.offset = window(self.cursor, self.offset, vis);
         self.held_offset = window(self.held_cursor, self.held_offset, vis);
@@ -400,6 +404,11 @@ impl App {
     fn on_tick(&mut self) {
         self.tick += 1;
         self.poll_job();
+        if self.animations {
+            self.free_shown.step(self.free_now as f64, 0.15);
+        } else {
+            self.free_shown = Smooth::new(self.free_now as f64);
+        }
         if self.tick.is_multiple_of(20) {
             self.refresh_free();
         }

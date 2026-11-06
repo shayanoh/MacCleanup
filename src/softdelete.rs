@@ -30,6 +30,8 @@ pub enum HoldError {
 mod path_bytes {
     use super::*;
 
+    // serde's `with` passes `&PathBuf` (the field type), so the signature must match.
+    #[allow(clippy::ptr_arg)]
     pub fn serialize<S: serde::Serializer>(p: &PathBuf, s: S) -> Result<S::Ok, S::Error> {
         p.as_os_str().as_bytes().serialize(s)
     }

@@ -55,6 +55,36 @@ impl Glyphs {
         self.pick("\u{f017}", "(p)")
     }
 
+    pub fn hatch(&self) -> &'static str {
+        self.pick("░", "/")
+    }
+    pub fn star(&self) -> &'static str {
+        self.pick("★", "*")
+    }
+    pub fn dot(&self) -> &'static str {
+        self.pick("·", "|")
+    }
+    pub fn ellipsis(&self) -> &'static str {
+        self.pick("…", "...")
+    }
+    pub fn check(&self) -> &'static str {
+        self.pick("\u{f00c}", "ok")
+    }
+    pub fn warn(&self) -> &'static str {
+        self.pick("\u{f071}", "!")
+    }
+    /// Sidebar icon for entry `i`.
+    pub fn nav(&self, i: usize) -> &'static str {
+        const NERD: [&str; 8] = [
+            "\u{f015}", "\u{f07c}", "\u{f12d}", "\u{f187}", "\u{f1c0}", "\u{f308}", "\u{f121}",
+            "\u{f1f8}",
+        ];
+        match self.mode {
+            GlyphMode::Nerd => NERD.get(i).copied().unwrap_or("\u{f111}"),
+            GlyphMode::Ascii => "*",
+        }
+    }
+
     pub fn spinner(&self) -> &'static [&'static str] {
         match self.mode {
             GlyphMode::Nerd => NERD_SPINNER,
@@ -86,6 +116,14 @@ mod tests {
             g.caution(),
             g.protected(),
             g.pending(),
+            g.hatch(),
+            g.star(),
+            g.dot(),
+            g.ellipsis(),
+            g.check(),
+            g.warn(),
+            g.nav(0),
+            g.nav(7),
         ];
         v.extend(g.spinner().iter().copied());
         v

@@ -69,6 +69,11 @@ impl Node {
         self.done.load(Ordering::Acquire)
     }
 
+    /// Snapshot of the sub-directories discovered so far.
+    pub fn children(&self) -> Vec<Arc<Node>> {
+        lock(&self.subdirs).clone()
+    }
+
     pub fn subdir(&self, path: &Path) -> Option<Arc<Node>> {
         lock(&self.subdirs).iter().find(|n| n.path == path).cloned()
     }
