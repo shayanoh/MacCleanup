@@ -55,6 +55,8 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('r') if app.screen == Screen::Holding => Some(Action::RestoreSelected),
         KeyCode::Char('D') if app.screen == Screen::Holding => Some(Action::DeleteSelectedForever),
         KeyCode::Char('E') if app.screen == Screen::Holding => Some(Action::EmptyAll),
+        KeyCode::Char('r') => Some(Action::Rescan),
+        KeyCode::Char('R') if app.screen != Screen::Holding => Some(Action::RescanAll),
         _ => None,
     }
 }
@@ -152,7 +154,8 @@ mod tests {
             // Dialog-only and holding-only keys do nothing here.
             (ch('x'), None),
             (ch('y'), None),
-            (ch('r'), None),
+            (ch('r'), Some(Action::Rescan)),
+            (ch('R'), Some(Action::RescanAll)),
             (ch('D'), None),
             (ch('E'), None),
             (ch('z'), None),
@@ -302,5 +305,19 @@ mod tests {
         assert_eq!(map_mouse(click, app), None);
         let wheel = mouse(MouseEventKind::ScrollDown, 5, 7);
         assert_eq!(map_mouse(wheel, app), None);
+    }
+
+    #[test]
+    fn rescan_keys_on_every_screen() {
+        let mut e = env(FILES);
+        assert_eq!(map_key(ch('r'), &e.app), Some(Action::Rescan));
+        assert_eq!(map_key(ch('R'), &e.app), Some(Action::RescanAll));
+        e.app.update(Action::GoTo(Screen::Home));
+        assert_eq!(map_key(ch('r'), &e.app), Some(Action::Rescan));
+        assert_eq!(map_key(ch('R'), &e.app), Some(Action::RescanAll));
+        // On the ToBeDeleted screen `r` restores, and R does nothing.
+        e.app.update(Action::GoTo(Screen::Holding));
+        assert_eq!(map_key(ch('r'), &e.app), Some(Action::RestoreSelected));
+        assert_eq!(map_key(ch('R'), &e.app), None);
     }
 }

@@ -87,3 +87,17 @@ pub fn settle(app: &mut App) {
     }
     panic!("delete job did not finish");
 }
+
+/// Tick until the scanner has finished and the rows have been refreshed.
+pub fn wait_scan(app: &mut App) {
+    for _ in 0..2000 {
+        app.update(Action::Tick);
+        if app.scanner.is_idle() {
+            app.update(Action::Tick);
+            app.update(Action::Tick);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("scan did not finish");
+}

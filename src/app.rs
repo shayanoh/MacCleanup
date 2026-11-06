@@ -116,9 +116,16 @@ pub enum Action {
     CycleSort,
     FocusToggle,
     GoTo(Screen),
-    Click { x: u16, y: u16 },
+    Click {
+        x: u16,
+        y: u16,
+    },
     Scroll(i16),
     Tick,
+    /// Rescan the folder being shown.
+    Rescan,
+    /// Rescan everything from the scan root.
+    RescanAll,
     Confirm,
     Cancel,
     ConfirmIrreversible,
@@ -440,6 +447,8 @@ impl App {
                 }
             }
             Action::GoTo(screen) => self.goto(screen),
+            Action::Rescan => self.rescan(false),
+            Action::RescanAll => self.rescan(true),
             Action::Click { x, y } => self.click(x, y),
             Action::RestoreSelected => self.restore_selected(),
             Action::DeleteSelectedForever => self.ask_delete_forever(),
@@ -525,6 +534,40 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Rescan the current folder (or everything). Refused while a scan runs.
+    fn rescan(&mut self, all: bool) {
+        if self.screen == Screen::Holding {
+            return;
+        }
+        if !self.scanner.is_idle() {
+            self.notice = Some("A scan is still running. Wait for it to finish.".to_string());
+            return;
+        }
+        let whole = all || self.screen == Screen::Home || self.stack.len() == 1;
+        if whole {
+            let root_path = self.stack[0].path.clone();
+            let Some(root) = self.scanner.rescan_all(&root_path) else {
+                return;
+            };
+            self.stack = vec![root];
+            self.cursor = 0;
+            self.offset = 0;
+            self.rows.clear();
+            self.pending_select = None;
+            self.notice = Some("Rescanning everything...".to_string());
+        } else {
+            let node = Arc::clone(self.current());
+            let Some(fresh) = self.scanner.rescan_dir(&node) else {
+                return;
+            };
+            let name = fresh.name.to_string_lossy().into_owned();
+            let last = self.stack.len() - 1;
+            self.stack[last] = fresh;
+            self.notice = Some(format!("Rescanning {name}..."));
+        }
+        self.refresh_rows();
     }
 
     fn enter(&mut self) {
@@ -1459,5 +1502,92 @@ mod tests {
             }
             other => panic!("expected finish, got {}", other.is_some()),
         }
+    }
+
+    #[test]
+    fn rescan_folder_picks_up_new_files() {
+        let mut e = env(FILES);
+        let home = e.home.clone();
+        let app = &mut e.app;
+        app.update(Action::Into); // a/
+        assert_eq!(names(app), ["f"]);
+        crate::testutil::write(&home.join("a/new"), 20480);
+        app.update(Action::Rescan);
+        assert!(app.notice.is_some());
+        crate::testutil::wait_scan(app);
+        assert_eq!(app.stack.len(), 2, "still inside the folder");
+        assert_eq!(names(app), ["new", "f"]);
+        assert_eq!(app.current().size(), 12288 + 20480);
+        assert_eq!(app.stack[0].size(), 12288 + 8192 + 4096 + 20480);
+        assert!(app.current().is_done());
+    }
+
+    #[test]
+    fn rescan_all_returns_to_the_root_and_picks_up_changes() {
+        let mut e = env(FILES);
+        let home = e.home.clone();
+        let app = &mut e.app;
+        app.update(Action::Into);
+        crate::testutil::write(&home.join("d/g"), 16384);
+        app.update(Action::RescanAll);
+        crate::testutil::wait_scan(app);
+        assert_eq!(app.stack.len(), 1);
+        assert!(names(app).contains(&"d".to_string()), "{:?}", names(app));
+        assert_eq!(app.current().size(), 12288 + 8192 + 4096 + 16384);
+    }
+
+    #[test]
+    fn rescan_at_the_root_rescans_everything() {
+        let mut e = env(FILES);
+        let home = e.home.clone();
+        let app = &mut e.app;
+        crate::testutil::write(&home.join("d/g"), 16384);
+        app.update(Action::Rescan);
+        crate::testutil::wait_scan(app);
+        assert!(names(app).contains(&"d".to_string()));
+    }
+
+    #[test]
+    fn rescan_is_refused_while_a_scan_runs() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        app.update(Action::Into);
+        let before = std::sync::Arc::clone(app.current());
+        app.scanner.set_busy(true);
+        app.update(Action::Rescan);
+        app.update(Action::RescanAll);
+        app.scanner.set_busy(false);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("still running")
+        );
+        assert_eq!(app.stack.len(), 2);
+        assert!(std::sync::Arc::ptr_eq(app.current(), &before));
+    }
+
+    #[test]
+    fn rescan_does_nothing_on_the_holding_screen() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        app.update(Action::GoTo(Screen::Holding));
+        let root = std::sync::Arc::clone(&app.stack[0]);
+        app.update(Action::Rescan);
+        app.update(Action::RescanAll);
+        assert!(std::sync::Arc::ptr_eq(&app.stack[0], &root));
+    }
+
+    #[test]
+    fn rescan_keeps_the_cursor_and_marks() {
+        let mut e = env(FILES);
+        let home = e.home.clone();
+        let app = &mut e.app;
+        select(app, "b.bin");
+        app.update(Action::ToggleMark);
+        app.update(Action::Rescan);
+        crate::testutil::wait_scan(app);
+        assert!(app.marks.contains_key(&home.join("b.bin")));
+        assert_eq!(app.selected_row().unwrap().name, "b.bin");
     }
 }

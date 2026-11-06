@@ -90,6 +90,22 @@ fn add_up(node: &Arc<Node>, size: u64, disk: u64, files: u64) {
     }
 }
 
+/// Subtract from a node and every ancestor (never below zero).
+fn sub_up(node: &Arc<Node>, size: u64, disk: u64, files: u64) {
+    let sub = |counter: &AtomicU64, by: u64| {
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(by))
+        });
+    };
+    let mut cur = Some(Arc::clone(node));
+    while let Some(n) = cur {
+        sub(&n.size, size);
+        sub(&n.disk, disk);
+        sub(&n.files, files);
+        cur = n.parent.upgrade();
+    }
+}
+
 /// One unit of pending work finished; mark finished subtrees done upwards.
 fn finish_one(node: &Arc<Node>) {
     let mut cur = Some(Arc::clone(node));
@@ -143,7 +159,9 @@ impl Row {
 }
 
 struct Shared {
-    seen: Mutex<HashSet<(u64, u64)>>,
+    /// Hard-linked files already counted: (device, inode) -> the folder that
+    /// counted it, so a subtree rescan can forget exactly its own entries.
+    seen: Mutex<HashMap<(u64, u64), PathBuf>>,
     denied: Mutex<Vec<PathBuf>>,
     threads: Mutex<HashSet<ThreadId>>,
     files_seen: AtomicU64,
@@ -174,7 +192,7 @@ impl Scanner {
         Scanner {
             pool,
             shared: Arc::new(Shared {
-                seen: Mutex::new(HashSet::new()),
+                seen: Mutex::new(HashMap::new()),
                 denied: Mutex::new(Vec::new()),
                 threads: Mutex::new(HashSet::new()),
                 files_seen: AtomicU64::new(0),
@@ -253,6 +271,86 @@ impl Scanner {
             }
         }
         rows
+    }
+
+    /// Start over: scan `path` again from scratch with fresh counters.
+    /// Returns `None` while a scan is still running.
+    pub fn rescan_all(&self, path: &Path) -> Option<Arc<Node>> {
+        if !self.is_idle() {
+            return None;
+        }
+        lock(&self.shared.seen).clear();
+        lock(&self.shared.denied).clear();
+        for counter in [
+            &self.shared.files_seen,
+            &self.shared.bytes_seen,
+            &self.shared.disk_seen,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        Some(self.scan_root(path))
+    }
+
+    /// Scan one folder again and swap the new subtree into the tree, fixing
+    /// the totals above it. Returns the new node, or `None` while a scan is
+    /// still running. Rescanning the root is a full rescan.
+    pub fn rescan_dir(&self, node: &Arc<Node>) -> Option<Arc<Node>> {
+        if !self.is_idle() {
+            return None;
+        }
+        let Some(parent) = node.parent.upgrade() else {
+            return self.rescan_all(&node.path);
+        };
+        let (size, disk, files) = (node.size(), node.disk(), node.files());
+
+        // Forget what the old subtree contributed.
+        sub_up(&parent, size, disk, files);
+        for (counter, by) in [
+            (&self.shared.files_seen, files),
+            (&self.shared.bytes_seen, size),
+            (&self.shared.disk_seen, disk),
+        ] {
+            let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(by))
+            });
+        }
+        lock(&self.shared.seen).retain(|_, owner| !owner.starts_with(&node.path));
+        lock(&self.shared.denied).retain(|p| !p.starts_with(&node.path));
+
+        // Swap in a fresh node and mark every ancestor unfinished until the
+        // new subtree completes.
+        let fresh = Node::new(
+            node.path.clone(),
+            node.name.clone(),
+            node.dev,
+            Arc::downgrade(&parent),
+        );
+        {
+            let mut subdirs = lock(&parent.subdirs);
+            subdirs.retain(|n| n.path != node.path);
+            subdirs.push(Arc::clone(&fresh));
+        }
+        let mut cur = Some(parent);
+        while let Some(a) = cur {
+            a.pending.fetch_add(1, Ordering::AcqRel);
+            a.done.store(false, Ordering::Release);
+            cur = a.parent.upgrade();
+        }
+        self.shared.active.fetch_add(1, Ordering::AcqRel);
+        let shared = Arc::clone(&self.shared);
+        let job = Arc::clone(&fresh);
+        self.pool.spawn(move || walk(shared, job));
+        Some(fresh)
+    }
+
+    /// Test hook: pretend a scan is (or is no longer) running.
+    #[cfg(test)]
+    pub(crate) fn set_busy(&self, busy: bool) {
+        if busy {
+            self.shared.active.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.shared.active.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     pub fn is_idle(&self) -> bool {
@@ -338,8 +436,13 @@ fn scan_dir(shared: &Arc<Shared>, node: &Arc<Node>) {
             let sh = Arc::clone(shared);
             rayon::spawn(move || walk(sh, child));
         } else {
-            if md.nlink() > 1 && md.is_file() && !lock(&shared.seen).insert((md.dev(), md.ino())) {
-                continue; // hard link already counted
+            if md.nlink() > 1 && md.is_file() {
+                let key = (md.dev(), md.ino());
+                let mut seen = lock(&shared.seen);
+                if seen.contains_key(&key) {
+                    continue; // hard link already counted
+                }
+                seen.insert(key, node.path.clone());
             }
             size += md.len();
             disk += md.blocks() * 512;
@@ -556,5 +659,152 @@ mod tests {
         assert_eq!(stats.bytes, 6000);
         assert_eq!(stats.disk, root.disk());
         assert!(stats.disk >= 6000);
+    }
+
+    fn wait(s: &Scanner) {
+        assert!(s.wait_idle(WAIT), "scan did not finish");
+    }
+
+    #[test]
+    fn rescan_all_picks_up_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/f"), 1000);
+        let (s, old) = scan(r, 2);
+        assert_eq!(old.size(), 1000);
+
+        write(&r.join("b/g"), 500);
+        let root = s.rescan_all(r).expect("idle scanner can rescan");
+        wait(&s);
+        assert_eq!(root.size(), 1500);
+        assert_eq!(root.files(), 2);
+        assert!(root.is_done());
+        let stats = s.stats();
+        assert_eq!((stats.files, stats.bytes), (2, 1500), "counters restart");
+        assert_eq!(old.size(), 1000, "the old tree is untouched");
+    }
+
+    #[test]
+    fn rescan_dir_replaces_subtree_and_fixes_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/x"), 1000);
+        write(&r.join("a/b/y"), 2000);
+        write(&r.join("c/z"), 500);
+        let (s, root) = scan(r, 2);
+        assert_eq!(root.size(), 3500);
+        let a = root.subdir(&r.join("a")).unwrap();
+        assert!(a.is_done());
+
+        write(&r.join("a/new"), 700);
+        fs::remove_file(r.join("a/b/y")).unwrap();
+        let fresh = s.rescan_dir(&a).expect("idle scanner can rescan a folder");
+        wait(&s);
+
+        assert_eq!(fresh.size(), 1700);
+        assert_eq!(fresh.files(), 2);
+        assert!(fresh.is_done());
+        assert_eq!(root.size(), 2200, "ancestors follow the change");
+        assert_eq!(root.files(), 3);
+        assert!(root.is_done(), "ancestors are done again after the rescan");
+        let again = root.subdir(&r.join("a")).unwrap();
+        assert!(
+            Arc::ptr_eq(&again, &fresh),
+            "the tree now holds the new node"
+        );
+        let stats = s.stats();
+        assert_eq!(
+            (stats.files, stats.bytes),
+            (3, 2200),
+            "counters stay consistent"
+        );
+    }
+
+    #[test]
+    fn rescan_dir_while_ancestors_unfinished_is_refused_until_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a/x"), 10);
+        let (s, root) = scan(dir.path(), 2);
+        let a = root.subdir(&dir.path().join("a")).unwrap();
+        s.set_busy(true);
+        assert!(s.rescan_dir(&a).is_none());
+        assert!(s.rescan_all(dir.path()).is_none());
+        s.set_busy(false);
+        assert!(s.rescan_dir(&a).is_some());
+        wait(&s);
+    }
+
+    #[test]
+    fn rescan_dir_keeps_hard_links_counted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/one"), 4000);
+        fs::create_dir_all(r.join("c")).unwrap();
+        fs::hard_link(r.join("a/one"), r.join("c/two")).unwrap();
+        let (s, root) = scan(r, 2);
+        assert_eq!(root.size(), 4000);
+        // Whichever folder counted the shared file first, rescanning `a`
+        // must neither lose it nor count it twice.
+        let a = root.subdir(&r.join("a")).unwrap();
+        s.rescan_dir(&a).unwrap();
+        wait(&s);
+        assert_eq!(root.size(), 4000);
+        assert_eq!(root.files(), 1);
+        let c = root.subdir(&r.join("c")).unwrap();
+        s.rescan_dir(&c).unwrap();
+        wait(&s);
+        assert_eq!(root.size(), 4000);
+        assert_eq!(root.files(), 1);
+    }
+
+    #[test]
+    fn rescan_dir_of_the_root_is_a_full_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a/f"), 100);
+        let (s, root) = scan(dir.path(), 2);
+        write(&dir.path().join("b/g"), 50);
+        let fresh = s.rescan_dir(&root).unwrap();
+        wait(&s);
+        assert_eq!(fresh.size(), 150);
+        assert!(!Arc::ptr_eq(&fresh, &root));
+    }
+
+    #[test]
+    fn rescan_dir_of_a_vanished_folder_removes_its_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/x"), 1000);
+        write(&r.join("c/z"), 500);
+        let (s, root) = scan(r, 2);
+        let a = root.subdir(&r.join("a")).unwrap();
+        fs::remove_dir_all(r.join("a")).unwrap();
+        let fresh = s.rescan_dir(&a).unwrap();
+        wait(&s);
+        assert_eq!(fresh.size(), 0);
+        assert_eq!(root.size(), 500);
+        assert!(root.is_done());
+    }
+
+    #[test]
+    fn rescan_dir_forgets_denied_paths_inside_it() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let locked = r.join("a/locked");
+        write(&locked.join("secret"), 10);
+        write(&r.join("a/ok"), 10);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let _guard = RestorePerms(locked.clone());
+        let (s, root) = scan(r, 2);
+        assert!(s.denied().contains(&locked));
+        // Fix the permissions, then rescan the folder: no longer denied.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let a = root.subdir(&r.join("a")).unwrap();
+        s.rescan_dir(&a).unwrap();
+        wait(&s);
+        assert!(s.denied().is_empty(), "{:?}", s.denied());
+        assert_eq!(root.size(), 20);
     }
 }

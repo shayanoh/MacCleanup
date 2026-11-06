@@ -610,3 +610,13 @@ fn finish_dialog_shows_on_disk_amounts() {
         "{text}"
     );
 }
+
+#[test]
+fn explorer_and_home_footers_mention_rescan() {
+    let mut e = explorer(GlyphMode::Nerd);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("r/R rescan"), "{text}");
+    e.app.update(Action::GoTo(Screen::Home));
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("r/R rescan"), "{text}");
+}

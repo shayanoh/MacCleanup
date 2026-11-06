@@ -249,6 +249,14 @@ send(b"r")
 wait_for("Restored")
 assert os.path.exists(os.path.join(home, "proj", "big.bin")), "restore failed"
 
+step("rescan picks up a file created behind the app's back")
+send(b"2")
+wait_for("marked: 0 items")
+with open(os.path.join(home, "late.bin"), "wb") as f:
+    f.write(b"x" * 50_000)
+send(b"R")
+wait_for("late.bin")
+
 step("irreversible path asks twice and needs y")
 send(b"2")
 wait_for("marked: 0 items")

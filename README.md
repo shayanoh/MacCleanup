@@ -9,6 +9,7 @@ A colorful, animated terminal app (Rust TUI) for macOS that shows where your dis
 - **Home:** live free-space gauge, pending (soft-deleted) space, scan activity, and the biggest folders. Every size is shown both as logical size and as space actually used on disk (for example `1.5 KB (4.1 KB on disk)`), because on-disk size is what a delete frees.
 - **Disk explorer:** a multithreaded scan of your home folder (or `--root`) with live sizes. Each row shows logical size, real on-disk size and a share bar. Browse with vim-style keys or the mouse, sort by on-disk size, size or name, mark items, then review and delete.
 - **Soft delete:** "delete" moves items to `~/ToBeDeleted` (or `--holding-dir`). Browse that folder, restore items to where they came from, delete items for good, or empty it. Moved files count as **pending**, not freed, because nothing is freed until the folder is emptied.
+- **Rescan:** `r` rescans the folder you are viewing and updates the totals above it; `R` rescans everything from the scan root.
 - **Graphs:** a bar graph and a treemap (box area equals size) that follow your selection. Cycle bars, treemap and hidden with `t`; resize the panel with `[` (bigger) and `]` (smaller). Graphs and share bars follow the sorted size (on-disk by default).
 - **Honest accounting:** the finish screen reports space truly freed (the volume's free space now minus at the start), not just what was moved.
 - **Safety:** a hard-coded protected list, a review screen before every delete, and an extra explicit confirmation for anything irreversible (see below).
@@ -49,6 +50,7 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `d` | Review marked items, then delete |
 | `t` | Cycle graph type: bars, treemap, hidden |
 | `[` / `]` | Grow / shrink the graph panel |
+| `r` / `R` | Rescan the folder you are viewing / rescan everything (refused while a scan is running; on the ToBeDeleted screen `r` is restore) |
 | `s` | Cycle sort: on-disk size (default), size, name. The sorted column is white with an arrow in the header |
 | `Tab` | Focus the sidebar (then `j`/`k` switch screens) |
 | `1` `2` `3` | Home, Explorer, ToBeDeleted |

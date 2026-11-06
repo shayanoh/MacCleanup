@@ -264,16 +264,23 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         &["j/k choose", "enter open", "tab back", "q quit"]
     } else {
         match app.screen {
-            Screen::Home => &["2 explorer", "3 ToBeDeleted", "tab menu", "q quit"],
+            Screen::Home => &[
+                "2 explorer",
+                "3 ToBeDeleted",
+                "r/R rescan",
+                "tab menu",
+                "q quit",
+            ],
             Screen::Explorer => &[
                 "j/k move",
                 "h/l out/in",
-                "g/G top/bottom",
                 "space mark",
                 "d review & delete",
+                "r/R rescan",
                 "t graph type",
                 "[ ] resize",
                 "s sort",
+                "g/G top/bottom",
                 "tab menu",
                 "q quit",
             ],
