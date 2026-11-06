@@ -147,15 +147,14 @@ impl Holding {
             return Err(HoldError::Protected(path.to_path_buf()));
         }
         fs::symlink_metadata(path)?;
+        // A folder that contains a protected item cannot be moved as a whole.
+        if let Some(inner) = policy.protected_descendant(path) {
+            return Err(HoldError::Protected(inner));
+        }
 
         let id = new_id();
         let item_dir = self.item_dir(&id)?;
         fs::create_dir(&item_dir)?;
-        let payload = item_dir.join("payload");
-        if let Err(e) = fs::rename(path, &payload) {
-            let _ = fs::remove_dir(&item_dir);
-            return Err(map_rename_error(e, path));
-        }
         let item = HeldItem {
             id,
             original: path.to_path_buf(),
@@ -165,16 +164,28 @@ impl Holding {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
         };
-        let _g = self.guard();
-        let result = self.read_manifest().and_then(|mut items| {
-            items.push(item.clone());
-            self.write_manifest(&items)
-        });
-        if let Err(e) = result {
-            // Put the file back rather than leave it untracked.
-            let _ = fs::rename(&payload, path);
+        // Record the item BEFORE moving it: if the process dies in between,
+        // the leftover is a stale entry the user can delete, never an
+        // untracked payload nobody can see or empty.
+        {
+            let _g = self.guard();
+            let result = self.read_manifest().and_then(|mut items| {
+                items.push(item.clone());
+                self.write_manifest(&items)
+            });
+            if let Err(e) = result {
+                let _ = fs::remove_dir(&item_dir);
+                return Err(HoldError::Io(e));
+            }
+        }
+        if let Err(e) = fs::rename(path, item_dir.join("payload")) {
+            let _g = self.guard();
+            if let Ok(mut items) = self.read_manifest() {
+                items.retain(|i| i.id != item.id);
+                let _ = self.write_manifest(&items);
+            }
             let _ = fs::remove_dir(&item_dir);
-            return Err(HoldError::Io(e));
+            return Err(map_rename_error(e, path));
         }
         Ok(item)
     }
@@ -468,5 +479,66 @@ mod tests {
         assert_eq!(again.list().unwrap()[0].original, file);
         again.restore(&item.id).unwrap();
         assert!(file.exists());
+    }
+
+    #[test]
+    fn folder_containing_protected_is_refused() {
+        let s = sandbox();
+        let cfg = s.home.join(".config");
+        write(&cfg.join("gcloud/creds"), "secret");
+        write(&cfg.join("other/file"), "x");
+        let err = s.holding.move_in(&s.policy, &cfg, 7).unwrap_err();
+        match err {
+            HoldError::Protected(p) => assert_eq!(p, cfg.join("gcloud")),
+            other => panic!("expected Protected, got {other:?}"),
+        }
+        assert!(cfg.join("gcloud/creds").exists(), "nothing may be moved");
+        assert!(s.holding.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn manifest_has_no_stale_entry_when_rename_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores directory permissions
+        }
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let s = sandbox();
+        let locked = s.home.join("locked");
+        write(&locked.join("f"), "x");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = Restore(locked.clone());
+        let err = s
+            .holding
+            .move_in(&s.policy, &locked.join("f"), 1)
+            .unwrap_err();
+        assert!(matches!(err, HoldError::Io(_)), "{err:?}");
+        assert!(s.holding.list().unwrap().is_empty());
+        let leftovers = fs::read_dir(s.holding.dir().join("items")).unwrap().count();
+        assert_eq!(leftovers, 0);
+        assert!(locked.join("f").exists());
+    }
+
+    #[test]
+    fn manifest_entry_is_written_before_the_move() {
+        // A crash between the two steps must never leave an untracked payload:
+        // the entry exists first, so an interrupted move shows up as a stale
+        // entry (deletable) rather than an invisible folder.
+        let s = sandbox();
+        let file = s.home.join("p/a.txt");
+        write(&file, "hello");
+        let item = s.holding.move_in(&s.policy, &file, 5).unwrap();
+        let payload = s.holding.dir().join("items").join(&item.id).join("payload");
+        assert!(payload.exists());
+        // Simulate the interrupted state: entry present, payload missing.
+        fs::remove_file(&payload).unwrap();
+        assert_eq!(s.holding.list().unwrap().len(), 1);
+        assert_eq!(s.holding.delete_forever(&item.id).unwrap(), 5);
+        assert!(s.holding.list().unwrap().is_empty());
     }
 }

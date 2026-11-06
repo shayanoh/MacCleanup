@@ -151,6 +151,8 @@ pub struct FinishInfo {
     pub free_before: u64,
     pub free_after: u64,
     pub failures: usize,
+    /// Why the first item failed, if any did.
+    pub first_failure: Option<String>,
     /// App tick when the finish screen opened (drives the count-up).
     pub started_tick: u64,
 }
@@ -202,6 +204,8 @@ pub struct App {
     pub glyphs: Glyphs,
     pub transition_start: u64,
     pub fda_missing: bool,
+    /// Set by `ui::draw`: the terminal is below the minimum size, so input\n    /// is limited to quitting (the user cannot see what a key would do).
+    pub too_small: bool,
     pub scanner: Scanner,
     pub policy: Arc<Policy>,
     pub holding: Arc<Holding>,
@@ -210,6 +214,8 @@ pub struct App {
     job: Option<DeleteJob>,
     job_mode: DeleteMode,
     job_free_before: u64,
+    job_failure: Option<String>,
+    quit_after_job: bool,
 }
 
 fn sort_rows(rows: &mut [Row], by: SortBy) {
@@ -270,6 +276,7 @@ impl App {
             glyphs,
             transition_start: 0,
             fda_missing: false,
+            too_small: false,
             scanner,
             policy: Arc::new(policy),
             holding: Arc::new(holding),
@@ -278,6 +285,8 @@ impl App {
             job: None,
             job_mode: DeleteMode::SoftOnly,
             job_free_before: 0,
+            job_failure: None,
+            quit_after_job: false,
         };
         app.refresh_rows();
         app.refresh_held();
@@ -350,7 +359,7 @@ impl App {
             self.notice = None;
         }
         match action {
-            Action::Quit => self.should_quit = true,
+            Action::Quit => self.request_quit(),
             Action::Tick => self.on_tick(),
             Action::Cancel => self.cancel(),
             Action::Confirm => self.confirm(),
@@ -398,6 +407,17 @@ impl App {
             Action::RestoreSelected => self.restore_selected(),
             Action::DeleteSelectedForever => self.ask_delete_forever(),
             Action::EmptyAll => self.ask_empty_all(),
+        }
+    }
+
+    /// Quitting while a delete is running would kill it half-way, so wait
+    /// for it to finish first.
+    fn request_quit(&mut self) {
+        if self.job.is_some() {
+            self.quit_after_job = true;
+            self.notice = Some("Finishing the delete before quitting...".to_string());
+        } else {
+            self.should_quit = true;
         }
     }
 
@@ -608,6 +628,7 @@ impl App {
         };
         self.job_mode = mode;
         self.job_free_before = self.free_now;
+        self.job_failure = None;
         self.dialog = Some(Dialog::Deleting(DeleteProgress {
             done: 0,
             total: items.len() * phases,
@@ -644,7 +665,11 @@ impl App {
                         };
                     }
                 }
-                DeleteEvent::Failed { .. } => {}
+                DeleteEvent::Failed { error, .. } => {
+                    if self.job_failure.is_none() {
+                        self.job_failure = Some(error);
+                    }
+                }
                 DeleteEvent::Finished {
                     moved_bytes,
                     emptied_bytes,
@@ -656,6 +681,9 @@ impl App {
             self.job = None;
             let (mode, free_before) = (self.job_mode, self.job_free_before);
             self.after_delete(mode, moved, emptied, failures, free_before);
+            if self.quit_after_job {
+                self.should_quit = true;
+            }
         }
     }
 
@@ -680,6 +708,7 @@ impl App {
         self.refresh_free();
         self.refresh_held();
         self.refresh_rows();
+        let reason = self.job_failure.take();
         self.dialog = Some(match mode {
             DeleteMode::SoftThenEmpty => Dialog::Finish(FinishInfo {
                 moved_bytes: moved,
@@ -687,6 +716,7 @@ impl App {
                 free_before,
                 free_after: self.free_now,
                 failures,
+                first_failure: reason,
                 started_tick: self.tick,
             }),
             DeleteMode::SoftOnly => {
@@ -696,6 +726,9 @@ impl App {
                 );
                 if failures > 0 {
                     msg.push_str(&format!(". {failures} item(s) could not be moved"));
+                    if let Some(reason) = reason {
+                        msg.push_str(&format!(" ({reason})"));
+                    }
                 }
                 Dialog::Notice(msg)
             }
@@ -767,6 +800,7 @@ impl App {
                     free_before,
                     free_after: self.free_now,
                     failures: 0,
+                    first_failure: None,
                     started_tick: self.tick,
                 }));
             }
@@ -1236,5 +1270,52 @@ mod tests {
             }
             other => panic!("expected finish, got {}", other.is_some()),
         }
+    }
+
+    #[test]
+    fn quit_waits_for_running_delete() {
+        let mut e = env(FILES);
+        let home = e.home.clone();
+        let app = &mut e.app;
+        select(app, "b.bin");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        app.update(Action::Confirm);
+        assert!(matches!(app.dialog, Some(Dialog::Deleting(_))));
+        app.update(Action::Quit);
+        assert!(!app.should_quit, "must not quit while deleting");
+        assert!(app.notice.is_some());
+        settle(app);
+        assert!(app.should_quit, "quits once the delete has finished");
+        assert!(!home.join("b.bin").exists());
+        assert_eq!(app.held.len(), 1, "the moved item is tracked");
+    }
+
+    #[test]
+    fn folder_with_protected_inside_fails_with_a_reason() {
+        let mut e = env(&[(".config/gcloud/creds", 100), ("x/f", 50)]);
+        let home = e.home.clone();
+        let app = &mut e.app;
+        select(app, ".config");
+        app.update(Action::ToggleMark);
+        assert_eq!(app.marks.len(), 1, "the folder itself is only Caution");
+        app.update(Action::OpenReview);
+        app.update(Action::Confirm);
+        settle(app);
+        assert!(home.join(".config/gcloud/creds").exists());
+        match &app.dialog {
+            Some(Dialog::Notice(msg)) => {
+                assert!(msg.contains("could not be moved"), "{msg}");
+                assert!(msg.contains("protected"), "{msg}");
+            }
+            other => panic!("expected notice, got {}", other.is_some()),
+        }
+        assert_eq!(app.marks.len(), 1, "failed items stay marked");
+    }
+
+    #[test]
+    fn too_small_flag_defaults_to_false() {
+        let e = env(FILES);
+        assert!(!e.app.too_small);
     }
 }

@@ -9,6 +9,12 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
     if key.kind != KeyEventKind::Press {
         return None;
     }
+    if app.too_small {
+        // The user cannot see the screen, so a stray key must not act on it.
+        let quit = key.code == KeyCode::Char('q')
+            || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'));
+        return quit.then_some(Action::Quit);
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Some(Action::Quit),
@@ -76,7 +82,7 @@ fn dialog_key(code: KeyCode, dialog: &Dialog) -> Option<Action> {
 
 /// Translate a mouse event: left click selects, wheel scrolls.
 pub fn map_mouse(ev: MouseEvent, app: &App) -> Option<Action> {
-    if app.dialog.is_some() {
+    if app.dialog.is_some() || app.too_small {
         return None;
     }
     match ev.kind {
@@ -273,5 +279,26 @@ mod tests {
             map_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 7), &e.app),
             None
         );
+    }
+
+    #[test]
+    fn too_small_terminal_only_accepts_quit() {
+        let mut e = env(FILES);
+        select(&mut e.app, "b.bin");
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::OpenReview);
+        e.app.too_small = true;
+        let app = &e.app;
+        assert_eq!(map_key(key(KeyCode::Enter), app), None);
+        assert_eq!(map_key(ch('x'), app), None);
+        assert_eq!(map_key(ch('y'), app), None);
+        assert_eq!(map_key(ch('j'), app), None);
+        assert_eq!(map_key(ch('q'), app), Some(Action::Quit));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(map_key(ctrl_c, app), Some(Action::Quit));
+        let click = mouse(MouseEventKind::Down(MouseButton::Left), 5, 7);
+        assert_eq!(map_mouse(click, app), None);
+        let wheel = mouse(MouseEventKind::ScrollDown, 5, 7);
+        assert_eq!(map_mouse(wheel, app), None);
     }
 }

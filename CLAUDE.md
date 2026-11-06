@@ -36,7 +36,8 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 - Every scan is multithreaded for maximum speed: pool of `Scanner::default_threads()` (2x cores), a job per directory, no lock on the per-file hot path.
 - All file names shown on screen go through `ui::clean`/`fit`/`fit_start` (control characters and, in ASCII mode, non-ASCII become `?`); paths keep their tail, names keep their head.
 - Safety logic (protected paths, review/confirm, soft-delete recovery) is tested only in `tempfile` sandboxes, never against real user data. Anything that runs the binary must set a throwaway `HOME`.
-- Anything outside the home folder is protected in this release.
+- Anything outside the home folder is protected in this release. A folder containing a protected item is refused as a whole (`Policy::protected_descendant`, checked in `Holding::move_in` on the delete thread; `Safe` folders are not walked).
+- `Holding::move_in` writes the manifest entry BEFORE the rename (an interrupted move leaves a deletable stale entry, never an untracked payload); `App` defers quitting until a running delete job finishes; `App::too_small` (set by `ui::draw`) limits input to quit.
 
 ## Design
 

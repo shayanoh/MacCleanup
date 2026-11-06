@@ -190,10 +190,11 @@ pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.too_small = area.width < MIN_WIDTH || area.height < MIN_HEIGHT;
     if area.width == 0 || area.height == 0 {
         return;
     }
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+    if app.too_small {
         too_small(frame, area);
         return;
     }

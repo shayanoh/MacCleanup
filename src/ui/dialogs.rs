@@ -281,7 +281,14 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo) {
     )));
     if f.failures > 0 {
         lines.push(Line::from(Span::styled(
-            format!("{} item(s) could not be processed", f.failures),
+            match &f.first_failure {
+                Some(reason) => format!(
+                    "{} item(s) could not be processed ({})",
+                    f.failures,
+                    fit(reason, 50, g)
+                ),
+                None => format!("{} item(s) could not be processed", f.failures),
+            },
             Style::default().fg(DANGER),
         )));
     }

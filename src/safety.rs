@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,6 +181,38 @@ impl Policy {
             Ok(real_parent) => self.classify(&real_parent.join(name)),
             Err(_) => Safety::Protected,
         }
+    }
+
+    /// If `path` is a folder that contains something on the deny-list (for
+    /// example `~/.config` holding `gcloud`), return that protected path.
+    /// Moving or deleting such a folder would take the protected item with it.
+    /// Known-disposable (`Safe`) folders are not walked, and symlinks inside
+    /// are never followed.
+    pub fn protected_descendant(&self, path: &Path) -> Option<PathBuf> {
+        let (parent, name) = (path.parent()?, path.file_name()?);
+        let real = parent.canonicalize().ok()?.join(name);
+        if self.classify(&real) == Safety::Safe {
+            return None;
+        }
+        if !fs::symlink_metadata(&real).ok()?.is_dir() {
+            return None;
+        }
+        let mut stack = vec![real];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let child = entry.path();
+                if self.classify(&child) == Safety::Protected {
+                    return Some(child);
+                }
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push(child);
+                }
+            }
+        }
+        None
     }
 
     pub fn can_mark(&self, path: &Path) -> bool {
@@ -376,5 +409,70 @@ mod tests {
             Safety::Protected
         );
         assert!(!s.policy.can_mark(&s.home.join("proj/escape/file")));
+    }
+
+    #[test]
+    fn protected_descendant_found_in_caution_folder() {
+        let s = sandbox();
+        let creds = s.home.join(".config/gcloud/creds");
+        fs::create_dir_all(creds.parent().unwrap()).unwrap();
+        fs::write(&creds, "secret").unwrap();
+        assert_eq!(
+            s.policy.protected_descendant(&s.home.join(".config")),
+            Some(s.home.join(".config/gcloud"))
+        );
+    }
+
+    #[test]
+    fn vault_inside_a_project_is_found() {
+        let s = sandbox();
+        let vault = s.home.join("proj/Photos.photoslibrary");
+        fs::create_dir_all(vault.join("database")).unwrap();
+        assert_eq!(
+            s.policy.protected_descendant(&s.home.join("proj")),
+            Some(vault)
+        );
+    }
+
+    #[test]
+    fn plain_folder_has_no_protected_descendant() {
+        let s = sandbox();
+        fs::create_dir_all(s.home.join("proj/a/b")).unwrap();
+        fs::write(s.home.join("proj/a/b/c.txt"), "x").unwrap();
+        assert_eq!(s.policy.protected_descendant(&s.home.join("proj")), None);
+        // A plain file has no descendants.
+        assert_eq!(
+            s.policy
+                .protected_descendant(&s.home.join("proj/a/b/c.txt")),
+            None
+        );
+    }
+
+    #[test]
+    fn safe_folders_skip_the_walk() {
+        let s = sandbox();
+        let nested = s.home.join("proj/node_modules/pkg/.ssh");
+        fs::create_dir_all(&nested).unwrap();
+        // node_modules is known-disposable (Safe); the walk is skipped.
+        assert_eq!(
+            s.policy
+                .protected_descendant(&s.home.join("proj/node_modules")),
+            None
+        );
+    }
+
+    #[test]
+    fn symlinks_inside_are_not_followed() {
+        let s = sandbox();
+        fs::create_dir_all(s.home.join(".ssh")).unwrap();
+        fs::create_dir_all(s.home.join("proj")).unwrap();
+        symlink(s.home.join(".ssh"), s.home.join("proj/link")).unwrap();
+        assert_eq!(s.policy.protected_descendant(&s.home.join("proj")), None);
+    }
+
+    #[test]
+    fn missing_path_has_no_protected_descendant() {
+        let s = sandbox();
+        assert_eq!(s.policy.protected_descendant(&s.home.join("nope")), None);
     }
 }

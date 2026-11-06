@@ -396,3 +396,14 @@ fn long_and_wide_names_do_not_break_layout() {
         assert_eq!(cells.len(), 90 * 20);
     }
 }
+
+#[test]
+fn drawing_records_whether_the_terminal_is_too_small() {
+    let mut e = explorer(GlyphMode::Nerd);
+    render(&mut e.app, 20, 5);
+    assert!(e.app.too_small);
+    render(&mut e.app, 100, 30);
+    assert!(!e.app.too_small);
+    render(&mut e.app, 0, 0);
+    assert!(e.app.too_small);
+}
