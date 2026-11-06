@@ -40,6 +40,17 @@ pub enum Focus {
     Main,
 }
 
+/// One box or bar the graph drew, for its hover tooltip.
+#[derive(Clone, Debug)]
+pub struct GraphTip {
+    pub rect: Rect,
+    pub name: String,
+    pub size: u64,
+    pub disk: u64,
+    /// Share of the whole graph, in percent.
+    pub pct: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphMode {
     Bars,
@@ -141,6 +152,11 @@ pub enum Action {
     /// A digit key: the page at this position (1-based) in the menu.
     Menu(usize),
     Click {
+        x: u16,
+        y: u16,
+    },
+    /// The mouse moved to this cell.
+    Hover {
         x: u16,
         y: u16,
     },
@@ -447,6 +463,12 @@ pub struct App {
     pub review_scroll: usize,
     /// Where a click on the graph lands, written by the UI every frame.
     pub graph_hits: Vec<(Rect, (usize, usize))>,
+    /// What every box or bar of the graph is, written by the UI every frame.
+    pub graph_tips: Vec<GraphTip>,
+    /// Where the mouse last was, and the tick it got there (any other input
+    /// restarts the count): the graph shows a tooltip after it rests a while.
+    pub hover: Option<(u16, u16)>,
+    pub hover_since: u64,
     pub animations: bool,
     pub glyphs: Glyphs,
     pub transition_start: u64,
@@ -606,6 +628,9 @@ impl App {
             notice: None,
             layout: UiLayout::default(),
             graph_hits: Vec::new(),
+            graph_tips: Vec::new(),
+            hover: None,
+            hover_since: 0,
             review_scroll: 0,
             animations,
             glyphs,
@@ -915,6 +940,17 @@ impl App {
             self.notice = None;
         }
         match action {
+            Action::Hover { x, y } => {
+                if self.hover != Some((x, y)) {
+                    self.hover = Some((x, y));
+                    self.hover_since = self.tick;
+                }
+            }
+            // Any other input hides the tooltip until the mouse rests again.
+            _ if !matches!(action, Action::Tick) => self.hover_since = self.tick,
+            _ => {}
+        }
+        match action {
             Action::Quit => self.request_quit(),
             Action::Tick => self.on_tick(),
             Action::Cancel => self.cancel(),
@@ -1042,6 +1078,7 @@ impl App {
             Action::Rescan => self.rescan(false),
             Action::RescanAll => self.rescan(true),
             Action::Click { x, y } => self.click(x, y),
+            Action::Hover { .. } => {}
             Action::RestoreSelected => self.restore_selected(),
             Action::DeleteSelectedForever => self.ask_delete_forever(),
             Action::EmptyAll => self.ask_empty_all(),

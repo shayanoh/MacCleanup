@@ -2997,3 +2997,61 @@ fn docker_file_browser_header_marks_the_sorted_column_and_s_moves_it() {
     let t = render(&mut e.app, 150, 30);
     assert!(t.contains("Name ▲"), "{t}");
 }
+
+/// A folder with two sub-folders and a loose file, shown as a big treemap.
+fn nested_explorer() -> Env {
+    let mut e = make_app(
+        &[
+            ("proj/alpha/a.bin", 3_000_000),
+            ("proj/beta/b.bin", 2_000_000),
+            ("proj/loose.bin", 1_000_000),
+        ],
+        GlyphMode::Nerd,
+    );
+    e.app.update(Action::GoTo(Screen::Explorer));
+    e.app.graph = GraphMode::Treemap;
+    e
+}
+
+#[test]
+fn treemap_nests_folder_contents_inside_a_large_box() {
+    let mut e = nested_explorer();
+    let text = render(&mut e.app, 200, 60);
+    // The sub-folders are only named inside the treemap box of `proj`.
+    assert!(text.contains("alpha") && text.contains("beta"), "{text}");
+    assert!(text.contains("(files in proj)"), "{text}");
+    // Shrinking the graph pane until the box is under the nesting minimum
+    // leaves one plain box.
+    for _ in 0..8 {
+        e.app.update(Action::ShrinkGraph);
+    }
+    render(&mut e.app, 80, 24);
+    let boxes = e.app.graph_tips.len();
+    assert_eq!(boxes, 1, "{:?}", e.app.graph_tips);
+}
+
+#[test]
+fn hovering_a_nested_box_shows_a_tooltip_after_a_pause() {
+    let mut e = nested_explorer();
+    render(&mut e.app, 200, 60);
+    let tip = e
+        .app
+        .graph_tips
+        .iter()
+        .find(|t| t.name == "alpha")
+        .expect("alpha box")
+        .clone();
+    e.app.update(Action::Hover {
+        x: tip.rect.x + 1,
+        y: tip.rect.y,
+    });
+    assert!(!render(&mut e.app, 200, 60).contains("% of the graph"));
+    for _ in 0..12 {
+        e.app.update(Action::Tick);
+    }
+    let text = render(&mut e.app, 200, 60);
+    assert!(text.contains("% of the graph"), "{text}");
+    // Any other input hides it until the mouse rests again.
+    e.app.update(Action::Scroll(1));
+    assert!(!render(&mut e.app, 200, 60).contains("% of the graph"));
+}

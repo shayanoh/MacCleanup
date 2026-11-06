@@ -199,6 +199,10 @@ pub fn map_mouse(ev: MouseEvent, app: &App) -> Option<Action> {
         }),
         MouseEventKind::ScrollDown => Some(Action::Scroll(3)),
         MouseEventKind::ScrollUp => Some(Action::Scroll(-3)),
+        MouseEventKind::Moved => Some(Action::Hover {
+            x: ev.column,
+            y: ev.row,
+        }),
         _ => None,
     }
 }
@@ -385,7 +389,10 @@ mod tests {
             map_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 5, 7), app),
             None
         );
-        assert_eq!(map_mouse(mouse(MouseEventKind::Moved, 5, 7), app), None);
+        assert_eq!(
+            map_mouse(mouse(MouseEventKind::Moved, 5, 7), app),
+            Some(Action::Hover { x: 5, y: 7 })
+        );
     }
 
     #[test]
