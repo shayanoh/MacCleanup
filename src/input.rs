@@ -36,10 +36,17 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
             Action::FilterClear
         } else if app.screen == Screen::Explorer && app.stack.len() > 1 {
             Action::Out
+        } else if app.screen == Screen::DockerFiles {
+            Action::CloseBrowse
         } else {
             Action::Quit
         }),
-        KeyCode::Char('/') if matches!(app.screen, Screen::Explorer | Screen::Targets) => {
+        KeyCode::Char('/')
+            if matches!(
+                app.screen,
+                Screen::Explorer | Screen::Targets | Screen::Docker | Screen::DockerFiles
+            ) =>
+        {
             Some(Action::FilterOpen)
         }
         KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
@@ -52,7 +59,12 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::Char(' ') => Some(Action::ToggleMark),
         KeyCode::Char('d') => Some(Action::OpenReview),
-        KeyCode::Char('m') if app.screen == Screen::Targets => Some(Action::MarkRelated),
+        KeyCode::Char('b') if app.screen == Screen::Docker => Some(Action::Browse),
+        KeyCode::Char('J') if app.screen == Screen::Docker => Some(Action::DetailScroll(1)),
+        KeyCode::Char('K') if app.screen == Screen::Docker => Some(Action::DetailScroll(-1)),
+        KeyCode::Char('m') if matches!(app.screen, Screen::Targets | Screen::Docker) => {
+            Some(Action::MarkRelated)
+        }
         KeyCode::Char('g') => Some(Action::Top),
         KeyCode::Char('t') => Some(Action::CycleGraph),
         KeyCode::Char('s') => Some(Action::CycleSort),
@@ -584,11 +596,13 @@ mod tests {
                     path: std::path::PathBuf::new(),
                     can_force: false,
                     force: false,
+                    group: Vec::new(),
                 })
                 .collect(),
             total: Usage::default(),
             space_ready: true,
             space: Default::default(),
+            problems: Vec::new(),
         })
     }
 
@@ -697,6 +711,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn shift_j_and_k_scroll_the_docker_details_only_on_that_page() {
+        let mut e = env(FILES);
+        let k = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+        e.app.update(Action::GoTo(Screen::Docker));
+        assert_eq!(map_key(k('J'), &e.app), Some(Action::DetailScroll(1)));
+        assert_eq!(map_key(k('K'), &e.app), Some(Action::DetailScroll(-1)));
+        e.app.update(Action::GoTo(Screen::Explorer));
+        assert_eq!(map_key(k('J'), &e.app), None);
+    }
+
+    #[test]
+    fn b_looks_inside_on_the_docker_page_and_esc_closes_the_browser() {
+        let mut e = env(FILES);
+        let k = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert_eq!(map_key(k('b'), &e.app), None, "only on the Docker page");
+        e.app.update(Action::GoTo(Screen::Docker));
+        assert_eq!(map_key(k('b'), &e.app), Some(Action::Browse));
+        e.app.update(Action::GoTo(Screen::DockerFiles));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(map_key(esc, &e.app), Some(Action::CloseBrowse));
+        assert_eq!(map_key(k('h'), &e.app), Some(Action::Out));
+        assert_eq!(map_key(k('/'), &e.app), Some(Action::FilterOpen));
     }
 
     #[test]
@@ -812,6 +851,7 @@ mod tests {
             commands: Vec::new(),
             retry: Vec::new(),
             started_tick: 0,
+            vm_disk: None,
         };
         assert_eq!(
             dialog_key(KeyCode::Char('f'), &Dialog::Finish(f.clone())),

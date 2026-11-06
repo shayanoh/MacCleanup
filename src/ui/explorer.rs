@@ -99,6 +99,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     // Column layout.
     let c = cols(inner.width, &g);
     let (icon_w, mark_w, name_w, show_share) = (c.icon_w, c.mark_w, c.name_w, c.show_share);
+    let show_modified = c.show_modified;
     frame.render_widget(
         Paragraph::new(header_line(app.sort, &c, &g)),
         Rect::new(inner.x, inner.y + 2 + filter_h, inner.width, 1),
@@ -129,6 +130,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
                 icon_w,
                 mark_w,
                 show_share,
+                show_modified,
             )
         })
         .collect();
@@ -207,17 +209,30 @@ pub(super) struct Cols {
     pub prefix_w: usize,
     pub name_w: usize,
     pub show_share: bool,
+    /// The Modified column fits without squeezing the names.
+    pub show_modified: bool,
 }
 
-pub(super) fn cols(inner_width: u16, g: &Glyphs) -> Cols {
+/// The widths of what sits left of the name: `(icon, mark, everything)`.
+pub(super) fn prefix_widths(g: &Glyphs) -> (usize, usize, usize) {
     let icon_w = text_width(g.folder()).max(text_width(g.file()));
     let mark_w = text_width(g.marked()).max(text_width(g.unmarked()));
     let dot_w = text_width(g.safe());
-    let prefix_w = 2 + mark_w + 1 + icon_w + 1 + dot_w + 1;
-    // Size, on disk, frees: three 9-wide columns; the share bar goes first
-    // when the pane is narrow.
-    let fixed_no_share = prefix_w + 3 * (1 + 9);
+    (icon_w, mark_w, 2 + mark_w + 1 + icon_w + 1 + dot_w + 1)
+}
+
+/// Names never get less than this many columns because of the Modified
+/// column; below it, Modified is dropped (the share bar goes first).
+const MIN_NAME_WITH_MODIFIED: usize = 16;
+
+pub(super) fn cols(inner_width: u16, g: &Glyphs) -> Cols {
+    let (icon_w, mark_w, prefix_w) = prefix_widths(g);
+    // Size, on disk, frees: three 9-wide columns; Modified is 10 wide
+    // ("Modified ▼" must fit).
+    let base = prefix_w + 3 * (1 + 9);
     let cw = inner_width.saturating_sub(1) as usize; // last column: scrollbar
+    let show_modified = cw.saturating_sub(base + 1 + 10) >= MIN_NAME_WITH_MODIFIED;
+    let fixed_no_share = base + if show_modified { 1 + 10 } else { 0 };
     let show_share = cw >= fixed_no_share + 9 + 16;
     let fixed = fixed_no_share + if show_share { 9 } else { 0 };
     let name_w = cw.saturating_sub(fixed).max(4);
@@ -227,6 +242,7 @@ pub(super) fn cols(inner_width: u16, g: &Glyphs) -> Cols {
         prefix_w,
         name_w,
         show_share,
+        show_modified,
     }
 }
 
@@ -274,25 +290,33 @@ pub(super) fn header_line(sort: SortBy, c: &Cols, g: &Glyphs) -> Line<'static> {
             head_style(SortBy::Frees),
         ),
     ];
+    if c.show_modified {
+        header.push(Span::raw(" "));
+        header.push(Span::styled(
+            right(&format!("Modified{}", arrow(SortBy::Modified)), 10),
+            head_style(SortBy::Modified),
+        ));
+    }
     if c.show_share {
         header.push(Span::styled(" Share", Style::default().fg(DIM)));
     }
     Line::from(header)
 }
 
-/// The Size, On disk and Frees cells of a row. `frees_text` replaces the
+/// The Size, On disk, Frees and Modified cells of a row. `frees_text` replaces the
 /// Frees value (for example "up to 6 GB" on a tool command).
 pub(super) fn number_spans(
     r: &Row,
     queued: bool,
     sort: SortBy,
     frees_text: Option<String>,
+    modified: bool,
     g: &Glyphs,
 ) -> Vec<Span<'static>> {
     // A queued folder has no numbers yet: show that, not a misleading 0 B.
     let unknown = right(g.ellipsis(), 9);
     let cell = |v: String| if queued { unknown.clone() } else { v };
-    vec![
+    let mut spans = vec![
         Span::styled(
             format!(" {}", cell(right(&human_size(r.size), 9))),
             value_style(sort == SortBy::Size),
@@ -312,7 +336,21 @@ pub(super) fn number_spans(
             ),
             value_style(sort == SortBy::Frees),
         ),
-    ]
+    ];
+    if modified {
+        spans.push(Span::styled(
+            format!(
+                " {}",
+                if queued {
+                    right(g.ellipsis(), 10)
+                } else {
+                    right(&crate::fmt::ago(crate::fmt::now_secs(), r.mtime), 10)
+                }
+            ),
+            value_style(sort == SortBy::Modified),
+        ));
+    }
+    spans
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -326,6 +364,7 @@ fn row_line<'a>(
     icon_w: usize,
     mark_w: usize,
     show_share: bool,
+    show_modified: bool,
 ) -> Line<'a> {
     let g = &app.glyphs;
     let r = row.live();
@@ -378,7 +417,7 @@ fn row_line<'a>(
         name_style,
         name_style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
     ));
-    spans.extend(number_spans(&r, queued, app.sort, None, g));
+    spans.extend(number_spans(&r, queued, app.sort, None, show_modified, g));
     if show_share {
         let color = if queued { DIM } else { Color::Yellow };
         spans.push(Span::styled(

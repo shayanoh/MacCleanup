@@ -92,6 +92,7 @@ impl Group {
             node: None,
             space: None,
             frees: self.frees(),
+            mtime: self.rows.iter().map(|r| r.row.mtime).max().unwrap_or(0),
         }
     }
 }
@@ -211,6 +212,7 @@ fn row_for(c: &Cand, space: Option<crate::scan::Space>) -> Option<Row> {
             node: Some(Arc::clone(node)),
             space,
             frees: space.map(|s| s.frees_now),
+            mtime: node.mtime(),
         }),
         None => {
             use std::os::unix::fs::MetadataExt;
@@ -227,6 +229,7 @@ fn row_for(c: &Cand, space: Option<crate::scan::Space>) -> Option<Row> {
                 node: None,
                 space: sp,
                 frees: sp.map(|s| s.frees_now),
+                mtime: md.mtime(),
             })
         }
     }

@@ -177,7 +177,7 @@ fn totals_line(app: &App, width: usize) -> TextLine<'static> {
 
 /// "reading space numbers 2/3 ██▌   ": what a piece of background work is
 /// doing, with a filled bar when its steps are known and a moving one when not.
-fn work_text(
+pub(super) fn work_text(
     snap: &crate::bg::WorkSnapshot,
     fallback: &str,
     tick: u64,
@@ -412,7 +412,14 @@ fn group_line(app: &App, gi: usize, c: &Cols) -> TextLine<'static> {
         base,
         base.fg(Color::Yellow),
     );
-    spans.extend(number_spans(&grp.as_row(), false, app.sort, None, g));
+    spans.extend(number_spans(
+        &grp.as_row(),
+        false,
+        app.sort,
+        None,
+        c.show_modified,
+        g,
+    ));
     TextLine::from(spans)
 }
 
@@ -516,7 +523,14 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
             9,
         )
     });
-    spans.extend(number_spans(&r, queued, app.sort, frees_text, g));
+    spans.extend(number_spans(
+        &r,
+        queued,
+        app.sort,
+        frees_text,
+        c.show_modified,
+        g,
+    ));
     if c.show_share {
         let color = if queued { DIM } else { Color::Yellow };
         spans.push(Span::styled(
@@ -527,7 +541,12 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
     TextLine::from(spans)
 }
 
-fn highlight(text: &str, positions: &[usize], base: Style, hit: Style) -> Vec<Span<'static>> {
+pub(super) fn highlight(
+    text: &str,
+    positions: &[usize],
+    base: Style,
+    hit: Style,
+) -> Vec<Span<'static>> {
     if positions.is_empty() {
         return vec![Span::styled(text.to_string(), base)];
     }

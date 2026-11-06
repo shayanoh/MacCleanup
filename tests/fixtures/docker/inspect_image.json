@@ -1,0 +1,1 @@
+{"Id": "sha256:aaa1", "RootFS": {"Type": "layers", "Layers": ["sha256:l1", "sha256:l2", "sha256:l3"]}}

@@ -21,11 +21,16 @@ use crate::targets::{BuildSource, Line, SectionKind, TRow, Targets};
 use crate::usage::Usage;
 use crate::volume;
 
+mod dockerpage;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
     Home,
     Explorer,
     Targets,
+    Docker,
+    /// Looking inside a Docker image or volume (opened from the Docker page).
+    DockerFiles,
     Holding,
 }
 
@@ -50,6 +55,8 @@ pub enum SortBy {
     Frees,
     /// Logical size.
     Size,
+    /// Newest modification time inside (most recent first).
+    Modified,
     Name,
 }
 
@@ -83,7 +90,7 @@ pub const SIDEBAR: [SidebarEntry; 7] = [
     },
     SidebarEntry {
         label: "Docker",
-        screen: None,
+        screen: Some(Screen::Docker),
     },
     SidebarEntry {
         label: "ToBeDeleted",
@@ -138,6 +145,12 @@ pub enum Action {
         y: u16,
     },
     Scroll(i16),
+    /// Scroll the details pane of the Docker page (Shift-J / Shift-K).
+    DetailScroll(i16),
+    /// Look inside the image or volume under the cursor (Docker page).
+    Browse,
+    /// Leave the file browser, back to the Docker page.
+    CloseBrowse,
     Tick,
     /// Rescan the folder being shown.
     Rescan,
@@ -191,6 +204,10 @@ pub struct ReviewCommand {
     pub can_force: bool,
     /// The user chose the forced form for this run.
     pub force: bool,
+    /// More commands of the same kind that run right after this one and are
+    /// shown as part of this row (`(id, spec)`): a bulk mark of fifty build
+    /// cache records is one reviewable row, not fifty.
+    pub group: Vec<(String, CommandSpec)>,
 }
 
 impl ReviewCommand {
@@ -232,6 +249,9 @@ pub struct Review {
     /// Where the marked items' disk space would go: freed now, held by
     /// snapshots, or shared with clones and hard links that stay.
     pub space: Space,
+    /// Things that stop it from running (Docker would refuse part of it);
+    /// while there are any, confirming only explains them.
+    pub problems: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -260,6 +280,9 @@ pub struct FinishInfo {
     pub retry: Vec<ReviewCommand>,
     /// App tick when the finish screen opened (drives the count-up).
     pub started_tick: u64,
+    /// What the Docker VM disk file took on the Mac before and after the
+    /// Docker commands (allocated bytes); `None` when none ran.
+    pub vm_disk: Option<(u64, u64)>,
 }
 
 /// What the quit warning tells the user is still waiting in ToBeDeleted.
@@ -460,6 +483,8 @@ pub struct App {
     pub tools_work: Arc<Work>,
     /// Tool commands marked for the review (the second kind of selection).
     pub tool_marks: BTreeSet<String>,
+    /// The Docker page: what was read from Docker and the list shown.
+    pub docker: crate::docker::state::DockerState,
     /// Set-wise space of the whole selection, worked out on a thread.
     pub set_space: Latest<JointSpace>,
     set_exact: bool,
@@ -483,6 +508,12 @@ pub struct App {
     job_free_before: u64,
     job_failure: Option<String>,
     quit_after_job: bool,
+    /// What the Docker VM disk file took on the Mac before Docker commands ran.
+    docker_vm_before: Option<u64>,
+    /// Docker items the running review removes, and (once its commands are
+    /// done) the ones the next read must no longer list.
+    docker_expect_gone: Vec<String>,
+    docker_check_gone: Vec<String>,
 }
 
 /// The order the explorer (and every screen like it) puts rows in: biggest
@@ -498,6 +529,11 @@ pub fn cmp_rows(by: SortBy, a: &Row, b: &Row) -> std::cmp::Ordering {
             .frees
             .unwrap_or(0)
             .cmp(&a.frees.unwrap_or(0))
+            .then_with(|| b.disk.cmp(&a.disk))
+            .then_with(|| a.name.cmp(&b.name)),
+        SortBy::Modified => b
+            .mtime
+            .cmp(&a.mtime)
             .then_with(|| b.disk.cmp(&a.disk))
             .then_with(|| a.name.cmp(&b.name)),
         SortBy::Size => b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)),
@@ -596,6 +632,10 @@ impl App {
             build_work: Work::new(),
             tools_work: Work::new(),
             tool_marks: BTreeSet::new(),
+            docker: crate::docker::state::DockerState::new(),
+            docker_vm_before: None,
+            docker_expect_gone: Vec::new(),
+            docker_check_gone: Vec::new(),
             set_space: Latest::new(),
             set_exact: true,
             holders: Latest::new(),
@@ -640,7 +680,7 @@ impl App {
         match self.sort {
             SortBy::Size => row.size,
             SortBy::Frees if self.frees_total() > 0 => row.frees.unwrap_or(0),
-            SortBy::Frees | SortBy::Disk | SortBy::Name => row.disk,
+            SortBy::Frees | SortBy::Disk | SortBy::Name | SortBy::Modified => row.disk,
         }
     }
 
@@ -654,7 +694,7 @@ impl App {
         match self.sort {
             SortBy::Size => self.current().size(),
             SortBy::Frees if self.frees_total() > 0 => self.frees_total(),
-            SortBy::Frees | SortBy::Disk | SortBy::Name => self
+            SortBy::Frees | SortBy::Disk | SortBy::Name | SortBy::Modified => self
                 .current_space
                 .map_or_else(|| self.current().disk(), |s| s.footprint),
         }
@@ -678,6 +718,10 @@ impl App {
         self.offset = window(self.cursor, self.offset, vis);
         self.held_offset = window(self.held_cursor, self.held_offset, vis);
         self.toffset = window(self.tcursor, self.toffset, vis);
+        self.docker.offset = window(self.docker.cursor, self.docker.offset, vis);
+        if let Some(b) = &mut self.docker.browse {
+            b.offset = window(b.cursor, b.offset, vis);
+        }
     }
 
     /// Re-list the current directory, keeping the cursor on the same path.
@@ -724,6 +768,18 @@ impl App {
     /// Re-apply the query. While typing the selection jumps to the first
     /// match; `keep_selection` keeps the same row selected when it survives.
     fn refilter(&mut self, keep_selection: bool) {
+        if self.screen == Screen::DockerFiles {
+            self.browse_refilter();
+            return;
+        }
+        if self.screen == Screen::Docker {
+            self.docker_refilter();
+            if !keep_selection {
+                self.docker.cursor = 0;
+                self.docker.offset = 0;
+            }
+            return;
+        }
         if self.screen == Screen::Targets {
             let keep = keep_selection.then(|| self.sel_of(self.tcursor)).flatten();
             self.rebuild_tlines(keep);
@@ -750,7 +806,10 @@ impl App {
     }
 
     fn filter_open(&mut self) {
-        if !matches!(self.screen, Screen::Explorer | Screen::Targets) {
+        if !matches!(
+            self.screen,
+            Screen::Explorer | Screen::Targets | Screen::Docker | Screen::DockerFiles
+        ) {
             return;
         }
         self.focus = Focus::Main;
@@ -886,6 +945,7 @@ impl App {
                         total: Usage::default(),
                         space_ready: true,
                         space: Space::default(),
+                        problems: Vec::new(),
                     }));
                 }
             }
@@ -943,13 +1003,20 @@ impl App {
             }
             Action::GrowGraph => self.graph_pct = (self.graph_pct + 5).min(70),
             Action::ShrinkGraph => self.graph_pct = self.graph_pct.saturating_sub(5).max(20),
+            Action::CycleSort if self.screen == Screen::Docker => self.docker_cycle_sort(),
+            Action::CycleSort if self.screen == Screen::DockerFiles => self.browse_cycle_sort(),
+            Action::DetailScroll(by) => self.docker_scroll_details(by),
+            Action::Browse => self.docker_browse(),
+            Action::CloseBrowse => self.docker_close_browse(),
             Action::CycleSort => {
                 self.sort = match self.sort {
-                    // Same order as the column headers: Name, Size, On disk, Frees.
+                    // Same order as the column headers: Name, Size, On disk,
+                    // Frees, Modified.
                     SortBy::Name => SortBy::Size,
                     SortBy::Size => SortBy::Disk,
                     SortBy::Disk => SortBy::Frees,
-                    SortBy::Frees => SortBy::Name,
+                    SortBy::Frees => SortBy::Modified,
+                    SortBy::Modified => SortBy::Name,
                 };
                 if self.screen == Screen::Targets {
                     // Only the order changes: no need to build the list again.
@@ -1116,6 +1183,8 @@ impl App {
         self.poll_discovery();
         self.process_refresh();
         self.poll_targets();
+        self.poll_docker();
+        self.poll_browse();
         if self.set_space.poll() || !self.set_space.pending {
             // A review opened while the numbers were being worked out.
             if let (Some(Dialog::Review(r)), Some(j)) = (&mut self.dialog, self.set_space.value)
@@ -1165,6 +1234,11 @@ impl App {
     fn confirm(&mut self) {
         match self.dialog.take() {
             Some(Dialog::QuitWarning(_)) => self.should_quit = true,
+            Some(Dialog::Review(r)) if !r.problems.is_empty() => {
+                // Docker would refuse part of it: say why, run nothing.
+                self.notice = Some(r.problems[0].clone());
+                self.dialog = Some(Dialog::Review(r));
+            }
             Some(Dialog::Review(r)) => {
                 if !r.commands.is_empty() && self.layout.review_clipped {
                     // Never run a command the review could not show.
@@ -1187,7 +1261,9 @@ impl App {
     fn goto(&mut self, screen: Screen) {
         self.filter.editing = false;
         // The filter belongs to one list; it does not follow to another screen.
-        if (self.screen == Screen::Targets || screen == Screen::Targets) && self.screen != screen {
+        let own_filter =
+            |s: Screen| matches!(s, Screen::Targets | Screen::Docker | Screen::DockerFiles);
+        if (own_filter(self.screen) || own_filter(screen)) && self.screen != screen {
             self.reset_filter();
         }
         self.screen = screen;
@@ -1199,7 +1275,8 @@ impl App {
                 self.start_discovery();
                 self.rebuild_targets();
             }
-            Screen::Home => {}
+            Screen::Docker => self.reload_docker(),
+            Screen::DockerFiles | Screen::Home => {}
         }
         self.refresh_detail();
     }
@@ -1211,9 +1288,15 @@ impl App {
                     Screen::Home,
                     Screen::Explorer,
                     Screen::Targets,
+                    Screen::Docker,
                     Screen::Holding,
                 ];
-                let idx = order.iter().position(|s| *s == self.screen).unwrap_or(0) as i64;
+                let here = if self.screen == Screen::DockerFiles {
+                    Screen::Docker
+                } else {
+                    self.screen
+                };
+                let idx = order.iter().position(|s| *s == here).unwrap_or(0) as i64;
                 let next = (idx + delta.signum()).clamp(0, order.len() as i64 - 1) as usize;
                 if order[next] != self.screen {
                     self.goto(order[next]);
@@ -1228,6 +1311,8 @@ impl App {
                 self.held_cursor = step(self.held_cursor, delta, self.held.len());
                 self.ensure_visible();
             }
+            (_, Screen::Docker) => self.docker_move(delta),
+            (_, Screen::DockerFiles) => self.browse_move(delta),
             (_, Screen::Targets) => {
                 self.tcursor = step(self.tcursor, delta, self.tlines.len());
                 self.ensure_visible();
@@ -1257,6 +1342,15 @@ impl App {
     /// Rescan the current folder (or everything). Refused while a scan runs.
     fn rescan(&mut self, all: bool) {
         if self.screen == Screen::Holding {
+            return;
+        }
+        if self.screen == Screen::Docker {
+            self.reload_docker();
+            self.notice = Some("Reading Docker again...".to_string());
+            return;
+        }
+        if self.screen == Screen::DockerFiles {
+            self.browse_reload();
             return;
         }
         if !self.scanner.is_idle() {
@@ -1304,6 +1398,14 @@ impl App {
             self.target_into();
             return;
         }
+        if self.screen == Screen::Docker {
+            self.docker_into();
+            return;
+        }
+        if self.screen == Screen::DockerFiles {
+            self.browse_into();
+            return;
+        }
         if self.screen != Screen::Explorer {
             return;
         }
@@ -1327,6 +1429,14 @@ impl App {
             self.target_out();
             return;
         }
+        if self.focus == Focus::Main && self.screen == Screen::Docker {
+            self.docker_out();
+            return;
+        }
+        if self.focus == Focus::Main && self.screen == Screen::DockerFiles {
+            self.browse_out();
+            return;
+        }
         if self.focus != Focus::Main || self.screen != Screen::Explorer || self.stack.len() <= 1 {
             return;
         }
@@ -1348,6 +1458,7 @@ impl App {
                 self.mark_path(path, usage, &name);
             }
             Screen::Targets => self.toggle_target_mark(),
+            Screen::Docker => self.toggle_docker_mark(),
             _ => {}
         }
     }
@@ -1643,6 +1754,10 @@ impl App {
 
     /// `m`: mark the selected folder and every folder that shares its data.
     fn mark_related(&mut self) {
+        if self.screen == Screen::Docker {
+            self.docker_mark_needed();
+            return;
+        }
         if self.screen != Screen::Targets {
             return;
         }
@@ -1669,7 +1784,10 @@ impl App {
     }
 
     fn open_review(&mut self) {
-        if !matches!(self.screen, Screen::Explorer | Screen::Targets) {
+        if !matches!(
+            self.screen,
+            Screen::Explorer | Screen::Targets | Screen::Docker
+        ) {
             return;
         }
         let commands = self.review_commands();
@@ -1701,12 +1819,14 @@ impl App {
             (false, Some(j)) => (j.base, true),
             _ => (Space::default(), false),
         };
+        let problems = self.docker_problems();
         self.dialog = Some(Dialog::Review(Review {
             items,
             commands,
             total,
             space_ready,
             space,
+            problems,
         }));
     }
 
@@ -1730,10 +1850,12 @@ impl App {
                         path: r.row.path.clone(),
                         can_force: spec.can_force(),
                         force: false,
+                        group: Vec::new(),
                     })
                 }
                 _ => None,
             })
+            .chain(self.docker_review_commands())
             .collect()
     }
 
@@ -1830,6 +1952,8 @@ impl App {
                         }
                     }
                 }
+                Screen::Docker => self.docker_click(i),
+                Screen::DockerFiles => self.browse_click(i),
                 Screen::Home => {}
             }
         }
@@ -2046,6 +2170,22 @@ impl App {
                 self.ensure_visible();
                 self.refresh_detail();
             }
+            Screen::DockerFiles
+                if self
+                    .docker
+                    .browse
+                    .as_ref()
+                    .is_some_and(|b| group < b.shown.len()) =>
+            {
+                if let Some(b) = &mut self.docker.browse {
+                    b.cursor = group;
+                }
+                self.ensure_visible();
+            }
+            Screen::Docker if group < self.docker.lines.len() => {
+                self.docker.cursor = group;
+                self.ensure_visible();
+            }
             Screen::Targets => {
                 // `usize::MAX` stands for the project's header line.
                 let wanted = if row == usize::MAX {
@@ -2114,9 +2254,14 @@ impl App {
         self.pending_commands = review
             .commands
             .iter()
-            .map(|c| (c.id.clone(), c.effective_spec()))
+            .flat_map(|c| {
+                std::iter::once((c.id.clone(), c.effective_spec())).chain(c.group.iter().cloned())
+            })
             .collect();
         self.pending_meta = review.commands.clone();
+        let ids: Vec<String> = review.commands.iter().map(|c| c.id.clone()).collect();
+        self.docker_note_vm_before(&ids);
+        self.docker_note_expected_gone(&review.commands);
         if items.is_empty() {
             self.start_commands();
             return;
@@ -2216,6 +2361,7 @@ impl App {
                 commands: Vec::new(),
                 retry: Vec::new(),
                 started_tick: self.tick,
+                vm_disk: None,
             }),
             DeleteMode::SoftOnly => {
                 let mut msg = format!(
@@ -2330,11 +2476,19 @@ impl App {
     fn commands_done(&mut self) {
         self.cmd_job = None;
         self.cmd_ctl = None;
+        let mut docker_ran = false;
         for (id, _) in std::mem::take(&mut self.pending_commands) {
+            docker_ran |= dockerpage::is_docker_id(&id);
             self.tool_marks.remove(&id);
         }
-        // The folders the commands cleaned changed on disk: scan them again.
-        let changed: Vec<PathBuf> = self.pending_meta.iter().map(|m| m.path.clone()).collect();
+        // The folders the commands cleaned changed on disk: scan them again
+        // (Docker's commands have no folder).
+        let changed: Vec<PathBuf> = self
+            .pending_meta
+            .iter()
+            .map(|m| m.path.clone())
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
         self.refresh_queue
             .extend(changed.into_iter().map(Refresh::Changed));
         // Commands that failed only because a lock was held, and that have a
@@ -2355,6 +2509,7 @@ impl App {
         self.refresh_held();
         self.refresh_rows();
         self.rebuild_targets();
+        let vm_disk = self.docker_after_commands(docker_ran);
         let (moved, emptied, failures) = self.last_moves;
         self.dialog = Some(Dialog::Finish(FinishInfo {
             moved,
@@ -2366,6 +2521,7 @@ impl App {
             commands: outcomes,
             retry,
             started_tick: self.tick,
+            vm_disk,
         }));
         if self.quit_after_job {
             self.quit_after_job = false;
@@ -2751,7 +2907,7 @@ mod tests {
 
     #[test]
     fn sort_cycles_in_the_order_of_the_column_headers() {
-        // Header order is Name, Size, On disk, Frees; `s` walks it left to right.
+        // Header order is Name, Size, On disk, Frees, Modified; `s` walks it left to right.
         let mut e = sort_env();
         let app = &mut e.app;
         assert_eq!(app.sort, SortBy::Disk, "on disk is the default");
@@ -2759,6 +2915,8 @@ mod tests {
         assert_eq!(app.sort, SortBy::Frees);
         // Plain files free what they occupy, so this order matches on-disk.
         assert_eq!(names(app), ["real.bin", "a.bin", "sparse.bin"]);
+        app.update(Action::CycleSort);
+        assert_eq!(app.sort, SortBy::Modified);
         app.update(Action::CycleSort);
         assert_eq!(app.sort, SortBy::Name);
         assert_eq!(names(app), ["a.bin", "real.bin", "sparse.bin"]);
@@ -2792,6 +2950,7 @@ mod tests {
         assert!(sparse.size > sparse.disk);
         assert_eq!(app.weight(&sparse), sparse.disk);
         app.update(Action::CycleSort); // by what it frees
+        app.update(Action::CycleSort); // by modified
         app.update(Action::CycleSort); // by name
         app.update(Action::CycleSort); // by size
         assert_eq!(app.sort, SortBy::Size);
@@ -2869,6 +3028,8 @@ mod tests {
         assert_eq!(app.screen, Screen::Explorer);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Targets);
+        app.update(Action::Down);
+        assert_eq!(app.screen, Screen::Docker);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Holding);
         app.update(Action::Into);
@@ -3943,6 +4104,7 @@ mod tests {
         assert_eq!(sp.footprint, 8192 + 12288);
         assert_eq!(app.weight_total(), 8192 + 12288);
         app.update(Action::CycleSort); // by what frees
+        app.update(Action::CycleSort); // by modified
         app.update(Action::CycleSort); // by name
         app.update(Action::CycleSort); // by size: the logical total
         assert_eq!(app.sort, SortBy::Size);
@@ -4248,14 +4410,21 @@ mod tests {
         let app = &mut e.app;
         assert_eq!(app.sort, SortBy::Disk);
         let mut seen = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.update(Action::CycleSort);
             seen.push(app.sort);
         }
         assert_eq!(
             seen,
-            [SortBy::Frees, SortBy::Name, SortBy::Size, SortBy::Disk]
+            [
+                SortBy::Frees,
+                SortBy::Modified,
+                SortBy::Name,
+                SortBy::Size,
+                SortBy::Disk
+            ]
         );
+        app.update(Action::CycleSort);
         app.update(Action::CycleSort);
         app.update(Action::CycleSort);
         assert_eq!(app.sort, SortBy::Name);

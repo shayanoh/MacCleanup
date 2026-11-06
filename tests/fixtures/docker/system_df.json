@@ -1,0 +1,17 @@
+{
+  "LayersSize": 1500,
+  "Images": [
+    {"Id": "sha256:aaa1", "ParentId": "", "RepoTags": ["web:latest"], "RepoDigests": ["web@sha256:aaa1"], "Created": 1792000000, "Size": 1000, "SharedSize": 400, "Labels": {"org.opencontainers.image.title": "Web"}, "Containers": 1},
+    {"Id": "sha256:bbb2", "ParentId": "", "RepoTags": null, "RepoDigests": null, "Created": 1791000000, "Size": 600, "SharedSize": -1, "Labels": null, "Containers": 0}
+  ],
+  "Containers": [],
+  "Volumes": [
+    {"Name": "pgdata", "Driver": "local", "Mountpoint": "/var/lib/docker/volumes/pgdata/_data", "CreatedAt": "2026-09-10T23:16:21Z", "Labels": {"com.docker.compose.project": "shop"}, "Scope": "local", "Options": null, "UsageData": {"RefCount": 1, "Size": 66363194}},
+    {"Name": "unmeasured", "Driver": "local", "Mountpoint": "/var/lib/docker/volumes/unmeasured/_data", "CreatedAt": "2026-10-01T00:00:00Z", "Labels": null, "Scope": "local", "Options": null, "UsageData": {"RefCount": -1, "Size": -1}}
+  ],
+  "BuildCache": [
+    {"ID": "root1", "Type": "regular", "Description": "pulled from docker.io/library/ubuntu:22.04", "InUse": false, "Shared": true, "Size": 117480604, "CreatedAt": "2026-10-23T14:51:03.209088184Z", "LastUsedAt": "2026-10-23T15:00:23.42436762Z", "UsageCount": 1},
+    {"ID": "child1", " Parents": ["root1"], "Type": "regular", "Description": "mount / from exec /bin/sh -c apt-get update", "InUse": false, "Shared": false, "Size": 1297818308, "CreatedAt": "2026-10-23T14:56:01.664773376Z", "LastUsedAt": "2026-10-23T15:00:23.428130844Z", "UsageCount": 2},
+    {"ID": "nolast", "Type": "source.local", "Description": "local source for context", "InUse": true, "Shared": false, "Size": 4096, "CreatedAt": "2026-10-23T14:51:03.14059082Z", "LastUsedAt": null, "UsageCount": 0}
+  ]
+}

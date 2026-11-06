@@ -50,6 +50,13 @@ const PROTECTED_LIBRARY_SELF: &[&str] = &[
     "Metadata",
 ];
 
+/// App data folders inside `~/Library/Containers` and `~/Library/Group
+/// Containers` that are protected including everything inside.
+const PROTECTED_APP_DATA: &[(&str, &str)] = &[
+    ("Containers", "com.docker.docker"),
+    ("Group Containers", "group.com.docker"),
+];
+
 /// `~/Library` folders that are protected including everything inside.
 const PROTECTED_LIBRARY_TREE: &[&str] = &[
     "Keychains",
@@ -208,6 +215,15 @@ impl Policy {
                 return Safety::Protected;
             }
             if PROTECTED_LIBRARY_TREE.contains(&second) {
+                return Safety::Protected;
+            }
+            // Docker Desktop's VM disk lives here: it is only ever shrunk
+            // through Docker itself, never deleted as a file.
+            if comps.len() >= 3
+                && PROTECTED_APP_DATA
+                    .iter()
+                    .any(|(folder, name)| second == *folder && comps[2] == *name)
+            {
                 return Safety::Protected;
             }
         }
@@ -506,6 +522,46 @@ mod tests {
         assert_eq!(
             s.policy.classify(&s.holding.join("items/1/a")),
             Safety::Protected
+        );
+    }
+
+    #[test]
+    fn docker_desktop_data_is_protected() {
+        let s = sandbox();
+        for rel in [
+            "Library/Containers/com.docker.docker",
+            "Library/Containers/com.docker.docker/Data",
+            "Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
+            "Library/Group Containers/group.com.docker",
+            "Library/Group Containers/group.com.docker/settings-store.json",
+        ] {
+            assert_eq!(
+                s.policy.classify(&s.home.join(rel)),
+                Safety::Protected,
+                "{rel}"
+            );
+        }
+        // Another app's container is not touched by this rule.
+        assert_ne!(
+            s.policy
+                .classify(&s.home.join("Library/Containers/com.other.app/Data/x")),
+            Safety::Protected
+        );
+    }
+
+    #[test]
+    fn folder_holding_docker_raw_is_refused_whole() {
+        let s = sandbox();
+        let dir = s
+            .home
+            .join("Library/Containers/com.docker.docker/Data/vms/0/data");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Docker.raw"), b"x").unwrap();
+        let outer = s.home.join("Library/Containers/com.docker.docker");
+        assert!(!s.policy.can_mark(&outer));
+        assert_eq!(
+            s.policy.protected_descendant(&dir),
+            Some(dir.join("Docker.raw"))
         );
     }
 

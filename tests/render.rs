@@ -497,7 +497,7 @@ use ratatui::style::{Color, Style};
 #[test]
 fn explorer_header_marks_the_sorted_column() {
     let mut e = explorer(GlyphMode::Nerd);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(
         text.contains("On disk ▼"),
         "default is on-disk, descending:\n{text}"
@@ -508,17 +508,22 @@ fn explorer_header_marks_the_sorted_column() {
     );
 
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Frees ▼"), "{text}");
     assert!(!text.contains("On disk ▼"), "{text}");
 
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
-    assert!(text.contains("Name ▲"), "{text}");
+    let text = render(&mut e.app, 170, 30);
+    assert!(text.contains("Modified ▼"), "{text}");
     assert!(!text.contains("Frees ▼"), "{text}");
 
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
+    assert!(text.contains("Name ▲"), "{text}");
+    assert!(!text.contains("Modified ▼"), "{text}");
+
+    e.app.update(Action::CycleSort);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Size ▼"), "{text}");
     assert!(!text.contains("Name ▲"), "{text}");
 }
@@ -526,13 +531,16 @@ fn explorer_header_marks_the_sorted_column() {
 #[test]
 fn explorer_header_arrows_are_ascii_in_ascii_mode() {
     let mut e = explorer(GlyphMode::Ascii);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("On disk v"), "{text}");
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Frees v"), "{text}");
     e.app.update(Action::CycleSort);
-    let text = render(&mut e.app, 120, 30);
+    let text = render(&mut e.app, 170, 30);
+    assert!(text.contains("Modified v"), "{text}");
+    e.app.update(Action::CycleSort);
+    let text = render(&mut e.app, 170, 30);
     assert!(text.contains("Name ^"), "{text}");
 }
 
@@ -543,20 +551,21 @@ fn sorted_column_is_white_and_the_others_gray() {
     let disk = find_text(&mut e.app, 120, 30, "On disk").unwrap();
     let size = find_text(&mut e.app, 120, 30, "Size").unwrap();
     assert_eq!(disk.fg, Some(Color::White));
-    assert_eq!(size.fg, Some(Color::DarkGray));
+    assert_eq!(size.fg, Some(maccleanup::ui::DIM));
 
     e.app.update(Action::CycleSort); // by Frees
     let disk = find_text(&mut e.app, 120, 30, "On disk").unwrap();
     let frees = find_text(&mut e.app, 120, 30, "Frees").unwrap();
     assert_eq!(frees.fg, Some(Color::White));
-    assert_eq!(disk.fg, Some(Color::DarkGray));
+    assert_eq!(disk.fg, Some(maccleanup::ui::DIM));
 
+    e.app.update(Action::CycleSort); // by Modified
     e.app.update(Action::CycleSort); // by Name
     e.app.update(Action::CycleSort); // by Size
     let frees = find_text(&mut e.app, 120, 30, "Frees").unwrap();
     let size = find_text(&mut e.app, 120, 30, "Size").unwrap();
     assert_eq!(size.fg, Some(Color::White));
-    assert_eq!(frees.fg, Some(Color::DarkGray));
+    assert_eq!(frees.fg, Some(maccleanup::ui::DIM));
 }
 
 #[test]
@@ -577,7 +586,7 @@ fn sorted_column_values_are_white_and_the_other_size_column_gray() {
     let disk = find_text(&mut e.app, 120, 30, &big_disk).unwrap();
     let size = find_text(&mut e.app, 120, 30, &big_size).unwrap();
     assert_eq!(disk.fg, Some(Color::White));
-    assert_eq!(size.fg, Some(Color::DarkGray));
+    assert_eq!(size.fg, Some(maccleanup::ui::DIM));
 }
 
 #[test]
@@ -1437,7 +1446,7 @@ fn targets_columns_match_the_explorer_in_order() {
             .lines()
             .find(|l| l.contains("Name") && l.contains("Frees"))
             .unwrap();
-        ["Name", "Size", "On disk", "Frees"]
+        ["Name", "Size", "On disk", "Frees", "Modified"]
             .iter()
             .map(|c| line.find(c).unwrap_or_else(|| panic!("no {c} in {line}")))
             .collect()
@@ -2349,4 +2358,642 @@ fn filtering_by_a_project_shows_its_caches_and_marks_why_the_group_matched() {
     }
     // The graph shows only the matching project.
     assert_eq!(e.app.graph_hits.len(), 1);
+}
+
+// ---- Docker page ---------------------------------------------------------
+
+const DOCKER_DF: &str = include_str!("fixtures/docker/system_df.json");
+const DOCKER_CONTAINERS: &str = include_str!("fixtures/docker/containers.json");
+const DOCKER_CONTAINER_INSPECT: &str = include_str!("fixtures/docker/container_inspect.json");
+const DOCKER_HISTORY: &str = include_str!("fixtures/docker/history.json");
+const DOCKER_INSPECT: &str = include_str!("fixtures/docker/inspect_image.json");
+const DOCKER_CONTEXT: &str = include_str!("fixtures/docker/context_inspect.json");
+
+/// Answers Docker's API calls from fixtures; runs nothing.
+struct FakeDocker {
+    df: String,
+    running: bool,
+    /// File listings (of a volume or image) fail.
+    no_listing: bool,
+}
+
+const BROWSE_ROOT: &str =
+    "d\t4096\t1700000000\tsub dir\0f\t12\t1700000100\tb.txt\0f\t2048000\t1700000200\tbig.db\0";
+
+impl maccleanup::catalog::CommandRunner for FakeDocker {
+    fn run(
+        &self,
+        _: &maccleanup::catalog::CommandSpec,
+        _: &maccleanup::catalog::RunControl,
+    ) -> maccleanup::catalog::CommandResult {
+        maccleanup::catalog::CommandResult {
+            ok: true,
+            cancelled: false,
+            output_tail: String::new(),
+        }
+    }
+    fn query(&self, spec: &maccleanup::catalog::CommandSpec) -> Option<String> {
+        let full = spec.full();
+        let answers: [(&str, &str); 7] = [
+            ("context inspect", DOCKER_CONTEXT),
+            ("/_ping", if self.running { "OK" } else { "" }),
+            ("/system/df", self.df.as_str()),
+            ("/containers/json?all=1", DOCKER_CONTAINERS),
+            ("/containers/c0ffee1/json", DOCKER_CONTAINER_INSPECT),
+            ("/images/sha256:aaa1/history", DOCKER_HISTORY),
+            ("/images/sha256:aaa1/json", DOCKER_INSPECT),
+        ];
+        if full.contains("/_ping") && !self.running {
+            return None;
+        }
+        if full.contains("--entrypoint sh") && !self.no_listing {
+            return Some(BROWSE_ROOT.to_string());
+        }
+        answers
+            .iter()
+            .find(|(k, _)| full.contains(k))
+            .map(|(_, v)| v.to_string())
+    }
+    fn available(&self, program: &str) -> bool {
+        program.ends_with("docker")
+    }
+}
+
+fn docker_screen_with(mode: GlyphMode, df: &str, running: bool, vm_disk: bool) -> Env {
+    docker_screen_full(mode, df, running, vm_disk, false)
+}
+
+fn docker_screen_full(
+    mode: GlyphMode,
+    df: &str,
+    running: bool,
+    vm_disk: bool,
+    no_listing: bool,
+) -> Env {
+    let mut e = make_app_with(&[("a.txt", 10)], mode, |home| {
+        if vm_disk {
+            let raw = home.join("Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw");
+            fs::create_dir_all(raw.parent().unwrap()).unwrap();
+            fs::write(&raw, vec![1u8; 8192]).unwrap();
+        }
+    });
+    e.app.runner = std::sync::Arc::new(FakeDocker {
+        df: df.to_string(),
+        running,
+        no_listing,
+    });
+    e.app.update(Action::GoTo(Screen::Docker));
+    for _ in 0..2000 {
+        e.app.update(Action::Tick);
+        if !e.app.docker.job.pending {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e
+}
+
+fn docker_screen(mode: GlyphMode) -> Env {
+    docker_screen_with(mode, DOCKER_DF, true, false)
+}
+
+#[test]
+fn docker_page_shows_sections_columns_the_tree_and_tags() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 150, 40);
+    for want in [
+        "IMAGES",
+        "VOLUMES",
+        "BUILD CACHE",
+        "web:latest",
+        "web-1",
+        "pgdata",
+        "unmeasured",
+        "apt-get update",
+        "running",
+        "unused",
+    ] {
+        assert!(t.contains(want), "missing {want:?}:\n{t}");
+    }
+    let header = t
+        .lines()
+        .find(|l| l.contains("Name") && l.contains("Created"))
+        .unwrap_or_else(|| panic!("no header:\n{t}"));
+    let at: Vec<usize> = ["Name", "Size", "Frees", "Last used", "Created"]
+        .iter()
+        .map(|c| {
+            header
+                .find(c)
+                .unwrap_or_else(|| panic!("no {c} in {header}"))
+        })
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?} in {header}");
+    assert!(
+        header.contains("Size ▼"),
+        "sorted by size by default: {header}"
+    );
+}
+
+#[test]
+fn docker_header_arrow_follows_the_sort_key() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    e.app.update(Action::CycleSort);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("Frees ▼") && !t.contains("Size ▼"), "{t}");
+}
+
+#[test]
+fn docker_page_hides_the_side_pane_when_narrow() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let wide = render(&mut e.app, 150, 40);
+    assert!(wide.contains("Details"));
+    let narrow = render(&mut e.app, 70, 30);
+    assert!(!narrow.contains("Details"), "{narrow}");
+    assert!(narrow.contains("IMAGES"));
+}
+
+#[test]
+fn docker_page_says_why_it_cannot_read_docker() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, DOCKER_DF, false, false);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("Docker is not running"), "{t}");
+    assert!(!t.contains("IMAGES"));
+}
+
+#[test]
+fn docker_names_are_cleaned_of_control_characters() {
+    let evil = DOCKER_DF.replace("web:latest", "evil\\u001b[31m:latest");
+    let mut e = docker_screen_with(GlyphMode::Nerd, &evil, true, false);
+    let cells = render_cells(&mut e.app, 150, 40);
+    assert!(cells.iter().all(|c| !c.contains('\u{1b}')), "escape leaked");
+    assert!(render(&mut e.app, 150, 40).contains("evil"));
+}
+
+#[test]
+fn docker_page_is_ascii_in_ascii_mode() {
+    let mut e = docker_screen(GlyphMode::Ascii);
+    for c in render_cells(&mut e.app, 150, 40) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+#[test]
+fn docker_summary_line_shows_marks_and_what_they_free() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("nothing marked"), "{t}");
+    let at = e
+        .app
+        .docker
+        .lines
+        .iter()
+        .position(|l| l.key == "section:cache")
+        .unwrap();
+    e.app.docker.cursor = at;
+    e.app.update(Action::ToggleMark);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("marked 2"), "{t}");
+    assert!(t.contains("frees 1.4 GB"), "{t}");
+    assert!(t.contains("VM disk trim"), "the trim comes along: {t}");
+}
+
+#[test]
+fn docker_status_line_shows_the_vm_disk() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, DOCKER_DF, true, true);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("VM disk"), "{t}");
+}
+
+fn docker_cursor(e: &mut Env, key: &str) {
+    let at = e
+        .app
+        .docker
+        .lines
+        .iter()
+        .position(|l| l.key == key)
+        .unwrap_or_else(|| panic!("no line {key}"));
+    e.app.docker.cursor = at;
+}
+
+fn docker_text_at(e: &mut Env, key: &str) -> String {
+    docker_cursor(e, key);
+    render(&mut e.app, 210, 50)
+}
+
+#[test]
+fn docker_layer_rows_show_command_size_and_the_biggest_one() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 210, 50);
+    assert!(t.contains("pnpm install"), "tidied command:\n{t}");
+    assert!(!t.contains("buildkit"), "noise is dropped:\n{t}");
+    let biggest: Vec<&str> = t.lines().filter(|l| l.contains("biggest")).collect();
+    assert_eq!(biggest.len(), 1, "exactly one biggest layer:\n{t}");
+    assert!(biggest[0].contains("alpine-minirootfs"), "{}", biggest[0]);
+}
+
+#[test]
+fn docker_image_details_explain_the_proxy_layers_and_what_holds_it() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = docker_text_at(&mut e, "image:sha256:aaa1");
+    for want in [
+        "tags: web:latest",
+        "layers: 5",
+        "worked out from its containers",
+        "web-1",
+        "cannot be removed",
+    ] {
+        assert!(t.contains(want), "missing {want:?}:\n{t}");
+    }
+}
+
+#[test]
+fn docker_image_with_stopped_containers_says_to_remove_them_first() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = docker_text_at(&mut e, "image:sha256:bbb2");
+    assert!(t.contains("remove these containers first"), "{t}");
+    assert!(t.contains("old"), "{t}");
+}
+
+#[test]
+fn docker_container_volume_cache_and_layer_details() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = docker_text_at(&mut e, "container:c0ffee2");
+    assert!(t.contains("stopped") && !t.contains("volumes:"), "{t}");
+    let t = docker_text_at(&mut e, "volume:pgdata");
+    assert!(t.contains("cannot be recovered"), "{t}");
+    assert!(t.contains("web-1"), "{t}");
+    let t = docker_text_at(&mut e, "cache:child1");
+    assert!(t.contains("mount / from exec"), "the original wording: {t}");
+    assert!(t.contains("used 2 times"), "{t}");
+    let t = docker_text_at(&mut e, "layer:sha256:aaa1:3");
+    assert!(t.contains("RUN /bin/sh -c pnpm install"), "{t}");
+    assert!(t.contains("only in this image"), "{t}");
+}
+
+/// A build step too long for any pane, ending in a marker.
+fn long_step_df() -> String {
+    let long = format!(
+        "mount / from exec /bin/sh -c {} TAILMARK",
+        "apt-get install -y some-quite-long-package-name ".repeat(12)
+    );
+    DOCKER_DF.replace("mount / from exec /bin/sh -c apt-get update", &long)
+}
+
+#[test]
+fn docker_details_show_the_whole_command_line() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, &long_step_df(), true, false);
+    let t = docker_text_at(&mut e, "cache:child1");
+    assert!(
+        t.contains("TAILMARK"),
+        "the end of the command is shown:\n{t}"
+    );
+    assert!(
+        t.matches("some-quite-long-package-name").count() >= 6,
+        "wrapped over several lines, not cut:\n{t}"
+    );
+}
+
+#[test]
+fn docker_details_scroll_with_the_detail_keys_when_they_do_not_fit() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, &long_step_df(), true, false);
+    docker_cursor(&mut e, "cache:child1");
+    // A short terminal: the wrapped command cannot fit in the pane.
+    let top = render(&mut e.app, 150, 22);
+    assert!(!top.contains("TAILMARK"), "starts at the top:\n{top}");
+    let mut seen = false;
+    for _ in 0..60 {
+        e.app.update(Action::DetailScroll(1));
+        if render(&mut e.app, 150, 22).contains("TAILMARK") {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "scrolling down reaches the end of the command");
+    // It stops at the end: more presses change nothing and need no catching up.
+    for _ in 0..50 {
+        e.app.update(Action::DetailScroll(1));
+    }
+    let end = render(&mut e.app, 150, 22);
+    assert!(end.contains("TAILMARK"));
+    e.app.update(Action::DetailScroll(-1));
+    let up = render(&mut e.app, 150, 22);
+    assert_ne!(end, up, "one press up moves it at once");
+    for _ in 0..100 {
+        e.app.update(Action::DetailScroll(-1));
+    }
+    assert!(!render(&mut e.app, 150, 22).contains("TAILMARK"));
+}
+
+#[test]
+fn docker_details_scroll_resets_when_the_selection_changes() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, &long_step_df(), true, false);
+    docker_cursor(&mut e, "cache:child1");
+    render(&mut e.app, 150, 22);
+    for _ in 0..8 {
+        e.app.update(Action::DetailScroll(1));
+        render(&mut e.app, 150, 22);
+    }
+    assert!(e.app.docker.detail_scroll > 0);
+    docker_cursor(&mut e, "cache:root1");
+    render(&mut e.app, 150, 22);
+    assert_eq!(e.app.docker.detail_scroll, 0);
+}
+
+#[test]
+fn docker_review_shows_what_blocks_it() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    docker_cursor(&mut e, "image:sha256:bbb2");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("is held by container(s) old"), "{t}");
+    assert!(
+        !t.contains("Move, then run") && !t.contains("Run the commands"),
+        "{t}"
+    );
+    assert!(t.contains("docker image rm"), "{t}");
+}
+
+#[test]
+fn docker_finish_screen_reports_the_vm_disk_file() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, DOCKER_DF, true, true);
+    docker_cursor(&mut e, "container:c0ffee2");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..2000 {
+        e.app.update(Action::Tick);
+        if matches!(e.app.dialog, Some(Dialog::Finish(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("Docker VM disk file"), "{t}");
+}
+
+#[test]
+fn docker_vm_disk_row_shows_at_the_top_with_its_upper_bound() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, DOCKER_DF, true, true);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("VM DISK"), "{t}");
+    assert!(t.contains("Shrink VM disk"), "{t}");
+    let band = t.lines().position(|l| l.contains("VM DISK")).unwrap();
+    let images = t.lines().position(|l| l.contains("IMAGES")).unwrap();
+    assert!(band < images, "the VM disk comes first:\n{t}");
+    let detail = {
+        docker_cursor(&mut e, "vm:trim");
+        render(&mut e.app, 210, 50)
+    };
+    assert!(detail.contains("fstrim"), "{detail}");
+}
+
+#[test]
+fn docker_finish_says_unchanged_when_the_trim_gave_nothing_back() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, DOCKER_DF, true, true);
+    docker_cursor(&mut e, "vm:trim");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..2000 {
+        e.app.update(Action::Tick);
+        if matches!(e.app.dialog, Some(Dialog::Finish(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains("unchanged"), "{t}");
+}
+
+/// The Docker page with its volume `pgdata` opened in the file browser.
+fn docker_browsing(mode: GlyphMode, no_listing: bool) -> Env {
+    let mut e = docker_screen_full(mode, DOCKER_DF, true, false, no_listing);
+    docker_cursor(&mut e, "volume:pgdata");
+    e.app.update(Action::Browse);
+    for _ in 0..2000 {
+        e.app.update(Action::Tick);
+        if e.app.docker.browse.as_ref().is_some_and(|b| !b.loading()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e
+}
+
+#[test]
+fn docker_file_browser_lists_names_sizes_and_dates() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    let t = render(&mut e.app, 120, 30);
+    for want in [
+        "volume pgdata",
+        "sub dir",
+        "b.txt",
+        "big.db",
+        "2.0 MB",
+        "4.1 KB",
+        "3 items",
+        "ago",
+        "read-only",
+    ] {
+        assert!(t.contains(want), "missing {want:?}:\n{t}");
+    }
+    let header = t
+        .lines()
+        .find(|l| l.contains("Name") && l.contains("Modified"))
+        .unwrap_or_else(|| panic!("no header:\n{t}"));
+    assert!(header.find("Name") < header.find("Size"));
+    assert!(header.find("Size") < header.find("Modified"));
+    let first = t.lines().position(|l| l.contains("sub dir")).unwrap();
+    let file = t.lines().position(|l| l.contains("b.txt")).unwrap();
+    assert!(first < file, "folders come first:\n{t}");
+}
+
+#[test]
+fn docker_file_browser_says_why_a_listing_failed() {
+    let mut e = docker_browsing(GlyphMode::Nerd, true);
+    let t = render(&mut e.app, 120, 30);
+    assert!(t.contains("Docker did not answer"), "{t}");
+}
+
+#[test]
+fn docker_file_browser_is_ascii_in_ascii_mode() {
+    let mut e = docker_browsing(GlyphMode::Ascii, false);
+    for c in render_cells(&mut e.app, 120, 30) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+#[test]
+fn docker_file_browser_filter_row_and_path_follow_the_folder() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    e.app.update(Action::FilterOpen);
+    e.app.update(Action::FilterChar('i'));
+    e.app.update(Action::FilterChar('g'));
+    let t = render(&mut e.app, 120, 30);
+    assert!(
+        t.contains("big.db") && !t.contains("b.txt") && !t.contains("sub dir"),
+        "{t}"
+    );
+}
+
+#[test]
+fn explorer_keeps_names_readable_on_a_narrow_terminal_by_dropping_modified() {
+    let mut e = explorer(GlyphMode::Nerd);
+    let t = render(&mut e.app, 100, 30);
+    assert!(t.contains("small.txt"), "the whole name fits:\n{t}");
+    assert!(
+        !t.contains("Modified"),
+        "the Modified column gives way first:\n{t}"
+    );
+}
+
+#[test]
+fn explorer_shows_modified_when_there_is_room_for_it() {
+    let mut e = explorer(GlyphMode::Nerd);
+    let t = render(&mut e.app, 170, 30);
+    assert!(t.contains("Modified"), "{t}");
+    assert!(t.contains("small.txt"), "{t}");
+}
+
+#[test]
+fn docker_review_shows_the_whole_target_of_a_removal() {
+    let long = "a-volume-with-quite-a-long-name-for-the-review-dialog-to-show-in-full";
+    let df = DOCKER_DF.replace("unmeasured", long);
+    let mut e = docker_screen_with(GlyphMode::Nerd, &df, true, false);
+    docker_cursor(&mut e, &format!("volume:{long}"));
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    let t = render(&mut e.app, 150, 40);
+    assert!(t.contains(&format!("docker volume rm {long}")), "{t}");
+    assert!(
+        !t.contains("--context"),
+        "the flag is noise in the review:\n{t}"
+    );
+}
+
+#[test]
+fn docker_page_keeps_names_readable_on_a_narrow_terminal() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 100, 40);
+    // The name must be in the list row itself (left of its size), not only in
+    // the graph or Details panes on the right.
+    assert!(
+        t.lines().any(|l| matches!(
+            (l.find("web:latest"), l.find("1.0 KB")),
+            (Some(n), Some(s)) if n < s
+        )),
+        "the tag is not squeezed to an ellipsis:\n{t}"
+    );
+    assert!(!t.contains("Created"), "Created gives way first:\n{t}");
+    let wide = render(&mut e.app, 170, 40);
+    assert!(
+        wide.contains("Created") && wide.contains("Last used"),
+        "{wide}"
+    );
+    assert!(wide.contains("web:latest"));
+}
+
+#[test]
+fn docker_page_at_the_narrowest_keeps_size_and_frees() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 70, 30);
+    assert!(t.contains("Size") && t.contains("Frees"), "{t}");
+    assert!(!t.contains("Last used") && !t.contains("Created"), "{t}");
+}
+
+#[test]
+fn docker_file_browser_status_line_cleans_folder_names_from_inside_a_volume() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    e.app.docker.browse.as_mut().unwrap().dir = "/evil\u{1b}[31mdir".to_string();
+    let cells = render_cells(&mut e.app, 120, 30);
+    assert!(
+        cells.iter().all(|c| !c.contains('\u{1b}')),
+        "an escape sequence from a file name reached the screen"
+    );
+}
+
+#[test]
+fn the_finish_screen_summarises_a_long_list_of_command_results() {
+    use maccleanup::app::{CommandOutcome, FinishInfo};
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let outcomes: Vec<CommandOutcome> = (0..40)
+        .map(|i| CommandOutcome {
+            line: format!("docker builder prune -f --filter id=rec{i:02}"),
+            ok: i != 7,
+            cancelled: false,
+            note: "refused".to_string(),
+            lock_wait: false,
+        })
+        .collect();
+    e.app.dialog = Some(Dialog::Finish(FinishInfo {
+        moved: Default::default(),
+        emptied: Default::default(),
+        free_before: 0,
+        free_after: 0,
+        failures: 0,
+        first_failure: None,
+        commands: outcomes,
+        retry: Vec::new(),
+        started_tick: 0,
+        vm_disk: None,
+    }));
+    let t = render(&mut e.app, 150, 50);
+    assert!(t.contains("rec07"), "the failed one is always listed:\n{t}");
+    assert!(t.contains("and 32 more"), "{t}");
+    assert!(!t.contains("rec39"), "the rest are summarised:\n{t}");
+}
+
+#[test]
+fn docker_file_browser_has_the_graph_at_the_side_like_the_explorer() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    let t = render(&mut e.app, 150, 30);
+    assert!(t.contains("Treemap"), "{t}");
+    assert!(!e.app.graph_hits.is_empty(), "boxes are clickable");
+    // `t` cycles the graph like in the Explorer.
+    e.app.update(Action::CycleGraph);
+    let t = render(&mut e.app, 150, 30);
+    assert!(t.contains("Distribution") || !t.contains("Treemap"), "{t}");
+    e.app.update(Action::CycleGraph);
+    e.app.update(Action::CycleGraph);
+    let narrow = render(&mut e.app, 70, 30);
+    assert!(
+        !narrow.contains("Treemap") && !narrow.contains("Distribution"),
+        "{narrow}"
+    );
+    assert!(narrow.contains("big.db"), "the list still shows: {narrow}");
+}
+
+#[test]
+fn docker_file_browser_graph_click_selects_the_entry() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    render(&mut e.app, 150, 30);
+    let hits = e.app.graph_hits.clone();
+    // The biggest entry always has a box; start on the last (tiny) one.
+    let (rect, key) = hits
+        .iter()
+        .find(|(_, k)| k.0 == 0)
+        .cloned()
+        .expect("a box for the biggest entry");
+    e.app.update(Action::Down);
+    e.app.update(Action::Down);
+    assert_eq!(e.app.docker.browse.as_ref().unwrap().cursor, 2);
+    e.app.update(Action::Click {
+        x: rect.x + rect.width / 2,
+        y: rect.y + rect.height / 2,
+    });
+    assert_eq!(e.app.docker.browse.as_ref().unwrap().cursor, key.0);
+}
+
+#[test]
+fn docker_file_browser_header_marks_the_sorted_column_and_s_moves_it() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    let t = render(&mut e.app, 150, 30);
+    assert!(t.contains("Size ▼"), "biggest first by default:\n{t}");
+    e.app.update(Action::CycleSort);
+    let t = render(&mut e.app, 150, 30);
+    assert!(t.contains("Modified ▼") && !t.contains("Size ▼"), "{t}");
+    e.app.update(Action::CycleSort);
+    let t = render(&mut e.app, 150, 30);
+    assert!(t.contains("Name ▲"), "{t}");
 }

@@ -289,10 +289,12 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
             Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
         )));
         for c in r.commands.iter().take(lay.shown_commands) {
+            // The whole command: what it will do must be readable before it
+            // is confirmed. Which tool, how much and where from go below.
             lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", g.dot()), Style::default().fg(DANGER)),
                 Span::styled(
-                    fit(&c.line, 40, g),
+                    fit(&c.line, (inner.width as usize).saturating_sub(4), g),
                     // A forced command is drawn in red: it skips a safety check.
                     if c.force {
                         Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
@@ -300,16 +302,18 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
                         Style::default().add_modifier(Modifier::BOLD)
                     },
                 ),
-                Span::styled(
-                    format!("  {}  up to {}", c.tool, human_size(c.up_to)),
-                    Style::default().fg(DIM),
-                ),
             ]));
             if !lay.compact {
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "    via {}",
-                        fit_start(&c.spec.program, (inner.width as usize).saturating_sub(8), g)
+                        "    {}  up to {}  via {}",
+                        c.tool,
+                        human_size(c.up_to),
+                        fit_start(
+                            &c.spec.program,
+                            (inner.width as usize).saturating_sub(40),
+                            g
+                        )
                     ),
                     Style::default().fg(DIM),
                 )));
@@ -401,7 +405,17 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
             )));
         }
     }
-    if r.commands.is_empty() {
+    if let Some(problem) = r.problems.first() {
+        // Docker would refuse part of it: nothing can run until it is fixed.
+        lines.push(Line::from(Span::styled(
+            format!("{} {}", g.warn(), problem),
+            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(key_line(
+            g,
+            &[("Esc", "Cancel (mark them, then review again)")],
+        ));
+    } else if r.commands.is_empty() {
         lines.push(key_line(
             g,
             &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],
@@ -682,7 +696,34 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
             Style::default().fg(DANGER),
         )));
     }
-    for c in &f.commands {
+    // A long list is summarised: every failure is shown (up to the cap),
+    // then the first of the rest, and a line says how many are hidden.
+    const SHOWN: usize = 8;
+    let mut shown: Vec<usize> = f
+        .commands
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.ok)
+        .map(|(i, _)| i)
+        .take(SHOWN)
+        .collect();
+    for i in 0..f.commands.len() {
+        if shown.len() >= SHOWN {
+            break;
+        }
+        if !shown.contains(&i) {
+            shown.push(i);
+        }
+    }
+    shown.sort_unstable();
+    let hidden = f.commands.len() - shown.len();
+    let hidden_failed = f
+        .commands
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| !c.ok && !shown.contains(i))
+        .count();
+    for c in shown.iter().map(|&i| &f.commands[i]) {
         let (mark, color) = if c.ok {
             (g.check(), SAFE)
         } else if c.cancelled {
@@ -711,6 +752,33 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
                 Style::default().fg(CAUTION),
             )));
         }
+    }
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} and {hidden} more ({})",
+                g.ellipsis(),
+                if hidden_failed == 0 {
+                    "all ok".to_string()
+                } else {
+                    format!("{hidden_failed} failed")
+                }
+            ),
+            Style::default().fg(DIM),
+        )));
+    }
+    if let Some((before, after)) = f.vm_disk {
+        let change = match after.cmp(&before) {
+            std::cmp::Ordering::Less => format!("shrank by {}", human_size(before - after)),
+            std::cmp::Ordering::Equal => "unchanged".to_string(),
+            std::cmp::Ordering::Greater => format!("grew by {}", human_size(after - before)),
+        };
+        lines.push(Line::from(format!(
+            "Docker VM disk file on this Mac: {} {} {} ({change})",
+            human_size(before),
+            g.arrow(),
+            human_size(after)
+        )));
     }
     lines.push(Line::from(format!(
         "Free space now {}   pending {}",
@@ -866,11 +934,13 @@ mod review_layout_tests {
                     path: std::path::PathBuf::new(),
                     can_force: false,
                     force: false,
+                    group: Vec::new(),
                 })
                 .collect(),
             total: Usage::default(),
             space: Default::default(),
             space_ready: true,
+            problems: Vec::new(),
         }
     }
 
