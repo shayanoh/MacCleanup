@@ -1,5 +1,7 @@
 # Caches & Projects Implementation Plan
 
+> **Status: implemented and merged.** Requests made while using it (cancelling commands and `--force`, products kept apart, workspaces, toolchain detection, npm as two items, a graph per project, the group-aware filter) went beyond this plan; section 11 of the design records them.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** One new screen listing project build artifacts and tool caches, with a joint (set-wise) "frees" figure, a detail pane naming related folders, one selection shared with the Explorer, and tool cleanup commands in the same review.

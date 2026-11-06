@@ -37,7 +37,7 @@ Success looks like: free space visibly increases, the user trusts it never delet
 ## 4. Experience requirements
 
 ### Layout **[User chose B]**
-Persistent left sidebar (Home, Explorer, Leftovers, Uninstall, Caches, Docker, Projects, ToBeDeleted, plus other sections as built) with a "pending" figure (soft-deleted, not yet freed) under it. Right side is the active pane. The Home overview pane shows free space with a live bar and a list of suggested biggest wins, with a "clean suggested" action.
+Persistent left sidebar (Home, Explorer, Leftovers, Uninstall, Caches & Projects (one page, built in milestone 2), Docker, ToBeDeleted, plus other sections as built) with a "pending" figure (soft-deleted, not yet freed) under it. Right side is the active pane. The Home overview pane shows free space with a live bar and a list of suggested biggest wins, with a "clean suggested" action.
 
 ### Visual style **[User]**
 Rich color, icons, special Unicode and Nerd Font glyphs (assume Nerd Font installed), elegant and "alive". A command-line flag switches to ASCII-only for terminals without that support. Animations using characters, motion and morph/transitions are wanted: screen transitions, treemap zoom, scan activity, final count-up. **[My call]**: an option to reduce or disable animations; animation never delays input or the real work.
@@ -93,7 +93,7 @@ Before running any cleanup, snapshot the relevant measure (affected paths and ov
 - Docker integration approach (Docker CLI versus API), and how to browse inside volumes.
 - Config file format and location, ToBeDeleted metadata format.
 - Animation engine details.
-- Build order after the explorer and soft delete: **[My call]** explorer plus soft delete first, then caches and project artifacts, then Docker, then leftovers and uninstaller, then the remaining candidates.
+- Build order after the explorer and soft delete (**done: the explorer with soft delete, then caches and project artifacts; next is Docker**): **[My call]** explorer plus soft delete first, then caches and project artifacts, then Docker, then leftovers and uninstaller, then the remaining candidates.
 - Testing approach, with emphasis on safety logic (protected set, review/confirm flow, soft-delete recovery) being heavily tested and never run against real user data.
 
 ## 10. Decisions after the builder check

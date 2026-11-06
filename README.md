@@ -2,9 +2,11 @@
 
 A colorful, animated terminal app (Rust TUI) for macOS that shows where your disk space went and helps you free it safely. Open it, see your free space, clean up, and finish with a summary of exactly how much you got back.
 
-> **Status: milestones 1 and 2 are implemented.** The disk explorer, soft delete (ToBeDeleted folder), graphs, free-space accounting, and the Caches & Projects screen work today. The remaining features below are planned; see the design document for the full scope.
+> **Status: milestones 1 and 2 are implemented and merged.** The disk explorer, soft delete (ToBeDeleted folder), graphs, free-space accounting, and the Caches & Projects screen (project build output and tool caches, with products kept and tool commands) work today. The remaining features under *Planned* are not built yet; see the design documents for the full scope.
 
 ## What works today
+
+### Explorer, soft delete and accounting
 
 - **Home:** live free-space gauge, pending (soft-deleted) space, scan activity, and the biggest folders. Every size is shown both as logical size and as space actually used on disk (for example `1.5 KB (4.1 KB on disk)`), because on-disk size is what a delete frees.
 - **Disk explorer:** a multithreaded scan of your home folder (or the folder you pass, e.g. `maccleanup .`) with live sizes. Each row shows logical size, real on-disk size and a share bar. Browse with vim-style keys or the mouse, sort by on-disk size, what a delete frees, size or name, mark items, then review and delete.
@@ -23,7 +25,11 @@ A colorful, animated terminal app (Rust TUI) for macOS that shows where your dis
 - **Honest accounting:** the finish screen reports space truly freed (the volume's free space now minus at the start), not just what was moved.
 - **Safety:** a hard-coded protected list, a review screen before every delete, and an extra explicit confirmation for anything irreversible (see below).
 
-- **Caches & Projects** (`5`): one list of things that come back by themselves. A blue **PROJECTS** section groups build output by project (`node_modules`, `.next`, `.turbo`, Rust `target`, `.dart_tool`, Flutter and Xcode `build`, `Pods`; only when the project's `package.json`, `Cargo.toml`, `pubspec.yaml`, `Podfile` or `.xcodeproj` sits next to it) and a purple **TOOLS & CACHES** section groups tool caches (pnpm, npm, Yarn, Go, uv, pip, Homebrew, Cargo, Dart/Flutter pub, Xcode DerivedData, Playwright, and every other folder in `~/Library/Caches` and `~/.cache`). It has the Explorer's columns, sort, filter, graph and keys. Because pnpm clones files into every project, one row's size lies: the footer shows **what everything you marked really frees, as a set**, recomputed in the background on every mark. The details pane names the other folders that hold the same data (with their mark state) and `m` marks them all, so you can keep one project's `node_modules` and clear the rest. Marks are shared with the Explorer: mark in either place, and `d` reviews everything.
+### Caches & Projects
+
+Press `5` (or choose it in the menu). It uses the Explorer's columns, sort, filter, graph, keys and mouse, and shares its marks with the Explorer: mark in either place and `d` reviews everything.
+
+- **What it lists:** one list of things that come back by themselves. A blue **PROJECTS** section groups build output by project (`node_modules`, `.next`, `.turbo`, Rust `target`, `.dart_tool`, Flutter and Xcode `build`, `Pods`; only when the project's `package.json`, `Cargo.toml`, `pubspec.yaml`, `Podfile` or `.xcodeproj` sits next to it) and a purple **TOOLS & CACHES** section groups tool caches (pnpm, npm, Yarn, Go, uv, pip, Homebrew, Cargo, Dart/Flutter pub, Xcode DerivedData, Playwright, and every other folder in `~/Library/Caches` and `~/.cache`). It has the Explorer's columns, sort, filter, graph and keys. Because pnpm clones files into every project, one row's size lies: the footer shows **what everything you marked really frees, as a set**, recomputed in the background on every mark. The details pane names the other folders that hold the same data (with their mark state) and `m` marks them all, so you can keep one project's `node_modules` and clear the rest. Marks are shared with the Explorer: mark in either place, and `d` reviews everything.
 - **Products are kept:** build folders hold intermediate files and the things you actually want (a built program, an APK, a bundle). The list splits them: Rust `target` becomes `debug/deps`, `release/incremental` and so on, with each built program and Tauri `bundle` as its own **(kept)** row; Xcode `build` and DerivedData keep `Build/Products`; Flutter keeps `build/app/outputs` and the web build; Gradle keeps `outputs` and `libs`; Maven keeps the packaged `.jar`/`.war`; SwiftPM keeps executables; a Python `dist` folder is one kept row. Marking a project or a section marks the intermediate folders only; a kept row is deleted only when you mark that row yourself. A build folder the app does not recognise is still shown as one row.
 - **Projects and workspaces:** a monorepo's packages are grouped under its root project, found the way the node tools find it (`pnpm-workspace.yaml`, `"workspaces"` in `package.json`, lerna, nx, Cargo `[workspace]`, ...), so `apps/web/node_modules` and a Tauri `src-tauri/target` appear in one group named after the project, with root-relative names. SDKs and toolchains (a Flutter SDK, a Node or Rust install) are recognised by their layout and never listed, wherever they are installed.
 - **Filtering projects and tools too:** on Caches & Projects, `/` matches the name of a project or tool as well as the items. Typing `uv` shows the uv group with all its caches, and a project's folder name (say `MacCleanup`) shows that project with every cache in it, even if it was folded; the matching letters of the name are highlighted. Otherwise only the items that match are shown, as before. Several words may be spread over the two: `mac node_modules` is "node_modules in projects matching mac", and `shop !next` is shop without its `.next`. Only the group's *name* is matched, not its path, so `dev` does not pull in every project under `~/dev`.
@@ -34,9 +40,7 @@ A colorful, animated terminal app (Rust TUI) for macOS that shows where your dis
 
 ## Planned
 
-A Time Machine snapshots screen (list them with sizes, thin or delete them) is the next phase; for now the app only tells you how much they hold.
-
-App leftovers, app uninstaller, a Docker panel, Time Machine snapshots, simulators, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed.
+Next is the Docker panel (images, volumes, containers and build cache by name, with their relations, cleaned through Docker's own commands), then app leftovers and the app uninstaller, then the other candidates: a Time Machine snapshots screen (list, thin or delete them; for now the app only tells you how much they hold), simulators and runtimes, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed (their menu numbers already work and say they are coming).
 
 ## Build and run
 
@@ -66,7 +70,7 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `j` / `k`, arrows | Move down / up |
 | `h` / `l`, `Enter` | Go out of / into a folder |
 | `g` / `G` (or `Home` / `End`), `PageUp` / `PageDown`, `Ctrl-F` / `Ctrl-B` (also `Ctrl-D` / `Ctrl-U`) | Jump to top / bottom, page down / up |
-| `/` | Filter the current folder's list (`Enter` keeps it, `/` edits it, `Esc` clears it) |
+| `/` | Filter the list (`Enter` keeps it, `/` edits it, `Esc` clears it). On Caches & Projects it also matches project and tool names |
 | `space` | Mark or unmark the selected item |
 | `d` | Review marked items, then delete |
 | `t` | Cycle graph type: treemap, hidden, bars |
@@ -78,10 +82,10 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `h` / `l` (Caches & Projects) | Fold / open the group; `l` or `Enter` on a row shows it in the Explorer |
 | `m` (Caches & Projects) | Mark the selected folder and every folder that shares its data |
 | `r` / `D` / `E` (ToBeDeleted screen) | Restore / delete for good / empty all |
-| `q`, `Esc` | Quit (`Esc` first clears an active filter, then goes up a folder; quitting asks first if ToBeDeleted still holds items) |
+| `q`, `Esc` | Quit (`Esc` first clears an active filter, then goes up a folder; quitting asks first if ToBeDeleted still holds items). While a tool command runs, `Esc` cancels it and `q` / `Ctrl-C` cancel it and quit |
 | mouse | Click rows, menu entries, and treemap boxes or bars (a click on the graph selects that row in the list); scroll with the wheel |
 
-In the review dialog the item list scrolls when it is longer than the window: `j`/`k`, the arrows, `PageUp`/`PageDown`, `Ctrl-F`/`Ctrl-B`, `Home`/`End` or the mouse wheel (a line under the list says which items you are looking at, e.g. `11-20 of 57`). Tool commands are never scrolled away: they keep their own space. `Enter` moves items to ToBeDeleted, `x` offers "move, then empty now" (irreversible), `Esc` cancels. Irreversible actions need an explicit `y`; `Enter` never confirms them. When the review contains tool commands, only `y` runs it.
+In the review dialog the item list scrolls when it is longer than the window: `j`/`k`, the arrows, `PageUp`/`PageDown`, `Ctrl-F`/`Ctrl-B`, `Home`/`End` or the mouse wheel (a line under the list says which items you are looking at, e.g. `11-20 of 57`). Tool commands are never scrolled away: they keep their own space. `Enter` moves items to ToBeDeleted, `x` offers "move, then empty now" (irreversible), `f` switches a command that has a force form (`uv cache clean`) to `--force`, `Esc` cancels. Irreversible actions need an explicit `y`; `Enter` never confirms them. When the review contains tool commands, only `y` runs it.
 
 ## Safety
 
@@ -89,6 +93,9 @@ In the review dialog the item list scrolls when it is longer than the window: `j
 - System paths, your top-level user folders, keychains, mail, secrets (`.ssh`, `.gnupg`, `.aws`), Photos libraries and disk images, and the ToBeDeleted folder itself are protected and cannot be marked.
 - A folder that contains a protected item (for example `~/.config` holding `gcloud`) cannot be moved or deleted as a whole; the app reports which protected item blocked it.
 - Quitting while a delete is running waits for it to finish, and a too-small terminal accepts only `q` / Ctrl-C, so a stray key never acts on a screen you cannot see.
+- Tool commands run only after you confirm with `y` (never `Enter`). The app never adds a `--force` on its own: you choose it with `f` in the review (shown in red with a warning), or retry with it after a lock failure, and it still goes through the review. A running command can always be cancelled, and everything it started is stopped with it.
+- Build products (a built program, an APK, a bundle, a `dist` folder) are listed as separate rows marked *(kept)*; marking a project or a section never selects them. Caches that may hold offline downloads or saved media (Spotify, Telegram, model caches, sync clients...) are drawn as caution, never as safe, but you can still clear them.
+- SDKs and toolchain installs (a Flutter SDK, Node or Rust installs, editor extensions, app bundles) are recognised by their layout and never listed as projects, wherever they live.
 - The app never asks for your password. (Admin-only actions are planned: it will show the exact command with a copy button, you run it in another terminal, and then confirm in the app.)
 
 ## Development
@@ -100,11 +107,11 @@ cargo test                                  # unit and integration tests
 cargo build && python3 -I scripts/smoke_pty.py target/debug/maccleanup   # end-to-end run in a pseudo-terminal
 ```
 
-The smoke script drives the real binary in a throwaway `HOME` (mark, review, soft delete, restore, irreversible path, quit); set `DUMP=1` to print the screens it sees.
+The smoke script drives the real binary in a throwaway `HOME` (explorer, filter, mark, review, soft delete, restore, rescan, the Caches & Projects screen, the irreversible path, quit); set `DUMP=1` to print the screens it sees. A few slow checks only run on request, for example `cargo test --release stress_ -- --ignored --nocapture` (timing on a clone-heavy tree) and `cargo test real_uv -- --ignored --nocapture` (cancelling the real `uv` while it waits on a held cache lock, in a throwaway cache).
 
 ## Documentation
 
 - Design: [`docs/superpowers/specs/2026-11-06-maccleanup-design.md`](docs/superpowers/specs/2026-11-06-maccleanup-design.md)
-- Caches & Projects design: [`docs/superpowers/specs/2026-11-06-caches-projects-design.md`](docs/superpowers/specs/2026-11-06-caches-projects-design.md) and plan: [`docs/superpowers/plans/2026-11-06-caches-projects.md`](docs/superpowers/plans/2026-11-06-caches-projects.md)
+- Caches & Projects design (section 11 records what was built and what is deferred): [`docs/superpowers/specs/2026-11-06-caches-projects-design.md`](docs/superpowers/specs/2026-11-06-caches-projects-design.md) and plan: [`docs/superpowers/plans/2026-11-06-caches-projects.md`](docs/superpowers/plans/2026-11-06-caches-projects.md)
 - Milestone 1 plan: [`docs/superpowers/plans/2026-11-06-maccleanup-milestone-1.md`](docs/superpowers/plans/2026-11-06-maccleanup-milestone-1.md)
 - Contributor and AI-assistant guidance: [`CLAUDE.md`](CLAUDE.md)

@@ -123,19 +123,37 @@ How it works:
 - Key choices not named above, wording, colors beyond the section bands.
 - Test plan, with emphasis on: the set-wise identity with clones, the keep-one-project case, marker-based detection, registry paths, review listing of commands, and the Explorer-consistency rule where it can be asserted (column order, sort cycle).
 
-## 11. As built (2026-11-06) and deferred items
+## 11. As built and deferred items (updated when merged)
 
-Implemented on branch `feat/caches-projects` per `docs/superpowers/plans/2026-11-06-caches-projects.md`. Decisions made while building (all **[My call]**, open to change):
+Implemented per `docs/superpowers/plans/2026-11-06-caches-projects.md`, then extended by requests made while using it. **Where this section differs from sections 1 to 10, this section wins.** All choices below are **[My call]** unless marked **[User]**, and open to change.
 
-- Tool entries are discovered on a background thread (`catalog::discover_tools`); `ToolEntry` has `String` ids and one folder path each. The list itself (`Targets::build`) is built on a `bg::Latest` worker; sorting and folds are re-applied when it lands.
-- Row Frees columns stay per-row (what deleting that row alone frees). Section bands show the joint figure for the marked folders of that section; group headers show sums and a marked count; the footer shows the joint figure for the whole selection. There is no "+N if X is marked" what-if figure: the details pane lists the related folders with their state and `m` marks them.
-- The review's headline "frees about" is `frees_all` (the same figure as the footer). A review opened while that figure is still being worked out shows "Working out..." and fills it in. Commands are always shown: the "via" lines are dropped first, and if they still do not fit the review says so and `y` is refused.
-- Project detection never offers install trees (editor extensions, Node/Rust version managers, `.app` bundles, pnpm's global folder) or anything inside an unmatched `node_modules`.
-- App caches skip `com.apple.*`. Caches that may hold offline downloads or saved media (Spotify, Telegram, WhatsApp, Netflix, Plex, Apple Music/Podcasts, sync clients, Lightroom, ML model caches...) are classified Caution with "hard to rebuild" text (`safety::keeps_offline_data`, matched at word starts); they can still be marked and deleted.
-- Sidebar widened to 22 columns; `4` opens the screen (`3` stays ToBeDeleted); `Esc` here clears the filter or quits.
+**The screen and the list**
+- One sidebar entry, **Caches & Projects**, replaces the dimmed Caches and Projects entries. The sidebar is 23 columns wide. **[User]** A digit key is always the page's position in the menu (`5` here; `3`, `4`, `6` are planned pages and say so).
+- Row Frees columns stay per-row (what deleting that row alone frees). Section bands show the joint figure for their marked folders; group headers show sums and a marked count; the footer shows the joint figure for the whole selection. There is no "+N if X is marked" what-if figure: the details pane lists the related folders with their state and `m` marks them.
+- The graph shows **one box or bar per project or tool in the list** (honouring the filter), named by the short label; a click selects that group's header. **[User]**
+- The filter matches each term against the group's short name or the item's name (never letters from both), so a group whose name matches shows all its items, folded or not; only the name is matched, not the path. **[User]**
+- Paging: `Ctrl-F` / `Ctrl-B` as in vim (also `Ctrl-D` / `Ctrl-U`). **[User]**
 
-Deferred minor items (found by the final review, not fixed):
+**What is listed**
+- Project detection never offers install trees (editor extensions, Node, Rust and Python version managers, `.app` bundles, pnpm's global folder) or anything inside an unmatched `node_modules`, and never lists SDK or toolchain installs, which are recognised by layout (a signature program in `bin/` plus a folder only that toolchain has: Flutter, Dart, Go, Node, Java, Rust, Swift, Python, Ruby), never by name or place. **[User]**
+- Projects are grouped under their **root**: the nearest folder at or above the project that declares a workspace (`pnpm-workspace.yaml`, `"workspaces"` in `package.json`, lerna, nx, rush, `go.work`, melos, Cargo `[workspace]`, Dart `workspace:`), in any ecosystem, never above the scan root. Rows are named relative to the root (`apps/web/node_modules`). **[User]**
+- Build systems detected, each only with its marker beside it: Node (`node_modules`, `.next`, `.turbo`), Rust `target`, Swift `.build`, Xcode `build`, Flutter (`.dart_tool`, `build`), CocoaPods `Pods`, Gradle (`build`, `.gradle`), Maven `target`, Python (`build`, `dist`). JS `dist` folders are deliberately not offered (libraries commit them).
+- **Products are kept apart from intermediates.** Rust `target`, SwiftPM `.build`, Xcode `build` and DerivedData, Flutter `build`, Gradle `build` and Maven `target` are split into one row per intermediate folder and one row per product (built programs, `bundle`, `Build/Products`, `app/outputs`, `outputs` and `libs`, packaged `.jar`/`.war`); a Python `dist` is one product row. Product rows are marked *(kept)* and are skipped by every bulk mark; they go only when that row is marked. A build folder with nothing recognisable stays one row. **[User]**
+- App caches skip `com.apple.*`. Caches that may hold offline downloads or saved media (Spotify, Telegram, WhatsApp, Netflix, Plex, Apple Music and Podcasts, sync clients, Lightroom, downloaded model caches) are Caution, matched at word starts (`safety::keeps_offline_data`), never safe, and still deletable. **[User]**
 
+**Tool commands**
+- Discovery runs on a thread and finds every install of pnpm and npm (PATH, fnm, nvm, volta, corepack shims). Every command is pinned to one exact install, runs in the home folder with `COREPACK_ENABLE_NETWORK=0` and `COREPACK_ENABLE_DOWNLOAD_PROMPT=0`, with the matching Node first on `PATH`. **[User]**
+- **One command, one item.** npm is two items, the package cache (`npm cache clean --force`) and the npx cache (`npm cache npx rm --force`); pnpm has one item per store version; Go has a build cache and a module cache. An npm without the npx command gets a plain folder item. **[User]**
+- A running command shows its live output and elapsed time; `Esc` cancels it (its whole process group is killed and the commands after it are skipped; moves already made stay), `q` and `Ctrl-C` cancel and quit. **[User]**
+- uv waits up to 5 minutes (`UV_LOCK_TIMEOUT`) while another uv process, for example a `uv run` MCP server, holds its cache lock, then fails. The Working and result windows say so. `uv cache clean` has a force form: `f` in the review switches to `--force` (red, with a warning), and after a lock failure the result screen offers `f` to retry with it through the review. The app never adds `--force` on its own. **[User]**
+- The review always lists every command that will run: the "via" lines go first, and if the commands still do not fit the review says so and refuses `y`. A review of folders scrolls (`j`/`k`, arrows, `PageUp`/`PageDown`, `Ctrl-F`/`Ctrl-B`, `Home`/`End`, mouse wheel); its headline "frees about" is the same figure as the footer, and a review opened while that figure is still being worked out fills it in later. **[User]** for the scrolling.
+
+**Responsiveness and numbers**
+- The list is built on a `bg::Latest` worker, one build at a time (a request made during a build is served by one follow-up build); a build is current only if the scan data did not change since it started (`scan_epoch`). Sorting and folds are re-applied when it lands.
+- After a cleanup the scan follows the disk: moved folders leave the tree at once (`Scanner::forget_dir`), folders a command changed are scanned again (`rescan_dir`, one at a time), and the list rebuilds.
+- Progress readouts: the scan shows a moving bar and its counters; the tool lookup and the list build show their phase, and the build a filled bar by stage.
+
+**Deferred minor items (not fixed)**
 - A marked folder spanning both sections counts in only one band's "frees" (the footer is right).
 - A command mark survives under a covering folder mark and comes back if the folder is unmarked (it is still reviewed and needs `y`).
 - Fixed-entry commands (go, pip, yarn, uv, brew) clean the tool's configured folder, which can differ from the default folder shown.
@@ -143,5 +161,8 @@ Deferred minor items (found by the final review, not fixed):
 - The `x` (irreversible) dialog does not say that tool commands also run.
 - A panicking command-job thread would leave the "Working" dialog up; `bg::Latest` keeps the last good value after a worker panic.
 - No "clear the whole selection" key.
-- Offline-data detection is a name list: apps not on it (Discord/Slack media, Obsidian, Box, ...) still show as safe.
-- Not yet verified with a real run: whether `pnpm store prune` frees cloned (not hard-linked) packages; until then the pnpm row only promises an upper bound.
+- Offline-data detection is a name list: apps not on it (Discord and Slack media, Obsidian, Box, ...) still show as safe.
+- The Explorer still works out each folder's space numbers on the UI thread (`refresh_rows`); that is one pass over the clone tables, fast on moderate trees, and could be moved to a worker for very large clone tables.
+- A monorepo lists every package's `node_modules` as its own row (66 for one real project); they are grouped under the root but not folded further.
+- Per-package rows for the npx cache are not offered (it is one item).
+- Not verified with a real run: whether `pnpm store prune` frees cloned (not hard-linked) packages; until then the pnpm row only promises an upper bound.
