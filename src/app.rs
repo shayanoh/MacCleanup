@@ -21,11 +21,14 @@ use crate::targets::{BuildSource, Line, SectionKind, TRow, Targets};
 use crate::usage::Usage;
 use crate::volume;
 
+mod dockerpage;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
     Home,
     Explorer,
     Targets,
+    Docker,
     Holding,
 }
 
@@ -85,7 +88,7 @@ pub const SIDEBAR: [SidebarEntry; 7] = [
     },
     SidebarEntry {
         label: "Docker",
-        screen: None,
+        screen: Some(Screen::Docker),
     },
     SidebarEntry {
         label: "ToBeDeleted",
@@ -462,6 +465,8 @@ pub struct App {
     pub tools_work: Arc<Work>,
     /// Tool commands marked for the review (the second kind of selection).
     pub tool_marks: BTreeSet<String>,
+    /// The Docker page: what was read from Docker and the list shown.
+    pub docker: crate::docker::state::DockerState,
     /// Set-wise space of the whole selection, worked out on a thread.
     pub set_space: Latest<JointSpace>,
     set_exact: bool,
@@ -603,6 +608,7 @@ impl App {
             build_work: Work::new(),
             tools_work: Work::new(),
             tool_marks: BTreeSet::new(),
+            docker: crate::docker::state::DockerState::new(),
             set_space: Latest::new(),
             set_exact: true,
             holders: Latest::new(),
@@ -685,6 +691,7 @@ impl App {
         self.offset = window(self.cursor, self.offset, vis);
         self.held_offset = window(self.held_cursor, self.held_offset, vis);
         self.toffset = window(self.tcursor, self.toffset, vis);
+        self.docker.offset = window(self.docker.cursor, self.docker.offset, vis);
     }
 
     /// Re-list the current directory, keeping the cursor on the same path.
@@ -731,6 +738,14 @@ impl App {
     /// Re-apply the query. While typing the selection jumps to the first
     /// match; `keep_selection` keeps the same row selected when it survives.
     fn refilter(&mut self, keep_selection: bool) {
+        if self.screen == Screen::Docker {
+            self.docker_refilter();
+            if !keep_selection {
+                self.docker.cursor = 0;
+                self.docker.offset = 0;
+            }
+            return;
+        }
         if self.screen == Screen::Targets {
             let keep = keep_selection.then(|| self.sel_of(self.tcursor)).flatten();
             self.rebuild_tlines(keep);
@@ -757,7 +772,10 @@ impl App {
     }
 
     fn filter_open(&mut self) {
-        if !matches!(self.screen, Screen::Explorer | Screen::Targets) {
+        if !matches!(
+            self.screen,
+            Screen::Explorer | Screen::Targets | Screen::Docker
+        ) {
             return;
         }
         self.focus = Focus::Main;
@@ -950,6 +968,7 @@ impl App {
             }
             Action::GrowGraph => self.graph_pct = (self.graph_pct + 5).min(70),
             Action::ShrinkGraph => self.graph_pct = self.graph_pct.saturating_sub(5).max(20),
+            Action::CycleSort if self.screen == Screen::Docker => self.docker_cycle_sort(),
             Action::CycleSort => {
                 self.sort = match self.sort {
                     // Same order as the column headers: Name, Size, On disk,
@@ -1125,6 +1144,7 @@ impl App {
         self.poll_discovery();
         self.process_refresh();
         self.poll_targets();
+        self.poll_docker();
         if self.set_space.poll() || !self.set_space.pending {
             // A review opened while the numbers were being worked out.
             if let (Some(Dialog::Review(r)), Some(j)) = (&mut self.dialog, self.set_space.value)
@@ -1196,7 +1216,10 @@ impl App {
     fn goto(&mut self, screen: Screen) {
         self.filter.editing = false;
         // The filter belongs to one list; it does not follow to another screen.
-        if (self.screen == Screen::Targets || screen == Screen::Targets) && self.screen != screen {
+        if (matches!(self.screen, Screen::Targets | Screen::Docker)
+            || matches!(screen, Screen::Targets | Screen::Docker))
+            && self.screen != screen
+        {
             self.reset_filter();
         }
         self.screen = screen;
@@ -1208,6 +1231,7 @@ impl App {
                 self.start_discovery();
                 self.rebuild_targets();
             }
+            Screen::Docker => self.reload_docker(),
             Screen::Home => {}
         }
         self.refresh_detail();
@@ -1220,6 +1244,7 @@ impl App {
                     Screen::Home,
                     Screen::Explorer,
                     Screen::Targets,
+                    Screen::Docker,
                     Screen::Holding,
                 ];
                 let idx = order.iter().position(|s| *s == self.screen).unwrap_or(0) as i64;
@@ -1237,6 +1262,7 @@ impl App {
                 self.held_cursor = step(self.held_cursor, delta, self.held.len());
                 self.ensure_visible();
             }
+            (_, Screen::Docker) => self.docker_move(delta),
             (_, Screen::Targets) => {
                 self.tcursor = step(self.tcursor, delta, self.tlines.len());
                 self.ensure_visible();
@@ -1266,6 +1292,11 @@ impl App {
     /// Rescan the current folder (or everything). Refused while a scan runs.
     fn rescan(&mut self, all: bool) {
         if self.screen == Screen::Holding {
+            return;
+        }
+        if self.screen == Screen::Docker {
+            self.reload_docker();
+            self.notice = Some("Reading Docker again...".to_string());
             return;
         }
         if !self.scanner.is_idle() {
@@ -1313,6 +1344,10 @@ impl App {
             self.target_into();
             return;
         }
+        if self.screen == Screen::Docker {
+            self.docker_into();
+            return;
+        }
         if self.screen != Screen::Explorer {
             return;
         }
@@ -1336,6 +1371,10 @@ impl App {
             self.target_out();
             return;
         }
+        if self.focus == Focus::Main && self.screen == Screen::Docker {
+            self.docker_out();
+            return;
+        }
         if self.focus != Focus::Main || self.screen != Screen::Explorer || self.stack.len() <= 1 {
             return;
         }
@@ -1357,6 +1396,7 @@ impl App {
                 self.mark_path(path, usage, &name);
             }
             Screen::Targets => self.toggle_target_mark(),
+            Screen::Docker => self.toggle_docker_mark(),
             _ => {}
         }
     }
@@ -1839,6 +1879,7 @@ impl App {
                         }
                     }
                 }
+                Screen::Docker => self.docker_click(i),
                 Screen::Home => {}
             }
         }
@@ -2881,6 +2922,8 @@ mod tests {
         assert_eq!(app.screen, Screen::Explorer);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Targets);
+        app.update(Action::Down);
+        assert_eq!(app.screen, Screen::Docker);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Holding);
         app.update(Action::Into);

@@ -39,7 +39,12 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         } else {
             Action::Quit
         }),
-        KeyCode::Char('/') if matches!(app.screen, Screen::Explorer | Screen::Targets) => {
+        KeyCode::Char('/')
+            if matches!(
+                app.screen,
+                Screen::Explorer | Screen::Targets | Screen::Docker
+            ) =>
+        {
             Some(Action::FilterOpen)
         }
         KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
