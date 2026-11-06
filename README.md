@@ -7,14 +7,16 @@ A colorful, animated terminal app (Rust TUI) for macOS that shows where your dis
 ## What works today
 
 - **Home:** live free-space gauge, pending (soft-deleted) space, scan activity, and the biggest folders. Every size is shown both as logical size and as space actually used on disk (for example `1.5 KB (4.1 KB on disk)`), because on-disk size is what a delete frees.
-- **Disk explorer:** a multithreaded scan of your home folder (or `--root`) with live sizes. Each row shows logical size, real on-disk size and a share bar. Browse with vim-style keys or the mouse, sort by on-disk size, size or name, mark items, then review and delete.
+- **Disk explorer:** a multithreaded scan of your home folder (or the folder you pass, e.g. `maccleanup .`) with live sizes. Each row shows logical size, real on-disk size and a share bar. Browse with vim-style keys or the mouse, sort by on-disk size, what a delete frees, size or name, mark items, then review and delete.
 - **Filter:** `/` opens a filter box above the list and typing narrows the current folder's list as you type, fzf-style: space-separated terms must all match, each term is a fuzzy match that ignores case unless you type a capital, and `'exact`, `^prefix`, `suffix$` and `!exclude` work too. Matched letters are highlighted, the sort order is kept, and the box shows how many rows match. `Enter` returns to the list with the filter kept, `/` edits it again, `Esc` clears it. Going into or out of a folder clears it.
 - **ToBeDeleted indicator and quit warning:** the menu shows when ToBeDeleted is empty and, when it holds something, lights its icon and shows how many items are waiting. Quitting with items still in it asks first (`e` opens it, `q` quits anyway, `Esc` stays).
 - **Always responsive:** every move and every permanent delete runs in the background with a live progress bar (by bytes, so one huge folder still moves it). Big trees are deleted in parallel. Quitting while a delete runs waits for it to finish.
 - **Soft delete:** "delete" moves items to `~/ToBeDeleted` (or `--holding-dir`). Browse that folder, restore items to where they came from, delete items for good, or empty it. Moved files count as **pending**, not freed, because nothing is freed until the folder is emptied.
 - **Where the space would go:** under the list, the selected folder or file shows what deleting it would really do, because on a Mac sizes lie. APFS clones (what pnpm uses for `node_modules`) look full-size but cost nothing extra, and Time Machine local snapshots keep deleted files' blocks alive. Three lines: **frees now** and **held by snapshots** (freed only when those hourly snapshots expire), **shared with other places** (clones or hard links with files outside the folder, which stay) and **shared inside**, and what **cloning inside** already saves. A folder's **On disk** is its real footprint (clone data and hard links counted once), so the sort order and graphs use real space. The review dialog sums it for everything you marked. The numbers are final once the scan has finished; the scan is about 2.5 times slower for this (one extra system call per file).
+- **Folder totals and position:** a line above the scan totals sums the folder you are viewing (items, size, on disk, what deleting it frees); the bottom-right of the list shows your position (`12/340`) and a scrollbar appears when the list is longer than the pane. A **Frees** column shows what deleting each row really frees (a clone or hard link frees nothing); it is `…` until the scan finishes, and the Share bar is dropped first when the pane is narrow. Folders still waiting for their turn in the scan show `…` and `queued` instead of a misleading 0 B.
+- **Snapshots, exactly:** a file's shortfall is blamed on a Time Machine snapshot only if a snapshot exists, the file already existed when the newest one was taken, and the missing bytes lie inside the file's real data. Compressed files and blocks preallocated past the end of a file are never counted as snapshot-held.
 - **Rescan:** `r` rescans the folder you are viewing and updates the totals above it; `R` rescans everything from the scan root.
-- **Graphs:** a bar graph and a treemap (box area equals size) that follow your selection. Cycle bars, treemap and hidden with `t`; resize the panel with `[` (bigger) and `]` (smaller). Graphs and share bars follow the sorted size (on-disk by default).
+- **Graphs:** a treemap (box area equals size, the default) and a bar graph that follow your selection. Cycle treemap, hidden and bars with `t`; resize the panel with `[` (bigger) and `]` (smaller). Graphs and share bars follow the sorted size (on-disk by default).
 - **Motion:** windows grow in, and the congratulations window rains confetti. `--no-animation` turns all of it off.
 - **Quit summary:** when you quit, the app prints what the session did (moved, deleted for good, restored, still pending) and how much space was truly freed.
 - **Honest accounting:** the finish screen reports space truly freed (the volume's free space now minus at the start), not just what was moved.
@@ -32,13 +34,13 @@ Requires macOS and a recent Rust toolchain (developed with Rust 1.99, edition 20
 
 ```bash
 cargo run --release                       # run the app (scans your home folder)
-cargo run --release -- --root ~/Developer # explore a different folder
+cargo run --release -- ~/Developer        # explore a different folder (any path is the root)
 cargo run --release -- --help             # all options
 ```
 
 | Option | What it does |
 |---|---|
-| `--root <DIR>` | Folder to explore (default: your home folder) |
+| `[PATH]` | Folder to explore, e.g. `.` (default: your home folder); the old `--root DIR` still works |
 | `--holding-dir <DIR>` | Where soft-deleted items go (default: `~/ToBeDeleted`) |
 | `--ascii` | ASCII-only characters, for terminals without Nerd Font / Unicode support |
 | `--no-animation` | Turn off animations |
@@ -57,10 +59,10 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `/` | Filter the current folder's list (`Enter` keeps it, `/` edits it, `Esc` clears it) |
 | `space` | Mark or unmark the selected item |
 | `d` | Review marked items, then delete |
-| `t` | Cycle graph type: bars, treemap, hidden |
+| `t` | Cycle graph type: treemap, hidden, bars |
 | `[` / `]` | Grow / shrink the graph panel |
 | `r` / `R` | Rescan the folder you are viewing / rescan everything (refused while a scan is running; on the ToBeDeleted screen `r` is restore) |
-| `s` | Cycle sort: on-disk size (default), size, name. The sorted column is white with an arrow in the header |
+| `s` | Cycle sort: on-disk size (default), frees, size, name. The sorted column is white with an arrow in the header |
 | `Tab` | Switch focus between the menu and the list (the menu has focus at startup: `j`/`k` choose a screen, `Enter` opens it) |
 | `1` `2` `3` | Home, Explorer, ToBeDeleted |
 | `r` / `D` / `E` (ToBeDeleted screen) | Restore / delete for good / empty all |

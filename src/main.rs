@@ -40,7 +40,10 @@ fn run(cli: Cli) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot read your home folder {}", home.display()))?;
 
-    let root = cli.root.clone().unwrap_or_else(|| home.clone());
+    let root = cli
+        .root()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.clone());
     let root = root
         .canonicalize()
         .with_context(|| format!("cannot read {}", root.display()))?;

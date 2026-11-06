@@ -64,6 +64,12 @@ impl Glyphs {
     pub fn dot(&self) -> &'static str {
         self.pick("·", "|")
     }
+    pub fn scroll_track(&self) -> &'static str {
+        self.pick("│", "|")
+    }
+    pub fn scroll_thumb(&self) -> &'static str {
+        self.pick("█", "#")
+    }
     pub fn ellipsis(&self) -> &'static str {
         self.pick("…", "...")
     }

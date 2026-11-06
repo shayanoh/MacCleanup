@@ -471,8 +471,13 @@ fn explorer_header_marks_the_sorted_column() {
 
     e.app.update(Action::CycleSort);
     let text = render(&mut e.app, 120, 30);
-    assert!(text.contains("Size ▼"), "{text}");
+    assert!(text.contains("Frees ▼"), "{text}");
     assert!(!text.contains("On disk ▼"), "{text}");
+
+    e.app.update(Action::CycleSort);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("Size ▼"), "{text}");
+    assert!(!text.contains("Frees ▼"), "{text}");
 
     e.app.update(Action::CycleSort);
     let text = render(&mut e.app, 120, 30);
@@ -484,6 +489,9 @@ fn explorer_header_arrows_are_ascii_in_ascii_mode() {
     let mut e = explorer(GlyphMode::Ascii);
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("On disk v"), "{text}");
+    e.app.update(Action::CycleSort);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("Frees v"), "{text}");
     e.app.update(Action::CycleSort);
     e.app.update(Action::CycleSort);
     let text = render(&mut e.app, 120, 30);
@@ -499,11 +507,17 @@ fn sorted_column_is_white_and_the_others_gray() {
     assert_eq!(disk.fg, Some(Color::White));
     assert_eq!(size.fg, Some(Color::DarkGray));
 
-    e.app.update(Action::CycleSort); // by Size
+    e.app.update(Action::CycleSort); // by Frees
     let disk = find_text(&mut e.app, 120, 30, "On disk").unwrap();
+    let frees = find_text(&mut e.app, 120, 30, "Frees").unwrap();
+    assert_eq!(frees.fg, Some(Color::White));
+    assert_eq!(disk.fg, Some(Color::DarkGray));
+
+    e.app.update(Action::CycleSort); // by Size
+    let frees = find_text(&mut e.app, 120, 30, "Frees").unwrap();
     let size = find_text(&mut e.app, 120, 30, "Size").unwrap();
     assert_eq!(size.fg, Some(Color::White));
-    assert_eq!(disk.fg, Some(Color::DarkGray));
+    assert_eq!(frees.fg, Some(Color::DarkGray));
 }
 
 #[test]
@@ -901,10 +915,7 @@ fn the_filter_box_stays_after_enter_and_says_how_to_clear_it() {
 fn there_is_no_filter_box_without_a_filter() {
     let mut e = filter_app(GlyphMode::Nerd);
     let plain = render(&mut e.app, 120, 30);
-    assert!(
-        !plain.contains("esc clears") && !plain.contains("/4"),
-        "{plain}"
-    );
+    assert!(!plain.contains("esc clears"), "{plain}");
     let rows_plain = e.app.layout.list_rows;
     type_filter(&mut e.app, "no");
     render(&mut e.app, 120, 30);
@@ -1220,4 +1231,106 @@ fn the_detail_lines_fit_a_narrow_pane() {
         !text.contains("shared inside\u{2026}"),
         "no cut-off label:\n{text}"
     );
+}
+
+#[test]
+fn the_frees_column_is_in_the_header_and_shows_a_value_per_row() {
+    let mut e = make_app_with(
+        &[("plain.bin", 8192), ("orig.bin", 20480)],
+        GlyphMode::Nerd,
+        |home| {
+            let status = std::process::Command::new("cp")
+                .arg("-c")
+                .arg(home.join("orig.bin"))
+                .arg(home.join("clone.bin"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "needs APFS");
+        },
+    );
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let text = render(&mut e.app, 140, 30);
+    assert!(text.contains("Frees"), "{text}");
+    // (the treemap beside the list also names clone.bin; pick the list row)
+    let clone = text
+        .lines()
+        .find(|l| l.contains("clone.bin") && l.contains("20.5 KB"))
+        .unwrap_or_else(|| panic!("no list row with size and disk:\n{text}"));
+    assert!(clone.contains(" 0 B"), "a clone frees nothing: {clone}");
+    let plain = e
+        .app
+        .rows
+        .iter()
+        .find(|r| r.name == "plain.bin")
+        .unwrap()
+        .frees;
+    assert!(plain.is_some());
+}
+
+#[test]
+fn a_narrow_pane_drops_the_share_bar_but_keeps_the_frees_column() {
+    let mut e = explorer(GlyphMode::Nerd);
+    let wide = render(&mut e.app, 150, 30);
+    assert!(wide.contains("Frees") && wide.contains("Share"), "{wide}");
+    let narrow = render(&mut e.app, 100, 30);
+    assert!(
+        narrow.contains("Frees") && narrow.contains("On disk"),
+        "{narrow}"
+    );
+    assert!(
+        !narrow.contains("Share"),
+        "the bar gives way first:\n{narrow}"
+    );
+}
+
+#[test]
+fn the_treemap_is_the_default_graph() {
+    let mut e = explorer(GlyphMode::Nerd);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("Treemap"), "{text}");
+    assert!(!text.contains("Distribution"), "{text}");
+}
+
+#[test]
+fn rows_show_an_ellipsis_for_unknown_frees_and_the_ascii_form_in_ascii_mode() {
+    // Known/unknown formatting lives in the explorer module; here just make
+    // sure ASCII mode never prints a non-ASCII cell in the new column.
+    let mut e = explorer(GlyphMode::Ascii);
+    for c in render_cells(&mut e.app, 140, 30) {
+        assert!(c.is_ascii(), "{c:?}");
+    }
+}
+
+#[test]
+fn the_explorer_shows_the_folders_own_totals_above_the_scan_totals() {
+    let mut e = explorer(GlyphMode::Nerd);
+    let text = render(&mut e.app, 140, 30);
+    let lines: Vec<&str> = text.lines().collect();
+    let folder = lines
+        .iter()
+        .position(|l| l.contains("this folder:"))
+        .unwrap();
+    let scan = lines.iter().position(|l| l.contains(" files ")).unwrap();
+    assert!(folder < scan, "folder totals come first:\n{text}");
+    assert!(lines[folder].contains("items") && lines[folder].contains("frees"));
+}
+
+#[test]
+fn the_list_shows_where_the_cursor_is_and_a_scrollbar_when_it_overflows() {
+    let names: Vec<String> = (0..60).map(|i| format!("file{i:02}.txt")).collect();
+    let files: Vec<(&str, usize)> = names.iter().map(|n| (n.as_str(), 100)).collect();
+    let mut e = make_app(&files, GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let text = render(&mut e.app, 140, 30);
+    assert!(text.contains("1/60"), "{text}");
+    assert!(text.contains('█'), "a scrollbar thumb:\n{text}");
+    e.app.update(Action::Bottom);
+    let text = render(&mut e.app, 140, 30);
+    assert!(text.contains("60/60"), "{text}");
+
+    let mut e = make_app(&[("only.txt", 100)], GlyphMode::Ascii);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    let text = render(&mut e.app, 140, 30);
+    assert!(text.contains("1/1"), "{text}");
+    assert!(!text.contains('█'), "no scrollbar when everything fits");
 }

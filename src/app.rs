@@ -40,6 +40,8 @@ pub enum GraphMode {
 pub enum SortBy {
     /// Allocated bytes on disk (the default; this is what a delete frees).
     Disk,
+    /// What deleting the entry frees right now (clone- and snapshot-aware).
+    Frees,
     /// Logical size.
     Size,
     Name,
@@ -319,6 +321,13 @@ fn sort_rows(rows: &mut [Row], by: SortBy) {
                 .then_with(|| b.size.cmp(&a.size))
                 .then_with(|| a.name.cmp(&b.name))
         }),
+        SortBy::Frees => rows.sort_by(|a, b| {
+            b.frees
+                .unwrap_or(0)
+                .cmp(&a.frees.unwrap_or(0))
+                .then_with(|| b.disk.cmp(&a.disk))
+                .then_with(|| a.name.cmp(&b.name))
+        }),
         SortBy::Size => rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name))),
         SortBy::Name => rows.sort_by_key(|r| r.name.to_string_lossy().to_lowercase()),
     }
@@ -354,7 +363,7 @@ impl App {
             screen: Screen::Home,
             // The menu starts focused so j/k and Enter work straight away.
             focus: Focus::Sidebar,
-            graph: GraphMode::Bars,
+            graph: GraphMode::Treemap,
             graph_pct: 35,
             sort: SortBy::Disk,
             rows: Vec::new(),
@@ -414,15 +423,22 @@ impl App {
     pub fn weight(&self, row: &Row) -> u64 {
         match self.sort {
             SortBy::Size => row.size,
-            SortBy::Disk | SortBy::Name => row.disk,
+            SortBy::Frees if self.frees_total() > 0 => row.frees.unwrap_or(0),
+            SortBy::Frees | SortBy::Disk | SortBy::Name => row.disk,
         }
+    }
+
+    /// What deleting the whole folder shown frees now (0 while unknown).
+    fn frees_total(&self) -> u64 {
+        self.current_space.map_or(0, |s| s.frees_now)
     }
 
     /// The matching total for the folder being shown.
     pub fn weight_total(&self) -> u64 {
         match self.sort {
             SortBy::Size => self.current().size(),
-            SortBy::Disk | SortBy::Name => self
+            SortBy::Frees if self.frees_total() > 0 => self.frees_total(),
+            SortBy::Frees | SortBy::Disk | SortBy::Name => self
                 .current_space
                 .map_or_else(|| self.current().disk(), |s| s.footprint),
         }
@@ -656,16 +672,17 @@ impl App {
             Action::OpenReview => self.open_review(),
             Action::CycleGraph => {
                 self.graph = match self.graph {
-                    GraphMode::Bars => GraphMode::Treemap,
                     GraphMode::Treemap => GraphMode::Hidden,
                     GraphMode::Hidden => GraphMode::Bars,
+                    GraphMode::Bars => GraphMode::Treemap,
                 }
             }
             Action::GrowGraph => self.graph_pct = (self.graph_pct + 5).min(70),
             Action::ShrinkGraph => self.graph_pct = self.graph_pct.saturating_sub(5).max(20),
             Action::CycleSort => {
                 self.sort = match self.sort {
-                    SortBy::Disk => SortBy::Size,
+                    SortBy::Disk => SortBy::Frees,
+                    SortBy::Frees => SortBy::Size,
                     SortBy::Size => SortBy::Name,
                     SortBy::Name => SortBy::Disk,
                 };
@@ -1435,14 +1452,14 @@ mod tests {
     fn graph_cycle_and_resize_bounds() {
         let mut e = env(FILES);
         let app = &mut e.app;
-        assert_eq!(app.graph, GraphMode::Bars);
+        assert_eq!(app.graph, GraphMode::Treemap, "the treemap is the default");
         assert_eq!(app.graph_pct, 35);
-        app.update(Action::CycleGraph);
-        assert_eq!(app.graph, GraphMode::Treemap);
         app.update(Action::CycleGraph);
         assert_eq!(app.graph, GraphMode::Hidden);
         app.update(Action::CycleGraph);
         assert_eq!(app.graph, GraphMode::Bars);
+        app.update(Action::CycleGraph);
+        assert_eq!(app.graph, GraphMode::Treemap);
         for _ in 0..30 {
             app.update(Action::GrowGraph);
         }
@@ -1477,9 +1494,13 @@ mod tests {
     }
 
     #[test]
-    fn sort_cycles_disk_size_name() {
+    fn sort_cycles_disk_frees_size_name() {
         let mut e = sort_env();
         let app = &mut e.app;
+        app.update(Action::CycleSort);
+        assert_eq!(app.sort, SortBy::Frees);
+        // Plain files free what they occupy, so this order matches on-disk.
+        assert_eq!(names(app), ["real.bin", "a.bin", "sparse.bin"]);
         app.update(Action::CycleSort);
         assert_eq!(app.sort, SortBy::Size);
         assert_eq!(names(app), ["sparse.bin", "real.bin", "a.bin"]);
@@ -1512,7 +1533,9 @@ mod tests {
             .clone();
         assert!(sparse.size > sparse.disk);
         assert_eq!(app.weight(&sparse), sparse.disk);
-        app.update(Action::CycleSort);
+        app.update(Action::CycleSort); // by what it frees
+        app.update(Action::CycleSort); // by size
+        assert_eq!(app.sort, SortBy::Size);
         assert_eq!(app.weight(&sparse), sparse.size);
         assert_eq!(app.weight_total(), app.current().size());
     }
@@ -2432,10 +2455,11 @@ mod tests {
         app.update(Action::FilterOpen);
         type_text(app, "no");
         app.update(Action::FilterAccept);
-        app.update(Action::CycleSort); // by size
-        assert_eq!(names(app), ["node_modules", "notes.txt"]);
-        app.update(Action::CycleSort); // by name
-        assert_eq!(names(app), ["node_modules", "notes.txt"]);
+        for _ in 0..4 {
+            // frees, size, name, and back to on-disk: the filter stays on.
+            app.update(Action::CycleSort);
+            assert_eq!(names(app), ["node_modules", "notes.txt"]);
+        }
     }
 
     #[test]
@@ -2656,7 +2680,9 @@ mod tests {
         let sp = app.current_space.expect("the scan is done");
         assert_eq!(sp.footprint, 8192 + 12288);
         assert_eq!(app.weight_total(), 8192 + 12288);
+        app.update(Action::CycleSort); // by what frees
         app.update(Action::CycleSort); // by size: the logical total
+        assert_eq!(app.sort, SortBy::Size);
         assert_eq!(app.weight_total(), app.current().size());
     }
 
@@ -2737,5 +2763,104 @@ mod tests {
         );
         std::mem::forget(dir); // keep the sandbox alive for the app's lifetime
         app
+    }
+
+    fn frees_env() -> crate::testutil::Env {
+        // orig.bin and its clone share their data; plain.bin is on its own.
+        crate::testutil::env_with(&[("plain.bin", 8192), ("orig.bin", 20480)], |home| {
+            crate::testutil::clone_file(&home.join("orig.bin"), &home.join("clone.bin"))
+        })
+    }
+
+    fn frees_of(app: &App, name: &str) -> Option<u64> {
+        app.rows.iter().find(|r| r.name == name).unwrap().frees
+    }
+
+    #[test]
+    fn rows_know_what_deleting_them_frees() {
+        let mut e = frees_env();
+        let app = &mut e.app;
+        assert_eq!(
+            frees_of(app, "orig.bin"),
+            Some(0),
+            "a clone's data stays shared"
+        );
+        assert_eq!(frees_of(app, "clone.bin"), Some(0));
+        let plain = frees_of(app, "plain.bin").expect("known once the scan is done");
+        assert!(plain <= 8192);
+    }
+
+    #[test]
+    fn sorting_by_frees_puts_what_really_frees_first() {
+        let mut e = frees_env();
+        let app = &mut e.app;
+        // By on-disk size the two cloned files (20 KB each) come first.
+        assert_ne!(names(app)[0], "plain.bin");
+        app.update(Action::CycleSort);
+        assert_eq!(app.sort, SortBy::Frees);
+        let frees: Vec<u64> = app.rows.iter().map(|r| r.frees.unwrap_or(0)).collect();
+        assert!(
+            frees.windows(2).all(|w| w[0] >= w[1]),
+            "descending: {frees:?}"
+        );
+        if frees_of(app, "plain.bin").unwrap_or(0) > 0 {
+            assert_eq!(
+                names(app)[0],
+                "plain.bin",
+                "it is the only thing that frees"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_values_sort_as_zero_and_never_panic() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        app.scanner.set_busy(true);
+        app.refresh_rows();
+        app.scanner.set_busy(false);
+        assert!(
+            app.rows.iter().all(|r| r.frees.is_none()),
+            "unknown while scanning"
+        );
+        app.update(Action::CycleSort);
+        assert_eq!(app.sort, SortBy::Frees);
+        assert_eq!(app.rows.len(), 3);
+        app.refresh_rows();
+        assert!(
+            app.rows.iter().all(|r| r.frees.is_some()),
+            "known once idle"
+        );
+    }
+
+    #[test]
+    fn graphs_follow_what_frees_but_fall_back_when_nothing_does() {
+        // Only a clone pair: nothing frees, so a frees-weighted graph would be empty.
+        let mut e = crate::testutil::env_with(&[("orig.bin", 8192)], |home| {
+            crate::testutil::clone_file(&home.join("orig.bin"), &home.join("clone.bin"))
+        });
+        let app = &mut e.app;
+        app.update(Action::CycleSort);
+        assert_eq!(app.sort, SortBy::Frees);
+        assert_eq!(app.current_space.unwrap().frees_now, 0);
+        assert_eq!(app.weight_total(), app.current_space.unwrap().footprint);
+        let row = app.rows[0].clone();
+        assert_eq!(app.weight(&row), row.disk);
+
+        // With something that does free, the graph weighs by what frees.
+        let mut e = frees_env();
+        let app = &mut e.app;
+        app.update(Action::CycleSort);
+        let frees_total = app.current_space.unwrap().frees_now;
+        if frees_total > 0 {
+            assert_eq!(app.weight_total(), frees_total);
+            let plain = app
+                .rows
+                .iter()
+                .find(|r| r.name == "plain.bin")
+                .unwrap()
+                .clone();
+            assert_eq!(app.weight(&plain), plain.frees.unwrap());
+        }
     }
 }

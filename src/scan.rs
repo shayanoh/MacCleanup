@@ -7,9 +7,10 @@ use std::ops::Add;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, ThreadId};
+use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
 
 /// Publish partial totals after this many files so counters keep moving
@@ -75,6 +76,100 @@ pub fn clone_facts(path: &Path) -> Option<CloneFacts> {
     })
 }
 
+/// When the newest local snapshot of the startup volume was taken, in Unix
+/// seconds: `NO_SNAPSHOT` if there is none, `UNKNOWN_SNAPSHOT` if it could not
+/// be found out. Refreshed whenever a scan starts.
+static NEWEST_SNAPSHOT: AtomicI64 = AtomicI64::new(UNKNOWN_SNAPSHOT);
+const NO_SNAPSHOT: i64 = i64::MIN;
+const UNKNOWN_SNAPSHOT: i64 = i64::MAX;
+
+/// `com.apple.TimeMachine.2026-11-06-170157.local` -> Unix seconds (the name
+/// is in local time). `None` for any other kind of snapshot name.
+fn snapshot_time(name: &str) -> Option<i64> {
+    let stamp = name.strip_prefix("com.apple.TimeMachine.")?.get(..17)?;
+    let n = |r: std::ops::Range<usize>| stamp.get(r)?.parse::<i32>().ok();
+    // SAFETY: `tm` is plain-old-data; mktime only reads and normalizes it.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = n(0..4)? - 1900;
+    tm.tm_mon = n(5..7)? - 1;
+    tm.tm_mday = n(8..10)?;
+    tm.tm_hour = n(11..13)?;
+    tm.tm_min = n(13..15)?;
+    tm.tm_sec = n(15..17)?;
+    tm.tm_isdst = -1;
+    // SAFETY: as above.
+    let t = unsafe { libc::mktime(&mut tm) };
+    (t != -1).then_some(t)
+}
+
+/// Ask `tmutil` (no admin rights needed) when the newest local snapshot was
+/// taken, and remember it.
+pub fn refresh_local_snapshots() {
+    let newest = match std::process::Command::new("/usr/bin/tmutil")
+        .args(["listlocalsnapshots", "/"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    {
+        None => UNKNOWN_SNAPSHOT,
+        Some(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let names: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| l.starts_with("com.apple."))
+                .collect();
+            if names.is_empty() {
+                NO_SNAPSHOT
+            } else {
+                // A name we cannot read could be newer than all we can.
+                let unreadable = names.iter().any(|n| snapshot_time(n).is_none());
+                let newest = names.iter().filter_map(|n| snapshot_time(n)).max();
+                match (unreadable, newest) {
+                    (false, Some(t)) => t,
+                    _ => UNKNOWN_SNAPSHOT,
+                }
+            }
+        }
+    };
+    NEWEST_SNAPSHOT.store(newest, Ordering::Relaxed);
+}
+
+/// Could a local snapshot be holding blocks of this unshared file? Only if
+/// one exists, and the file already existed when the newest one was taken
+/// (a file created later has no blocks in any snapshot). A file with no data
+/// fork extents at all (`refcnt == 0`: macOS-compressed files keep their data
+/// elsewhere, so their private size reads 0) is never a snapshot's.
+fn snapshot_may_hold(created: Option<i64>, refcnt: u32) -> bool {
+    may_hold(NEWEST_SNAPSHOT.load(Ordering::Relaxed), created, refcnt)
+}
+
+fn may_hold(newest_snapshot: i64, created: Option<i64>, refcnt: u32) -> bool {
+    if refcnt == 0 {
+        return false;
+    }
+    match newest_snapshot {
+        NO_SNAPSHOT => false,
+        UNKNOWN_SNAPSHOT => true,
+        newest => created.is_none_or(|c| c <= newest),
+    }
+}
+
+/// Bytes of an unshared file that a snapshot could be holding: the part of
+/// its real data (the logical size, rounded up to blocks) that its private
+/// size does not cover. Blocks allocated past the end of the file
+/// (preallocation) are never snapshot data; they free when the file goes.
+fn held_bytes(alloc: u64, len: u64, private: u64) -> u64 {
+    let data = alloc.min(len.div_ceil(4096) * 4096);
+    data.saturating_sub(private)
+}
+
+/// Birth time of a file as Unix seconds.
+fn created_secs(md: &fs::Metadata) -> Option<i64> {
+    let d = md.created().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(d.as_secs()).ok()
+}
+
 /// Running totals added to a folder and all its ancestors.
 #[derive(Clone, Copy, Debug, Default)]
 struct Tally {
@@ -103,6 +198,8 @@ pub struct Node {
     /// 1 for this directory's own listing plus one per unfinished child.
     pending: AtomicUsize,
     done: AtomicBool,
+    /// Set when a worker begins listing this folder (before that it is queued).
+    started: AtomicBool,
     subdirs: Mutex<Vec<Arc<Node>>>,
 }
 
@@ -120,6 +217,7 @@ impl Node {
             snap: AtomicU64::new(0),
             pending: AtomicUsize::new(1),
             done: AtomicBool::new(false),
+            started: AtomicBool::new(false),
             subdirs: Mutex::new(Vec::new()),
         })
     }
@@ -147,6 +245,11 @@ impl Node {
     /// Bytes of unshared files kept alive only by local snapshots.
     pub fn snapshot_held(&self) -> u64 {
         self.snap.load(Ordering::Relaxed)
+    }
+
+    /// True once a worker has begun listing this folder.
+    pub fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
     }
 
     /// True once the whole subtree has been scanned.
@@ -283,9 +386,16 @@ pub struct Row {
     pub node: Option<Arc<Node>>,
     /// Clone- and snapshot-aware numbers, known once the scan has finished.
     pub space: Option<Space>,
+    /// What deleting this entry frees right now. `None` while a scan runs.
+    pub frees: Option<u64>,
 }
 
 impl Row {
+    /// A folder that is waiting for its turn to be scanned.
+    pub fn queued(&self) -> bool {
+        self.is_dir && self.scanning && self.node.as_ref().is_none_or(|n| !n.is_started())
+    }
+
     /// Re-read live totals from the node (if the row has one).
     pub fn live(&self) -> Row {
         match &self.node {
@@ -299,6 +409,7 @@ impl Row {
                 },
                 files: n.files(),
                 scanning: !n.is_done(),
+                // `frees` is kept as it was (`..self.clone()`).
                 ..self.clone()
             },
             None => self.clone(),
@@ -398,8 +509,11 @@ pub fn file_space(path: &Path) -> io::Result<Space> {
                 space.frees_now = private;
                 if f.refcnt > 1 {
                     space.shared_outside = alloc - private;
+                } else if snapshot_may_hold(created_secs(&md), f.refcnt) {
+                    space.snapshots = held_bytes(alloc, md.len(), private);
+                    space.frees_now = alloc - space.snapshots;
                 } else {
-                    space.snapshots = alloc - private;
+                    space.frees_now = alloc; // nothing can be holding it
                 }
             }
             None => space.frees_now = alloc,
@@ -489,6 +603,7 @@ impl Scanner {
 
     /// Start scanning `path` in the background and return its node at once.
     pub fn scan_root(&self, path: &Path) -> Arc<Node> {
+        refresh_local_snapshots();
         let dev = fs::metadata(path).map_or(0, |m| m.dev());
         let name = path
             .file_name()
@@ -531,6 +646,7 @@ impl Scanner {
                         scanning: !n.is_done(),
                         node: Some(Arc::clone(n)),
                         space: None,
+                        frees: None,
                     }),
                     None => rows.push(Row {
                         name,
@@ -543,6 +659,7 @@ impl Scanner {
                         scanning: md.dev() == dir.dev,
                         node: None,
                         space: None,
+                        frees: None,
                     }),
                 }
             } else {
@@ -556,11 +673,13 @@ impl Scanner {
                     scanning: false,
                     node: None,
                     space: None,
+                    frees: None,
                 });
             }
         }
         if self.is_idle() {
             self.fill_spaces(dir, &mut rows);
+            self.fill_frees(&mut rows);
         }
         rows
     }
@@ -590,6 +709,18 @@ impl Scanner {
                 row.space = Some(space);
             }
         }
+    }
+
+    /// Work out what deleting each row frees now (files are asked in parallel).
+    fn fill_frees(&self, rows: &mut [Row]) {
+        use rayon::prelude::*;
+        rows.par_iter_mut().for_each(|r| {
+            r.frees = Some(match (&r.space, r.is_dir) {
+                (Some(sp), _) => sp.frees_now,
+                (None, true) => 0,
+                (None, false) => file_space(&r.path).map_or(r.disk, |sp| sp.frees_now),
+            });
+        });
     }
 
     /// Where one folder's disk space would go: what deleting it frees now,
@@ -734,6 +865,7 @@ impl Scanner {
         let Some(parent) = node.parent.upgrade() else {
             return self.rescan_all(&node.path);
         };
+        refresh_local_snapshots();
         let old = node.tally();
 
         // Forget what the old subtree contributed.
@@ -825,6 +957,7 @@ impl Scanner {
 
 fn walk(shared: Arc<Shared>, node: Arc<Node>) {
     lock(&shared.threads).insert(thread::current().id());
+    node.started.store(true, Ordering::Release);
     scan_dir(&shared, &node);
     finish_one(&node);
     shared.active.fetch_sub(1, Ordering::AcqRel);
@@ -928,8 +1061,12 @@ fn scan_dir(shared: &Arc<Shared>, node: &Arc<Node>) {
                             group.members.push(Arc::clone(node));
                         } else {
                             // Not cloned, yet not fully private: a local
-                            // snapshot still holds these blocks.
-                            snap = shared_part;
+                            // snapshot holds these blocks (if there is none,
+                            // the shortfall is not snapshot data: it frees).
+                            if snapshot_may_hold(created_secs(&md), f.refcnt) {
+                                snap = held_bytes(alloc, md.len(), private);
+                            }
+                            private = alloc - snap;
                         }
                     }
                     None => private = alloc,
@@ -1713,5 +1850,144 @@ mod tests {
         assert_eq!(sum.snapshots, 6);
         assert_eq!(sum.saved, 10);
         assert_eq!(a + Space::default(), a);
+    }
+
+    #[test]
+    fn rows_know_what_deleting_them_frees_once_the_scan_is_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("plain"), 8192);
+        write(&r.join("orig"), 8192);
+        clone_file(r, "orig", "clone");
+        write(&r.join("h1"), 4096);
+        hard_link(r, "h1", "h2");
+        write(&r.join("d/p"), 8192);
+        write(&r.join("d/o"), 8192);
+        clone_file(r, "d/o", "d/c");
+        let (s, root) = scan(r, 2);
+        let rows = s.list_children(&root);
+        let frees = |name: &str| rows.iter().find(|x| x.name == name).unwrap().frees;
+        assert_eq!(frees("orig"), Some(0), "clone data stays shared");
+        assert_eq!(frees("clone"), Some(0));
+        assert_eq!(frees("h1"), Some(0), "another link keeps a hard link alive");
+        assert_eq!(frees("h2"), Some(0));
+        assert_eq!(
+            frees("plain"),
+            Some(file_space(&r.join("plain")).unwrap().frees_now)
+        );
+        let d = rows.iter().find(|x| x.name == "d").unwrap();
+        let d_node = d.node.as_ref().unwrap();
+        assert_eq!(d.frees, Some(s.space(d_node).frees_now));
+    }
+
+    #[test]
+    fn frees_are_unknown_while_a_scan_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("f"), 8192);
+        write(&dir.path().join("d/g"), 4096);
+        let (s, root) = scan(dir.path(), 2);
+        s.set_busy(true);
+        let busy = s.list_children(&root);
+        s.set_busy(false);
+        assert!(busy.iter().all(|x| x.frees.is_none()), "unknown, not zero");
+        let idle = s.list_children(&root);
+        assert!(idle.iter().all(|x| x.frees.is_some()));
+    }
+
+    #[test]
+    fn only_a_shortfall_inside_the_data_can_be_a_snapshots() {
+        // Fully covered: nothing held, even if blocks were preallocated past EOF.
+        assert_eq!(held_bytes(2_600_000, 1_556_328, 2_076_672), 0);
+        // Part of the real data missing from the private size: that part.
+        assert_eq!(held_bytes(8192, 8192, 4096), 4096);
+        assert_eq!(held_bytes(8192, 8192, 0), 8192);
+        // A tiny file occupies a whole block.
+        assert_eq!(held_bytes(4096, 100, 4096), 0);
+        // Sparse: only what is allocated can be missing.
+        assert_eq!(held_bytes(4096, 16 << 20, 0), 4096);
+    }
+
+    #[test]
+    fn snapshot_blame_needs_a_snapshot_the_file_predates_and_real_data_forks() {
+        let snap = 1_000_000;
+        assert!(!may_hold(NO_SNAPSHOT, Some(5), 1), "no snapshot, no blame");
+        assert!(may_hold(snap, Some(snap - 1), 1));
+        assert!(may_hold(snap, Some(snap), 1));
+        assert!(!may_hold(snap, Some(snap + 1), 1), "created after it");
+        assert!(
+            may_hold(snap, None, 1),
+            "unknown birth time: cannot rule out"
+        );
+        assert!(may_hold(UNKNOWN_SNAPSHOT, Some(snap + 1), 1));
+        assert!(
+            !may_hold(snap, Some(5), 0),
+            "refcnt 0: compressed, not held"
+        );
+    }
+
+    #[test]
+    fn snapshot_names_are_read_as_local_time() {
+        let a = snapshot_time("com.apple.TimeMachine.2026-11-06-170157.local").unwrap();
+        let b = snapshot_time("com.apple.TimeMachine.2026-11-06-170257.local").unwrap();
+        assert_eq!(b - a, 60);
+        assert!(snapshot_time("com.apple.os.update-ABC").is_none());
+        assert!(snapshot_time("com.apple.TimeMachine.garbage").is_none());
+        assert!(snapshot_time("").is_none());
+    }
+
+    #[test]
+    fn a_macos_compressed_file_is_never_blamed_on_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        fs::write(r.join("t"), "hello world\n".repeat(200_000)).unwrap();
+        let ok = std::process::Command::new("/usr/bin/ditto")
+            .arg("--hfsCompression")
+            .arg(r.join("t"))
+            .arg(r.join("c"))
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "needs ditto");
+        let sp = file_space(&r.join("c")).unwrap();
+        assert_eq!(sp.snapshots, 0);
+        assert_eq!(sp.frees_now, sp.footprint, "it all frees on delete");
+    }
+
+    #[test]
+    fn a_folder_not_yet_started_is_queued_and_a_finished_one_is_not() {
+        let row = |is_dir, scanning| Row {
+            name: "x".into(),
+            path: "/x".into(),
+            is_dir,
+            size: 0,
+            disk: 0,
+            files: 0,
+            scanning,
+            node: None,
+            space: None,
+            frees: None,
+        };
+        assert!(row(true, true).queued(), "undiscovered folder waits");
+        assert!(!row(true, false).queued());
+        assert!(!row(false, false).queued(), "files are never queued");
+
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir(t.path().join("d")).unwrap();
+        let s = Scanner::new(2);
+        let root = s.scan_root(t.path());
+        assert!(s.wait_idle(Duration::from_secs(30)));
+        let rows = s.list_children(&root);
+        assert!(rows.iter().all(|r| !r.queued()), "nothing queued when done");
+        assert!(root.children().iter().all(|n| n.is_started()));
+    }
+
+    #[test]
+    fn live_rows_keep_what_they_free() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("d/f"), 8192);
+        let (s, root) = scan(dir.path(), 2);
+        let rows = s.list_children(&root);
+        let d = rows.iter().find(|x| x.name == "d").unwrap();
+        assert_eq!(d.live().frees, d.frees);
+        assert!(d.frees.is_some());
     }
 }

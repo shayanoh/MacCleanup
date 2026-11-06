@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use super::{
     ACCENT, DIM, SELECTED_BG, fit, fit_pad, fit_start, graph, pad, panel, right, safety_color,
@@ -12,6 +12,7 @@ use crate::anim;
 use crate::app::{App, GraphMode, SortBy};
 use crate::filter::{self, Query};
 use crate::fmt::{both_usage, eighths_bar, human_size};
+use crate::glyphs::Glyphs;
 use crate::scan::Row;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -45,11 +46,11 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(block, area);
     // The filter box takes one row above the header while it is shown.
     let filter_h = u16::from(app.filter.visible());
-    if inner.height < 7 + filter_h || inner.width < 24 {
+    if inner.height < 8 + filter_h || inner.width < 24 {
         return;
     }
-    app.layout.list_top = inner.y + 2 + filter_h;
-    app.layout.list_rows = inner.height - 6 - filter_h;
+    app.layout.list_top = inner.y + 3 + filter_h;
+    app.layout.list_rows = inner.height - 7 - filter_h;
     app.ensure_visible();
 
     // Status line: live scan activity.
@@ -74,15 +75,19 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         ])
     };
     frame.render_widget(
-        Paragraph::new(status),
+        Paragraph::new(folder_totals(app, inner.width as usize)),
         Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(status),
+        Rect::new(inner.x, inner.y + 1, inner.width, 1),
     );
 
     // Filter box.
     if filter_h > 0 {
         frame.render_widget(
             Paragraph::new(filter_line(app, inner.width as usize)),
-            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            Rect::new(inner.x, inner.y + 2, inner.width, 1),
         );
     }
     let query = filter::parse(&app.filter.query);
@@ -92,8 +97,13 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let mark_w = text_width(g.marked()).max(text_width(g.unmarked()));
     let dot_w = text_width(g.safe());
     let prefix_w = 2 + mark_w + 1 + icon_w + 1 + dot_w + 1;
-    let fixed = prefix_w + 1 + 9 + 1 + 9 + 1 + 8;
-    let name_w = (inner.width as usize).saturating_sub(fixed).max(4);
+    // Size, on disk, frees: three 9-wide columns; the share bar goes first
+    // when the pane is narrow.
+    let fixed_no_share = prefix_w + 3 * (1 + 9);
+    let cw = inner.width.saturating_sub(1) as usize; // last column: scrollbar
+    let show_share = cw >= fixed_no_share + 9 + 16;
+    let fixed = fixed_no_share + if show_share { 9 } else { 0 };
+    let name_w = cw.saturating_sub(fixed).max(4);
 
     // Header: the sorted column is white with an arrow, the others gray.
     let sort = app.sort;
@@ -117,7 +127,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::default().fg(DIM)
         }
     };
-    let header = Line::from(vec![
+    let mut header = vec![
         Span::raw(" ".repeat(prefix_w)),
         Span::styled(
             pad(format!("Name{}", arrow(SortBy::Name)), name_w),
@@ -133,18 +143,26 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             right(&format!("On disk{}", arrow(SortBy::Disk)), 9),
             head_style(SortBy::Disk),
         ),
-        Span::styled(" Share", Style::default().fg(DIM)),
-    ]);
+        Span::raw(" "),
+        Span::styled(
+            right(&format!("Frees{}", arrow(SortBy::Frees)), 9),
+            head_style(SortBy::Frees),
+        ),
+    ];
+    if show_share {
+        header.push(Span::styled(" Share", Style::default().fg(DIM)));
+    }
+    let header = Line::from(header);
     frame.render_widget(
         Paragraph::new(header),
-        Rect::new(inner.x, inner.y + 1 + filter_h, inner.width, 1),
+        Rect::new(inner.x, inner.y + 2 + filter_h, inner.width, 1),
     );
 
     // Rows.
     let list_rows = app.layout.list_rows as usize;
     let list_area = Rect::new(
         inner.x,
-        inner.y + 2 + filter_h,
+        inner.y + 3 + filter_h,
         inner.width,
         app.layout.list_rows,
     );
@@ -154,7 +172,19 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = app.rows[start..end]
         .iter()
         .enumerate()
-        .map(|(i, row)| row_line(app, &query, start + i, row, total, name_w, icon_w, mark_w))
+        .map(|(i, row)| {
+            row_line(
+                app,
+                &query,
+                start + i,
+                row,
+                total,
+                name_w,
+                icon_w,
+                mark_w,
+                show_share,
+            )
+        })
         .collect();
     if app.rows.is_empty() && app.filter.active() {
         lines.push(Line::from(Span::styled(
@@ -170,6 +200,16 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         lines.push(Line::from(Span::styled(msg, Style::default().fg(DIM))));
     }
     frame.render_widget(Paragraph::new(lines), list_area);
+    if app.rows.len() > list_rows {
+        let mut state = ScrollbarState::new(app.rows.len() - list_rows).position(app.offset);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some(app.glyphs.scroll_track()))
+            .thumb_symbol(app.glyphs.scroll_thumb())
+            .style(Style::default().fg(ACCENT));
+        frame.render_stateful_widget(bar, list_area, &mut state);
+    }
 
     // Where the selected row's space would go.
     let detail_y = inner.y + inner.height - 4;
@@ -192,9 +232,21 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD)
     };
+    let pos = position_text(app);
+    let pos_w = text_width(&pos) as u16;
+    let marked_w = inner.width.saturating_sub(pos_w + 1) as usize;
     frame.render_widget(
-        Paragraph::new(Span::styled(fit(&marked, inner.width as usize, &g), style)),
-        Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
+        Paragraph::new(Span::styled(fit(&marked, marked_w, &g), style)),
+        Rect::new(inner.x, inner.y + inner.height - 1, marked_w as u16, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(pos, Style::default().fg(Color::White))),
+        Rect::new(
+            inner.x + inner.width - pos_w,
+            inner.y + inner.height - 1,
+            pos_w,
+            1,
+        ),
     );
 }
 
@@ -208,6 +260,7 @@ fn row_line<'a>(
     name_w: usize,
     icon_w: usize,
     mark_w: usize,
+    show_share: bool,
 ) -> Line<'a> {
     let g = &app.glyphs;
     let r = row.live();
@@ -234,7 +287,10 @@ fn row_line<'a>(
         Style::default()
     };
     let name = r.name.to_string_lossy();
-    let share = if r.scanning {
+    let queued = r.queued();
+    let share = if queued {
+        pad("queued".to_string(), 8)
+    } else if r.scanning {
         let frame_idx = anim::spinner_frame(app.tick, g.spinner().len());
         pad(format!("{} {}", g.spinner()[frame_idx], r.files), 8)
     } else {
@@ -257,23 +313,94 @@ fn row_line<'a>(
         name_style,
         name_style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
     ));
+    // A queued folder has no numbers yet: show that, not a misleading 0 B.
+    let unknown = right(g.ellipsis(), 9);
+    let cell = |v: String| if queued { unknown.clone() } else { v };
     spans.extend([
         Span::styled(
-            format!(" {}", right(&human_size(r.size), 9)),
+            format!(" {}", cell(right(&human_size(r.size), 9))),
             value_style(app.sort == SortBy::Size),
         ),
         Span::styled(
-            format!(" {}", right(&human_size(r.disk), 9)),
+            format!(" {}", cell(right(&human_size(r.disk), 9))),
             value_style(app.sort == SortBy::Disk),
         ),
-        Span::styled(format!(" {share}"), Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!(
+                " {}",
+                if queued {
+                    unknown.clone()
+                } else {
+                    frees_cell(r.frees, g)
+                }
+            ),
+            value_style(app.sort == SortBy::Frees),
+        ),
     ]);
+    if show_share {
+        let color = if queued { DIM } else { Color::Yellow };
+        spans.push(Span::styled(
+            format!(" {share}"),
+            Style::default().fg(color),
+        ));
+    }
     let line = Line::from(spans);
     if selected {
         line.style(Style::default().bg(SELECTED_BG))
     } else {
         line
     }
+}
+
+/// Where the cursor is in the list: `12/340` (`0/0` when empty).
+fn position_text(app: &App) -> String {
+    if app.rows.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!(
+            "{}/{}",
+            app.cursor.min(app.rows.len() - 1) + 1,
+            app.rows.len()
+        )
+    }
+}
+
+/// Totals for the folder being shown, above the scan-wide totals.
+fn folder_totals(app: &App, width: usize) -> Line<'static> {
+    let g = &app.glyphs;
+    let cur = app.current();
+    let mut parts = vec![format!("{} items", app.all_rows.len())];
+    parts.push(format!(
+        "{} ({} on disk)",
+        human_size(cur.size()),
+        human_size(
+            app.current_space
+                .map_or_else(|| cur.disk(), |s| s.footprint)
+        )
+    ));
+    parts.push(match app.current_space {
+        Some(s) => format!("frees {}", human_size(s.frees_now)),
+        None => format!("frees {}", g.ellipsis()),
+    });
+    let text = format!(
+        "{} this folder: {}",
+        g.folder(),
+        parts.join(&format!(" {} ", g.dot()))
+    );
+    Line::from(Span::styled(
+        fit(&text, width, g),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// The Frees column: a size, or an ellipsis while it is not known yet.
+fn frees_cell(frees: Option<u64>, g: &Glyphs) -> String {
+    right(
+        &frees.map_or_else(|| g.ellipsis().to_string(), human_size),
+        9,
+    )
 }
 
 /// The sorted column's values are white; the other size column is gray.
@@ -425,4 +552,26 @@ fn filter_line(app: &App, width: usize) -> Line<'static> {
         Style::default().fg(right_color),
     ));
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::glyphs::{GlyphMode, Glyphs};
+
+    #[test]
+    fn the_frees_cell_is_right_aligned_and_shows_unknown_as_an_ellipsis() {
+        let nerd = Glyphs::new(GlyphMode::Nerd);
+        let ascii = Glyphs::new(GlyphMode::Ascii);
+        assert_eq!(frees_cell(Some(1500), &nerd), "   1.5 KB");
+        assert_eq!(frees_cell(Some(0), &nerd), "      0 B");
+        assert_eq!(frees_cell(None, &nerd), "        …");
+        assert_eq!(frees_cell(None, &ascii), "      ...");
+        for text in [
+            frees_cell(Some(123_456_789_012), &nerd),
+            frees_cell(None, &nerd),
+        ] {
+            assert_eq!(text_width(&text), 9);
+        }
+    }
 }
