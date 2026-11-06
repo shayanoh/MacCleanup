@@ -302,7 +302,7 @@ wait_for("late.bin")
 step("caches & projects: 5 opens it, space marks a row, d reviews, Esc cancels, space unmarks")
 send(b"5")
 wait_for("PROJECTS")
-wait_for("node_modules")
+wait_for("shop")  # the project, in the list and as the graph's label
 wait_for("Details")
 send(b"j")  # the ~/shop group
 send(b"j")  # its node_modules row
