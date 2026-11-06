@@ -29,6 +29,11 @@ pub struct CommandSpec {
     /// Extra arguments for a forced run (`--force`); empty when the command
     /// has no such variant.
     pub force_args: Vec<String>,
+    /// Text written to the program's standard input (then closed); `None`
+    /// means no input at all.
+    pub stdin: Option<String>,
+    /// Replaces the runner's default time limit when set.
+    pub timeout: Option<Duration>,
 }
 
 impl CommandSpec {
@@ -39,7 +44,22 @@ impl CommandSpec {
             cwd: None,
             env: Vec::new(),
             force_args: Vec::new(),
+            stdin: None,
+            timeout: None,
         }
+    }
+
+    /// Feed `text` to the program's standard input (a Dockerfile for
+    /// `docker build -`, say).
+    pub fn with_stdin(mut self, text: &str) -> CommandSpec {
+        self.stdin = Some(text.to_string());
+        self
+    }
+
+    /// Stop the program after `limit` instead of the runner's default.
+    pub fn with_timeout(mut self, limit: Duration) -> CommandSpec {
+        self.timeout = Some(limit);
+        self
     }
 
     pub fn with_cwd(mut self, cwd: &Path) -> CommandSpec {
@@ -259,8 +279,13 @@ fn exec(spec: &CommandSpec, timeout: Duration, ctl: Option<&RunControl>) -> Outc
         return failed("no program given".to_string());
     }
     let mut cmd = Command::new(&spec.program);
+    let timeout = spec.timeout.unwrap_or(timeout);
     cmd.args(&spec.args)
-        .stdin(Stdio::null())
+        .stdin(if spec.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Its own process group: cancelling reaches everything it started,
@@ -279,6 +304,14 @@ fn exec(spec: &CommandSpec, timeout: Duration, ctl: Option<&RunControl>) -> Outc
         Ok(c) => c,
         Err(e) => return failed(format!("could not start {}: {e}", spec.program)),
     };
+    // Feed the input from its own thread (a program that never reads must
+    // not block us), then close the pipe so the program sees the end.
+    if let (Some(text), Some(mut input)) = (spec.stdin.clone(), child.stdin.take()) {
+        thread::spawn(move || {
+            use std::io::Write;
+            let _ = input.write_all(text.as_bytes());
+        });
+    }
     let (out, err) = (child.stdout.take(), child.stderr.take());
     thread::scope(|scope| {
         let out = out.map(|o| scope.spawn(move || read_stream(o, ctl)));
@@ -506,6 +539,20 @@ mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdin_text_reaches_the_program() {
+        let s = spec("/bin/cat", &[]).with_stdin("hello");
+        assert_eq!(SystemRunner.query(&s), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn timeout_overrides_the_default() {
+        let s = spec("/bin/sleep", &["5"]).with_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        assert_eq!(SystemRunner.query(&s), None);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     /// Run with a fresh, never-cancelled control.
     trait RunExt {
