@@ -6,6 +6,7 @@ use ratatui::layout::Rect;
 
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
+use crate::filter;
 use crate::fmt::both_usage;
 use crate::glyphs::Glyphs;
 use crate::jobs::{DeleteEvent, DeleteJob, DeleteMode, Phase};
@@ -126,6 +127,23 @@ pub enum Action {
     Rescan,
     /// Rescan everything from the scan root.
     RescanAll,
+    /// Open the filter box (`/`) on the explorer.
+    FilterOpen,
+    FilterChar(char),
+    FilterBackspace,
+    FilterDelete,
+    FilterLeft,
+    FilterRight,
+    FilterHome,
+    FilterEnd,
+    FilterClearWord,
+    FilterClearLine,
+    /// Enter: stop typing but keep the filter applied.
+    FilterAccept,
+    /// Esc: remove the filter.
+    FilterClear,
+    /// From the quit warning: go and look at ToBeDeleted instead.
+    ReviewHeld,
     Confirm,
     Cancel,
     ConfirmIrreversible,
@@ -176,6 +194,35 @@ pub struct FinishInfo {
     pub started_tick: u64,
 }
 
+/// What the quit warning tells the user is still waiting in ToBeDeleted.
+#[derive(Clone, Debug)]
+pub struct QuitWarning {
+    pub count: usize,
+    pub usage: Usage,
+}
+
+/// The explorer's filter box.
+#[derive(Clone, Debug, Default)]
+pub struct FilterState {
+    pub query: String,
+    /// Cursor position in characters.
+    pub cursor: usize,
+    /// True while the user is typing into the box.
+    pub editing: bool,
+}
+
+impl FilterState {
+    /// A non-empty filter is applied to the list.
+    pub fn active(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    /// The box is drawn while typing or while a filter is applied.
+    pub fn visible(&self) -> bool {
+        self.active() || self.editing
+    }
+}
+
 /// What a "delete for good" confirmation applies to.
 #[derive(Clone, Debug)]
 pub enum ForeverTarget {
@@ -192,6 +239,8 @@ pub enum ForeverTarget {
 
 #[derive(Clone, Debug)]
 pub enum Dialog {
+    /// Quit was requested while ToBeDeleted still holds something.
+    QuitWarning(QuitWarning),
     Review(Review),
     Irreversible(Review),
     ConfirmForever(ForeverTarget),
@@ -215,7 +264,11 @@ pub struct App {
     pub graph: GraphMode,
     pub graph_pct: u16,
     pub sort: SortBy,
+    /// The rows shown: `all_rows` narrowed by the filter.
     pub rows: Vec<Row>,
+    /// Everything in the current folder, before filtering.
+    pub all_rows: Vec<Row>,
+    pub filter: FilterState,
     pub detail: Option<Detail>,
     pub cursor: usize,
     pub offset: usize,
@@ -305,6 +358,8 @@ impl App {
             graph_pct: 35,
             sort: SortBy::Disk,
             rows: Vec::new(),
+            all_rows: Vec::new(),
+            filter: FilterState::default(),
             detail: None,
             cursor: 0,
             offset: 0,
@@ -404,13 +459,126 @@ impl App {
                 *usage = Usage::new(r.size, r.disk);
             }
         }
-        self.rows = rows;
+        self.all_rows = rows;
+        self.rows = self.matching_rows();
         let found = keep.and_then(|p| self.rows.iter().position(|r| r.path == p));
         self.cursor = found
             .unwrap_or(self.cursor)
             .min(self.rows.len().saturating_sub(1));
         self.ensure_visible();
         self.refresh_detail();
+    }
+
+    // --- filter -------------------------------------------------------
+
+    /// `all_rows` narrowed by the current query (the sort order is kept).
+    fn matching_rows(&self) -> Vec<Row> {
+        let query = filter::parse(&self.filter.query);
+        if query.is_empty() {
+            return self.all_rows.clone();
+        }
+        self.all_rows
+            .iter()
+            .filter(|r| query.matches(&r.name.to_string_lossy()).is_some())
+            .cloned()
+            .collect()
+    }
+
+    /// Re-apply the query. While typing the selection jumps to the first
+    /// match; `keep_selection` keeps the same row selected when it survives.
+    fn refilter(&mut self, keep_selection: bool) {
+        let keep = keep_selection
+            .then(|| self.selected_row().map(|r| r.path.clone()))
+            .flatten();
+        self.rows = self.matching_rows();
+        self.cursor = keep
+            .and_then(|p| self.rows.iter().position(|r| r.path == p))
+            .unwrap_or(0);
+        self.offset = 0;
+        self.ensure_visible();
+        self.refresh_detail();
+    }
+
+    fn reset_filter(&mut self) {
+        self.filter = FilterState::default();
+    }
+
+    fn filter_open(&mut self) {
+        if self.screen != Screen::Explorer {
+            return;
+        }
+        self.focus = Focus::Main;
+        self.filter.editing = true;
+        self.filter.cursor = self.filter.query.chars().count();
+    }
+
+    fn filter_clear(&mut self) {
+        let was_active = self.filter.active();
+        self.filter.query.clear();
+        self.filter.cursor = 0;
+        self.filter.editing = false;
+        if was_active {
+            self.refilter(true);
+        }
+    }
+
+    fn filter_byte(&self, chars: usize) -> usize {
+        self.filter
+            .query
+            .char_indices()
+            .nth(chars)
+            .map_or(self.filter.query.len(), |(b, _)| b)
+    }
+
+    fn filter_edit(&mut self, action: Action) {
+        if !self.filter.editing {
+            return;
+        }
+        let len = self.filter.query.chars().count();
+        let cursor = self.filter.cursor.min(len);
+        match action {
+            Action::FilterChar(c) if !c.is_control() => {
+                let at = self.filter_byte(cursor);
+                self.filter.query.insert(at, c);
+                self.filter.cursor = cursor + 1;
+                self.refilter(false);
+            }
+            Action::FilterBackspace if cursor > 0 => {
+                let at = self.filter_byte(cursor - 1);
+                self.filter.query.remove(at);
+                self.filter.cursor = cursor - 1;
+                self.refilter(false);
+            }
+            Action::FilterDelete if cursor < len => {
+                let at = self.filter_byte(cursor);
+                self.filter.query.remove(at);
+                self.refilter(false);
+            }
+            Action::FilterLeft => self.filter.cursor = cursor.saturating_sub(1),
+            Action::FilterRight => self.filter.cursor = (cursor + 1).min(len),
+            Action::FilterHome => self.filter.cursor = 0,
+            Action::FilterEnd => self.filter.cursor = len,
+            Action::FilterClearLine if cursor > 0 => {
+                let at = self.filter_byte(cursor);
+                self.filter.query.drain(..at);
+                self.filter.cursor = 0;
+                self.refilter(false);
+            }
+            Action::FilterClearWord if cursor > 0 => {
+                let chars: Vec<char> = self.filter.query.chars().collect();
+                let mut start = cursor;
+                while start > 0 && chars[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                while start > 0 && !chars[start - 1].is_whitespace() {
+                    start -= 1;
+                }
+                self.filter.query = chars[..start].iter().chain(&chars[cursor..]).collect();
+                self.filter.cursor = start;
+                self.refilter(false);
+            }
+            _ => {}
+        }
     }
 
     pub fn refresh_held(&mut self) {
@@ -450,8 +618,27 @@ impl App {
                 Some(Dialog::Review(r)) => self.dialog = Some(Dialog::Irreversible(r)),
                 other => self.dialog = other,
             },
+            Action::ReviewHeld => {
+                if matches!(self.dialog, Some(Dialog::QuitWarning(_))) {
+                    self.dialog = None;
+                    self.goto(Screen::Holding);
+                    self.focus = Focus::Main;
+                }
+            }
             // Everything below is blocked while a dialog is open.
             _ if self.dialog.is_some() => {}
+            Action::FilterOpen => self.filter_open(),
+            Action::FilterAccept => self.filter.editing = false,
+            Action::FilterClear => self.filter_clear(),
+            Action::FilterChar(_)
+            | Action::FilterBackspace
+            | Action::FilterDelete
+            | Action::FilterLeft
+            | Action::FilterRight
+            | Action::FilterHome
+            | Action::FilterEnd
+            | Action::FilterClearWord
+            | Action::FilterClearLine => self.filter_edit(action),
             Action::Up => self.move_by(-1),
             Action::Down => self.move_by(1),
             Action::PageUp => self.move_by(-(self.visible_rows() as i64)),
@@ -506,8 +693,14 @@ impl App {
         if self.job.is_some() {
             self.quit_after_job = true;
             self.notice = Some("Finishing the delete before quitting...".to_string());
-        } else {
+        } else if matches!(self.dialog, Some(Dialog::QuitWarning(_))) || self.held.is_empty() {
+            // Nothing waiting in ToBeDeleted, or the user asked twice.
             self.should_quit = true;
+        } else {
+            self.dialog = Some(Dialog::QuitWarning(QuitWarning {
+                count: self.held.len(),
+                usage: self.held.iter().map(HeldItem::usage).sum(),
+            }));
         }
     }
 
@@ -540,6 +733,7 @@ impl App {
 
     fn confirm(&mut self) {
         match self.dialog.take() {
+            Some(Dialog::QuitWarning(_)) => self.should_quit = true,
             Some(Dialog::Review(r)) => self.run_delete(r, DeleteMode::SoftOnly),
             Some(Dialog::Irreversible(r)) => self.run_delete(r, DeleteMode::SoftThenEmpty),
             Some(Dialog::ConfirmForever(t)) => self.run_forever(t),
@@ -549,6 +743,7 @@ impl App {
     }
 
     fn goto(&mut self, screen: Screen) {
+        self.filter.editing = false;
         self.screen = screen;
         self.transition_start = self.tick;
         match screen {
@@ -597,6 +792,12 @@ impl App {
             let Some(root) = self.scanner.rescan_all(&root_path) else {
                 return;
             };
+            // Going back to the root changes the folder shown, so the filter
+            // (which belongs to one folder's list) goes; a plain refresh of the
+            // same folder keeps it.
+            if self.stack.len() > 1 {
+                self.reset_filter();
+            }
             self.stack = vec![root];
             self.cursor = 0;
             self.offset = 0;
@@ -632,6 +833,7 @@ impl App {
             return;
         };
         self.stack.push(node);
+        self.reset_filter();
         self.cursor = 0;
         self.offset = 0;
         self.rows.clear();
@@ -645,6 +847,7 @@ impl App {
         if let Some(from) = self.stack.pop() {
             self.pending_select = Some(from.path.clone());
         }
+        self.reset_filter();
         self.refresh_rows();
     }
 
@@ -774,6 +977,7 @@ impl App {
         } else if inside(l.main) && y >= l.list_top && y < l.list_top + l.list_rows {
             let i = (y - l.list_top) as usize;
             self.focus = Focus::Main;
+            self.filter.editing = false;
             match self.screen {
                 Screen::Explorer => {
                     let idx = self.offset + i;
@@ -874,7 +1078,8 @@ impl App {
             let (mode, free_before) = (self.job_mode, self.job_free_before);
             self.after_delete(mode, moved, emptied, failures, free_before);
             if self.quit_after_job {
-                self.should_quit = true;
+                self.quit_after_job = false;
+                self.request_quit();
             }
         }
     }
@@ -1524,9 +1729,14 @@ mod tests {
         assert!(!app.should_quit, "must not quit while deleting");
         assert!(app.notice.is_some());
         settle(app);
-        assert!(app.should_quit, "quits once the delete has finished");
         assert!(!home.join("b.bin").exists());
         assert_eq!(app.held.len(), 1, "the moved item is tracked");
+        // The quit was deferred, and now that something sits in ToBeDeleted it
+        // asks first instead of quitting behind the user's back.
+        assert!(!app.should_quit);
+        assert!(matches!(app.dialog, Some(Dialog::QuitWarning(_))));
+        app.update(Action::Confirm);
+        assert!(app.should_quit);
     }
 
     #[test]
@@ -1983,5 +2193,468 @@ mod tests {
         let since = app.dialog_since;
         app.update(Action::Tick);
         assert_eq!(app.dialog_since, since, "ticks alone do not restart it");
+    }
+
+    fn filter_env() -> crate::testutil::Env {
+        // By on-disk size: node_modules, src, notes.txt, Makefile.
+        env(&[
+            ("node_modules/x", 20480),
+            ("notes.txt", 8192),
+            ("src/main.rs", 12288),
+            ("Makefile", 4096),
+        ])
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.update(Action::FilterChar(c));
+        }
+    }
+
+    #[test]
+    fn slash_opens_the_filter_and_typing_filters_the_list() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        assert_eq!(names(app), ["node_modules", "src", "notes.txt", "Makefile"]);
+        app.update(Action::FilterOpen);
+        assert!(app.filter.editing);
+        assert_eq!(app.focus, Focus::Main);
+        type_text(app, "no");
+        assert_eq!(names(app), ["node_modules", "notes.txt"]);
+        assert_eq!(app.all_rows.len(), 4, "the full listing is kept");
+        assert_eq!((app.filter.query.as_str(), app.filter.cursor), ("no", 2));
+    }
+
+    #[test]
+    fn enter_accepts_and_the_list_keeps_the_filter() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        app.update(Action::FilterAccept);
+        assert!(!app.filter.editing);
+        assert!(app.filter.active());
+        assert_eq!(names(app), ["node_modules", "notes.txt"]);
+        app.update(Action::Down);
+        assert_eq!(app.selected_row().unwrap().name, "notes.txt");
+        app.update(Action::ToggleMark);
+        assert!(app.marks.keys().any(|p| p.ends_with("notes.txt")));
+    }
+
+    #[test]
+    fn slash_again_edits_the_filter_and_refines_it() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        app.update(Action::FilterAccept);
+        app.update(Action::FilterOpen);
+        assert!(app.filter.editing);
+        assert_eq!((app.filter.query.as_str(), app.filter.cursor), ("no", 2));
+        type_text(app, "d");
+        assert_eq!(app.filter.query, "nod");
+        assert_eq!(names(app), ["node_modules"]);
+        app.update(Action::FilterBackspace);
+        assert_eq!(names(app), ["node_modules", "notes.txt"]);
+    }
+
+    #[test]
+    fn clearing_the_filter_restores_the_list_and_keeps_the_selected_row() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        app.update(Action::FilterAccept);
+        app.update(Action::Down);
+        app.update(Action::FilterClear);
+        assert!(!app.filter.active() && !app.filter.editing);
+        assert_eq!(names(app).len(), 4);
+        assert_eq!(app.selected_row().unwrap().name, "notes.txt");
+    }
+
+    #[test]
+    fn clearing_while_the_box_is_empty_just_closes_it() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        app.update(Action::FilterClear);
+        assert!(!app.filter.editing);
+        assert_eq!(names(app).len(), 4);
+    }
+
+    #[test]
+    fn typing_selects_the_first_match() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "e");
+        app.update(Action::Down);
+        app.update(Action::Down);
+        assert!(app.cursor > 0);
+        type_text(app, "s");
+        assert_eq!(app.cursor, 0);
+        assert_eq!(
+            app.selected_row().unwrap().name.to_string_lossy(),
+            names(app)[0]
+        );
+    }
+
+    #[test]
+    fn arrows_move_through_the_filtered_list_while_editing() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        app.update(Action::Down);
+        assert_eq!(app.selected_row().unwrap().name, "notes.txt");
+        app.update(Action::Down);
+        assert_eq!(app.cursor, 1, "clamped to the last match");
+        app.update(Action::Up);
+        assert_eq!(app.selected_row().unwrap().name, "node_modules");
+    }
+
+    #[test]
+    fn going_into_or_out_of_a_folder_clears_the_filter() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "node");
+        app.update(Action::FilterAccept);
+        app.update(Action::Into);
+        assert!(!app.filter.active());
+        assert_eq!(names(app), ["x"]);
+        app.update(Action::Out);
+        assert!(!app.filter.active());
+        assert_eq!(names(app).len(), 4);
+        assert_eq!(app.selected_row().unwrap().name, "node_modules");
+    }
+
+    #[test]
+    fn no_matches_gives_an_empty_list_nothing_trips_on() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "zzz");
+        assert!(app.rows.is_empty());
+        assert!(app.selected_row().is_none());
+        assert!(app.detail.is_none());
+        for a in [
+            Action::Down,
+            Action::Up,
+            Action::Top,
+            Action::Bottom,
+            Action::PageDown,
+            Action::PageUp,
+            Action::ToggleMark,
+            Action::Into,
+            Action::OpenReview,
+            Action::CycleSort,
+            Action::CycleGraph,
+        ] {
+            app.update(a);
+        }
+        assert!(app.marks.is_empty());
+        for _ in 0..3 {
+            app.update(Action::FilterBackspace);
+        }
+        assert_eq!(names(app).len(), 4);
+    }
+
+    #[test]
+    fn the_filter_only_looks_at_the_current_folder() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "main");
+        assert!(app.rows.is_empty(), "src/main.rs is in a subfolder");
+    }
+
+    #[test]
+    fn marks_survive_filtering() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        select(app, "Makefile");
+        app.update(Action::ToggleMark);
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        app.update(Action::FilterAccept);
+        assert_eq!(app.marks.len(), 1, "hidden rows stay marked");
+        assert_eq!(app.marked().size, 4096);
+        app.update(Action::FilterClear);
+        assert_eq!(app.marks.len(), 1);
+    }
+
+    #[test]
+    fn editing_keys_move_insert_and_delete_by_character() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "héllo wörld");
+        assert_eq!(app.filter.cursor, 11);
+        app.update(Action::FilterHome);
+        assert_eq!(app.filter.cursor, 0);
+        app.update(Action::FilterLeft);
+        assert_eq!(app.filter.cursor, 0, "clamped at the start");
+        app.update(Action::FilterRight);
+        app.update(Action::FilterRight);
+        type_text(app, "X");
+        assert_eq!(app.filter.query, "héXllo wörld");
+        assert_eq!(app.filter.cursor, 3);
+        app.update(Action::FilterDelete); // removes the l after the cursor
+        assert_eq!(app.filter.query, "héXlo wörld");
+        app.update(Action::FilterBackspace); // removes the X before it
+        assert_eq!(app.filter.query, "hélo wörld");
+        assert_eq!(app.filter.cursor, 2);
+        app.update(Action::FilterEnd);
+        assert_eq!(app.filter.cursor, 10);
+        app.update(Action::FilterRight);
+        assert_eq!(app.filter.cursor, 10, "clamped at the end");
+        app.update(Action::FilterDelete);
+        assert_eq!(app.filter.query, "hélo wörld", "nothing after the cursor");
+        app.update(Action::FilterHome);
+        app.update(Action::FilterBackspace);
+        assert_eq!(app.filter.query, "hélo wörld", "nothing before the cursor");
+    }
+
+    #[test]
+    fn clear_word_and_clear_line_work_like_a_shell() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "foo bar");
+        app.update(Action::FilterClearWord);
+        assert_eq!(app.filter.query, "foo ");
+        app.update(Action::FilterClearWord);
+        assert_eq!(app.filter.query, "");
+        type_text(app, "foobar");
+        app.update(Action::FilterHome);
+        for _ in 0..3 {
+            app.update(Action::FilterRight);
+        }
+        app.update(Action::FilterClearLine);
+        assert_eq!((app.filter.query.as_str(), app.filter.cursor), ("bar", 0));
+    }
+
+    #[test]
+    fn filter_actions_do_nothing_while_a_dialog_is_open() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        select(app, "Makefile");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        app.update(Action::FilterOpen);
+        assert!(!app.filter.editing);
+        app.update(Action::FilterChar('x'));
+        assert_eq!(app.filter.query, "");
+    }
+
+    #[test]
+    fn the_filter_belongs_to_the_explorer() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::GoTo(Screen::Home));
+        app.update(Action::FilterOpen);
+        assert!(!app.filter.editing);
+        app.update(Action::GoTo(Screen::Explorer));
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        app.update(Action::GoTo(Screen::Holding));
+        assert!(!app.filter.editing, "leaving stops editing");
+        assert_eq!(app.filter.query, "no", "but the filter is remembered");
+    }
+
+    #[test]
+    fn a_rescan_of_the_same_folder_keeps_the_filter() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        app.update(Action::FilterAccept);
+        app.update(Action::Rescan);
+        crate::testutil::wait_scan(app);
+        assert_eq!(app.filter.query, "no");
+        assert_eq!(names(app), ["node_modules", "notes.txt"]);
+        app.update(Action::RescanAll);
+        crate::testutil::wait_scan(app);
+        assert_eq!(app.filter.query, "no", "same folder, so the filter stays");
+        assert_eq!(names(app), ["node_modules", "notes.txt"]);
+    }
+
+    #[test]
+    fn rescanning_everything_from_a_subfolder_drops_the_filter() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        select(app, "node_modules");
+        app.update(Action::Into);
+        app.update(Action::FilterOpen);
+        type_text(app, "x");
+        app.update(Action::FilterAccept);
+        assert!(app.filter.active());
+        app.update(Action::RescanAll);
+        crate::testutil::wait_scan(app);
+        assert_eq!(app.stack.len(), 1, "back at the root");
+        assert!(!app.filter.active(), "a different folder is shown now");
+        assert_eq!(names(app).len(), 4);
+    }
+
+    #[test]
+    fn clicking_a_row_accepts_the_filter() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        set_layout(app);
+        app.update(Action::Click { x: 30, y: 4 });
+        assert!(!app.filter.editing);
+        assert_eq!(app.filter.query, "no");
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn sorting_keeps_the_filter_applied() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        app.update(Action::FilterAccept);
+        app.update(Action::CycleSort); // by size
+        assert_eq!(names(app), ["node_modules", "notes.txt"]);
+        app.update(Action::CycleSort); // by name
+        assert_eq!(names(app), ["node_modules", "notes.txt"]);
+    }
+
+    #[test]
+    fn shares_stay_relative_to_the_whole_folder() {
+        let mut e = filter_env();
+        let app = &mut e.app;
+        let before = app.weight_total();
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        assert_eq!(app.weight_total(), before);
+    }
+
+    #[test]
+    fn rows_that_appear_while_scanning_respect_the_filter() {
+        let mut e = filter_env();
+        let home = e.home.clone();
+        let app = &mut e.app;
+        app.update(Action::FilterOpen);
+        type_text(app, "no");
+        crate::testutil::write(&home.join("nothing.bin"), 4096);
+        crate::testutil::write(&home.join("other.bin"), 4096);
+        app.refresh_rows();
+        let n = names(app);
+        assert!(n.contains(&"nothing.bin".to_string()));
+        assert!(!n.contains(&"other.bin".to_string()));
+    }
+
+    #[test]
+    fn quitting_with_items_in_tobedeleted_warns_first() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        hold_two(app);
+        app.update(Action::Quit);
+        assert!(!app.should_quit);
+        match &app.dialog {
+            Some(Dialog::QuitWarning(w)) => {
+                assert_eq!(w.count, 2);
+                assert_eq!(w.usage.size, 12288 + 8192);
+            }
+            other => panic!("expected the quit warning, got {}", other.is_some()),
+        }
+        app.update(Action::Cancel);
+        assert!(app.dialog.is_none());
+        assert!(!app.should_quit, "staying is the default");
+        app.update(Action::Quit);
+        app.update(Action::Confirm);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn a_second_quit_confirms_the_warning() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        hold_two(app);
+        app.update(Action::Quit);
+        assert!(!app.should_quit);
+        app.update(Action::Quit); // Ctrl-C twice
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn quitting_with_an_empty_tobedeleted_just_quits() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        app.update(Action::Quit);
+        assert!(app.should_quit);
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn the_warning_can_open_tobedeleted_instead() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        hold_two(app);
+        app.update(Action::Quit);
+        app.update(Action::ReviewHeld);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.screen, Screen::Holding);
+        assert_eq!(app.focus, Focus::Main);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn review_held_does_nothing_without_the_warning() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        app.update(Action::ReviewHeld);
+        assert_eq!(app.screen, Screen::Explorer);
+    }
+
+    #[test]
+    fn emptying_tobedeleted_removes_the_warning() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        hold_two(app);
+        app.update(Action::GoTo(Screen::Holding));
+        app.update(Action::EmptyAll);
+        app.update(Action::Confirm);
+        settle(app);
+        app.update(Action::Cancel);
+        app.update(Action::Quit);
+        assert!(app.should_quit, "nothing left to warn about");
+    }
+
+    #[test]
+    fn items_left_by_an_earlier_run_also_warn() {
+        use crate::accounting::Accounting;
+        use crate::glyphs::{GlyphMode, Glyphs};
+        use crate::safety::Policy;
+        use crate::scan::Scanner;
+        use crate::softdelete::Holding;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let hold = base.join("hold");
+        crate::testutil::write(&home.join("old.bin"), 5000);
+        let policy = Policy::new(&home, &hold);
+        Holding::open(hold.clone())
+            .unwrap()
+            .move_in(&policy, &home.join("old.bin"), Usage::new(5000, 8192))
+            .unwrap();
+        let scanner = Scanner::new(2);
+        let root = scanner.scan_root(&home);
+        let mut app = App::new(
+            scanner,
+            root,
+            policy,
+            Holding::open(hold).unwrap(),
+            Accounting::new(0),
+            Glyphs::new(GlyphMode::Nerd),
+            false,
+        );
+        app.update(Action::Quit);
+        assert!(!app.should_quit);
+        assert!(matches!(app.dialog, Some(Dialog::QuitWarning(_))));
     }
 }

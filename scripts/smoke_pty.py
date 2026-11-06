@@ -192,6 +192,14 @@ def send(data):
     os.write(fd, data)
 
 
+def pid_alive():
+    try:
+        done, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return False
+    return done == 0
+
+
 def step(name):
     print("step:", name)
 
@@ -206,6 +214,19 @@ wait_for("j/k choose")
 send(b"j")
 wait_for("marked: 0 items")
 send(b"\r")
+
+step("filter: / opens the box, typing filters, Enter keeps it, Esc clears it")
+send(b"/")
+send(b"pro")
+wait_for("/ pro")
+wait_gone("note.txt")
+send(b"\r")
+pump(0.3)
+assert "esc clears" in screen.text(), "an accepted filter says how to clear it"
+assert "note.txt" not in screen.text(), "the filter stays applied after Enter"
+send(b"\x1b")
+wait_for("note.txt")
+wait_gone("esc clears")
 
 step("explorer, wait for the scan, jump to the top row (the biggest: proj)")
 send(b"2")
@@ -246,9 +267,18 @@ assert not os.path.exists(os.path.join(home, "proj")), "proj should have been mo
 payloads = glob.glob(os.path.join(home, "ToBeDeleted", "items", "*", "payload"))
 assert len(payloads) == 1, f"expected one held payload, got {payloads}"
 
-step("holding screen and restore")
-send(b"\r")  # dismiss the notice
+step("quit warns while something is in ToBeDeleted, and Esc stays")
+send(b"\r")  # dismiss the "moved" note first
 wait_gone("pending, not freed yet")
+wait_for("pending (1)")
+send(b"q")
+wait_for("still holds 1 item")
+wait_for("Quit anyway")
+send(b"\x1b")
+wait_gone("still holds 1 item")
+assert pid_alive(), "Esc must keep the app running"
+
+step("holding screen and restore")
 send(b"3")
 wait_for("1 items")
 send(b"r")

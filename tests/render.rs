@@ -423,11 +423,21 @@ fn drawing_records_whether_the_terminal_is_too_small() {
 }
 
 fn find_text(app: &mut App, w: u16, h: u16, needle: &str) -> Option<ratatui::style::Style> {
+    find_cell(app, w, h, needle, 0)
+}
+
+/// The style of the cell `offset` characters into the first occurrence of
+/// `needle` (scanning top to bottom, left to right).
+fn find_cell(
+    app: &mut App,
+    w: u16,
+    h: u16,
+    needle: &str,
+    offset: usize,
+) -> Option<ratatui::style::Style> {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| ui::draw(f, app)).unwrap();
     let buf = term.backend().buffer().clone();
-    let symbols: Vec<&str> = needle.chars().map(|_| "").collect();
-    let _ = symbols;
     let needle_chars: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
     for y in 0..buf.area.height {
         for x in 0..buf.area.width.saturating_sub(needle_chars.len() as u16) {
@@ -436,7 +446,7 @@ fn find_text(app: &mut App, w: u16, h: u16, needle: &str) -> Option<ratatui::sty
                 .enumerate()
                 .all(|(i, c)| buf[(x + i as u16, y)].symbol() == c)
             {
-                let cell = &buf[(x, y)];
+                let cell = &buf[(x + offset as u16, y)];
                 return Some(Style::default().fg(cell.fg).add_modifier(cell.modifier));
             }
         }
@@ -860,5 +870,258 @@ fn emptying_shows_a_deleting_dialog_with_a_progress_bar() {
         }
         e.app.update(Action::Tick);
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+const FILTER_FILES: &[(&str, usize)] = &[
+    ("node_modules/x", 20480),
+    ("notes.txt", 8192),
+    ("src/main.rs", 12288),
+    ("Makefile", 4096),
+];
+
+fn filter_app(mode: GlyphMode) -> Env {
+    let mut e = make_app(FILTER_FILES, mode);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    e
+}
+
+fn type_filter(app: &mut App, text: &str) {
+    app.update(Action::FilterOpen);
+    for c in text.chars() {
+        app.update(Action::FilterChar(c));
+    }
+}
+
+fn any_reversed(app: &mut App, w: u16, h: u16) -> bool {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| ui::draw(f, app)).unwrap();
+    term.backend()
+        .buffer()
+        .content()
+        .iter()
+        .any(|c| c.modifier.contains(ratatui::style::Modifier::REVERSED))
+}
+
+#[test]
+fn the_filter_box_shows_while_typing_with_a_match_count() {
+    let mut e = filter_app(GlyphMode::Nerd);
+    type_filter(&mut e.app, "no");
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("/ no"), "{text}");
+    assert!(text.contains("2/4"), "{text}");
+    assert!(
+        text.contains("notes.txt") && text.contains("node_modules"),
+        "{text}"
+    );
+    assert!(!text.contains("Makefile"), "filtered out:\n{text}");
+    assert!(!text.contains("main.rs"), "{text}");
+}
+
+#[test]
+fn the_filter_box_stays_after_enter_and_says_how_to_clear_it() {
+    let mut e = filter_app(GlyphMode::Nerd);
+    type_filter(&mut e.app, "no");
+    e.app.update(Action::FilterAccept);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("/ no"), "{text}");
+    assert!(text.contains("2/4"), "{text}");
+    assert!(text.contains("esc clears"), "{text}");
+    assert!(!text.contains("Makefile"), "{text}");
+}
+
+#[test]
+fn there_is_no_filter_box_without_a_filter() {
+    let mut e = filter_app(GlyphMode::Nerd);
+    let plain = render(&mut e.app, 120, 30);
+    assert!(
+        !plain.contains("esc clears") && !plain.contains("/4"),
+        "{plain}"
+    );
+    let rows_plain = e.app.layout.list_rows;
+    type_filter(&mut e.app, "no");
+    render(&mut e.app, 120, 30);
+    assert_eq!(
+        e.app.layout.list_rows,
+        rows_plain - 1,
+        "the box takes one row"
+    );
+    e.app.update(Action::FilterClear);
+    render(&mut e.app, 120, 30);
+    assert_eq!(e.app.layout.list_rows, rows_plain);
+}
+
+#[test]
+fn a_filter_with_no_matches_says_so() {
+    let mut e = filter_app(GlyphMode::Nerd);
+    type_filter(&mut e.app, "zzz");
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("no matches"), "{text}");
+    assert!(text.contains("0/4"), "{text}");
+}
+
+#[test]
+fn matching_letters_are_highlighted() {
+    let mut e = filter_app(GlyphMode::Nerd);
+    type_filter(&mut e.app, "no");
+    // The list row is "● notes.txt" (the graph panel has no dot), so anchor on
+    // that: offset 2 is the 'n', 3 the 'o', 4 the 't'.
+    let n = find_cell(&mut e.app, 120, 30, "● notes.txt", 2).unwrap();
+    assert_eq!(n.fg, Some(Color::Yellow), "'n' matches");
+    assert!(n.add_modifier.contains(ratatui::style::Modifier::BOLD));
+    let o = find_cell(&mut e.app, 120, 30, "● notes.txt", 3).unwrap();
+    assert_eq!(o.fg, Some(Color::Yellow), "'o' matches");
+    let t = find_cell(&mut e.app, 120, 30, "● notes.txt", 4).unwrap();
+    assert_ne!(t.fg, Some(Color::Yellow), "'t' does not match");
+}
+
+#[test]
+fn nothing_is_highlighted_without_a_filter() {
+    let mut e = filter_app(GlyphMode::Nerd);
+    let n = find_cell(&mut e.app, 120, 30, "● notes.txt", 2).unwrap();
+    assert_ne!(n.fg, Some(Color::Yellow));
+}
+
+#[test]
+fn the_editing_cursor_is_a_reversed_cell() {
+    let mut e = filter_app(GlyphMode::Nerd);
+    assert!(!any_reversed(&mut e.app, 120, 30));
+    type_filter(&mut e.app, "no");
+    assert!(any_reversed(&mut e.app, 120, 30), "cursor while editing");
+    e.app.update(Action::FilterAccept);
+    assert!(
+        !any_reversed(&mut e.app, 120, 30),
+        "no cursor once accepted"
+    );
+}
+
+#[test]
+fn the_filter_is_ascii_clean_in_ascii_mode() {
+    let mut e = filter_app(GlyphMode::Ascii);
+    type_filter(&mut e.app, "no");
+    for c in render_cells(&mut e.app, 120, 30) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+    e.app.update(Action::FilterAccept);
+    for c in render_cells(&mut e.app, 120, 30) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+#[test]
+fn the_graphs_follow_the_filter() {
+    for mode in [GraphMode::Bars, GraphMode::Treemap] {
+        let mut e = filter_app(GlyphMode::Nerd);
+        e.app.graph = mode;
+        type_filter(&mut e.app, "no");
+        let text = render(&mut e.app, 130, 30);
+        assert!(text.contains("selected: node_modules"), "{mode:?}\n{text}");
+        assert!(!text.contains("Makefile"), "{mode:?}\n{text}");
+    }
+}
+
+#[test]
+fn footers_explain_the_filter_keys() {
+    let mut e = filter_app(GlyphMode::Nerd);
+    let text = render(&mut e.app, 150, 30);
+    assert!(text.contains("/ filter"), "{text}");
+    type_filter(&mut e.app, "no");
+    let text = render(&mut e.app, 150, 30);
+    assert!(
+        text.contains("enter accept") && text.contains("esc clear"),
+        "{text}"
+    );
+    e.app.update(Action::FilterAccept);
+    let text = render(&mut e.app, 150, 30);
+    assert!(text.contains("/ edit filter"), "{text}");
+}
+
+#[test]
+fn a_long_query_does_not_break_the_layout() {
+    let mut e = filter_app(GlyphMode::Nerd);
+    type_filter(&mut e.app, &"abc日本 ".repeat(40));
+    let cells = render_cells(&mut e.app, 90, 20);
+    assert_eq!(cells.len(), 90 * 20);
+    let tiny = render_cells(&mut e.app, 61, 14);
+    assert_eq!(tiny.len(), 61 * 14);
+}
+
+fn with_held_item() -> Env {
+    let mut e = explorer(GlyphMode::Nerd);
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..500 {
+        if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
+            break;
+        }
+        e.app.update(Action::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e.app.update(Action::Cancel);
+    e
+}
+
+#[test]
+fn sidebar_says_when_tobedeleted_is_empty() {
+    let mut e = explorer(GlyphMode::Nerd);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains(" empty"), "{text}");
+    assert!(!text.contains("pending ("), "{text}");
+    assert!(text.contains("\u{f014}"), "outline trash icon:\n{text}");
+    assert!(!text.contains("\u{f1f8}"), "{text}");
+}
+
+#[test]
+fn sidebar_shows_a_count_and_a_full_icon_when_it_holds_something() {
+    let mut e = with_held_item();
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("pending (1)"), "{text}");
+    assert!(text.contains("\u{f1f8}"), "full trash icon:\n{text}");
+    assert!(!text.contains("\u{f014}"), "{text}");
+    let icon = find_text(&mut e.app, 120, 30, "\u{f1f8}").unwrap();
+    assert_eq!(icon.fg, Some(Color::Yellow), "stands out");
+}
+
+#[test]
+fn the_sidebar_indicator_is_ascii_in_ascii_mode() {
+    let mut e = explorer(GlyphMode::Ascii);
+    for c in render_cells(&mut e.app, 120, 30) {
+        assert!(c.is_ascii(), "{c:?}");
+    }
+    let empty = render(&mut e.app, 120, 30);
+    assert!(empty.contains(" empty"), "{empty}");
+}
+
+#[test]
+fn quitting_with_items_shows_the_warning_dialog() {
+    let mut e = with_held_item();
+    e.app.update(Action::Quit);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("still holds 1 item"), "{text}");
+    assert!(text.contains("not freed"), "{text}");
+    assert!(text.contains("1.5 KB (4.1 KB on disk)"), "{text}");
+    for key in ["[ e ]", "[ q ]", "[ Esc ]"] {
+        assert!(text.contains(key), "missing {key}:\n{text}");
+    }
+}
+
+#[test]
+fn the_quit_warning_is_ascii_in_ascii_mode() {
+    let mut e = explorer(GlyphMode::Ascii);
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..500 {
+        if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
+            break;
+        }
+        e.app.update(Action::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e.app.update(Action::Cancel);
+    e.app.update(Action::Quit);
+    for c in render_cells(&mut e.app, 120, 30) {
+        assert!(c.is_ascii(), "{c:?}");
     }
 }

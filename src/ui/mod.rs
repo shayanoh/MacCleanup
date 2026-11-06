@@ -261,7 +261,25 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    let hints: &[&str] = if app.focus == Focus::Sidebar {
+    let editing_filter = app.screen == Screen::Explorer && app.filter.editing;
+    let hints: &[&str] = if editing_filter {
+        &[
+            "type to filter",
+            "up/down move",
+            "enter accept",
+            "esc clear",
+            "ctrl-u wipe",
+        ]
+    } else if app.screen == Screen::Explorer && app.filter.active() && app.focus == Focus::Main {
+        &[
+            "j/k move",
+            "/ edit filter",
+            "esc clear filter",
+            "space mark",
+            "d review & delete",
+            "q quit",
+        ]
+    } else if app.focus == Focus::Sidebar {
         &[
             "j/k choose",
             "enter open",
@@ -281,6 +299,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Screen::Explorer => &[
                 "j/k move",
                 "h/l out/in",
+                "/ filter",
                 "space mark",
                 "d review & delete",
                 "r/R rescan",

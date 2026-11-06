@@ -85,6 +85,16 @@ impl Glyphs {
         }
     }
 
+    /// The ToBeDeleted icon: an empty outline, or a full one when it holds items.
+    pub fn trash(&self, full: bool) -> &'static str {
+        match (self.mode, full) {
+            (GlyphMode::Nerd, true) => "\u{f1f8}",
+            (GlyphMode::Nerd, false) => "\u{f014}",
+            (GlyphMode::Ascii, true) => "#",
+            (GlyphMode::Ascii, false) => "o",
+        }
+    }
+
     /// Sort-order arrows for column headers.
     pub fn sort_asc(&self) -> &'static str {
         self.pick("▲", "^")
@@ -134,6 +144,8 @@ mod tests {
             g.nav(7),
             g.sort_asc(),
             g.sort_desc(),
+            g.trash(false),
+            g.trash(true),
         ];
         v.extend(g.spinner().iter().copied());
         v

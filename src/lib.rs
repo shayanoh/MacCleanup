@@ -2,6 +2,7 @@ pub mod accounting;
 pub mod anim;
 pub mod app;
 pub mod cli;
+pub mod filter;
 pub mod fmt;
 pub mod glyphs;
 pub mod input;

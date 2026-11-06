@@ -8,6 +8,8 @@ A colorful, animated terminal app (Rust TUI) for macOS that shows where your dis
 
 - **Home:** live free-space gauge, pending (soft-deleted) space, scan activity, and the biggest folders. Every size is shown both as logical size and as space actually used on disk (for example `1.5 KB (4.1 KB on disk)`), because on-disk size is what a delete frees.
 - **Disk explorer:** a multithreaded scan of your home folder (or `--root`) with live sizes. Each row shows logical size, real on-disk size and a share bar. Browse with vim-style keys or the mouse, sort by on-disk size, size or name, mark items, then review and delete.
+- **Filter:** `/` opens a filter box above the list and typing narrows the current folder's list as you type, fzf-style: space-separated terms must all match, each term is a fuzzy match that ignores case unless you type a capital, and `'exact`, `^prefix`, `suffix$` and `!exclude` work too. Matched letters are highlighted, the sort order is kept, and the box shows how many rows match. `Enter` returns to the list with the filter kept, `/` edits it again, `Esc` clears it. Going into or out of a folder clears it.
+- **ToBeDeleted indicator and quit warning:** the menu shows when ToBeDeleted is empty and, when it holds something, lights its icon and shows how many items are waiting. Quitting with items still in it asks first (`e` opens it, `q` quits anyway, `Esc` stays).
 - **Always responsive:** every move and every permanent delete runs in the background with a live progress bar (by bytes, so one huge folder still moves it). Big trees are deleted in parallel. Quitting while a delete runs waits for it to finish.
 - **Soft delete:** "delete" moves items to `~/ToBeDeleted` (or `--holding-dir`). Browse that folder, restore items to where they came from, delete items for good, or empty it. Moved files count as **pending**, not freed, because nothing is freed until the folder is emptied.
 - **Unique vs shared space:** under the list, the selected folder or file shows what deleting it actually **frees** (every hard link to those files is inside it) and what it **shares** with hard links elsewhere, which stays on disk. This is what to look at for pnpm's `node_modules`, which hard-links into the pnpm store. The review dialog sums it for everything you marked ("frees about X; Y is shared and stays"). It does not depend on which folder the scanner happened to credit first.
@@ -50,6 +52,7 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `j` / `k`, arrows | Move down / up |
 | `h` / `l`, `Enter` | Go out of / into a folder |
 | `g` / `G` (or `Home` / `End`), `PageUp` / `PageDown` | Jump to top / bottom, page |
+| `/` | Filter the current folder's list (`Enter` keeps it, `/` edits it, `Esc` clears it) |
 | `space` | Mark or unmark the selected item |
 | `d` | Review marked items, then delete |
 | `t` | Cycle graph type: bars, treemap, hidden |
@@ -59,7 +62,7 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `Tab` | Switch focus between the menu and the list (the menu has focus at startup: `j`/`k` choose a screen, `Enter` opens it) |
 | `1` `2` `3` | Home, Explorer, ToBeDeleted |
 | `r` / `D` / `E` (ToBeDeleted screen) | Restore / delete for good / empty all |
-| `q`, `Esc` | Quit (`Esc` goes up a folder first) |
+| `q`, `Esc` | Quit (`Esc` first clears an active filter, then goes up a folder; quitting asks first if ToBeDeleted still holds items) |
 | mouse | Click rows and menu entries, scroll with the wheel |
 
 In the review dialog: `Enter` moves items to ToBeDeleted, `x` offers "move, then empty now" (irreversible), `Esc` cancels. Irreversible actions need an explicit `y`; `Enter` never confirms them.

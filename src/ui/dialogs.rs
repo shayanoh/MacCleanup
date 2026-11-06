@@ -10,7 +10,7 @@ use super::{
     safety_dot, safety_word,
 };
 use crate::anim;
-use crate::app::{App, DeleteProgress, Dialog, FinishInfo, ForeverTarget, Review};
+use crate::app::{App, DeleteProgress, Dialog, FinishInfo, ForeverTarget, QuitWarning, Review};
 use crate::fmt::{both_usage, eighths_bar, human_size};
 use crate::glyphs::Glyphs;
 use crate::jobs::Phase;
@@ -28,6 +28,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     };
     match &app.dialog {
         None => {}
+        Some(Dialog::QuitWarning(w)) => quit_warning(frame, area, g, w, scale),
         Some(Dialog::Review(r)) => review(frame, area, g, r, scale),
         Some(Dialog::Irreversible(r)) => irreversible(frame, area, g, r, scale),
         Some(Dialog::ConfirmForever(t)) => confirm_forever(frame, area, g, t, scale),
@@ -101,6 +102,37 @@ fn key_line<'a>(g: &Glyphs, keys: &[(&str, &str)]) -> Line<'a> {
         spans.push(Span::raw(format!(" {what}")));
     }
     Line::from(spans)
+}
+
+fn quit_warning(frame: &mut Frame, area: Rect, g: &Glyphs, w: &QuitWarning, scale: f64) {
+    let Some(inner) = popup(
+        frame,
+        area,
+        g,
+        &format!("{} Before you quit", g.warn()),
+        CAUTION,
+        area.width.saturating_sub(4).min(76),
+        9,
+        scale,
+    ) else {
+        return;
+    };
+    let items = if w.count == 1 {
+        "1 item".to_string()
+    } else {
+        format!("{} items", w.count)
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("ToBeDeleted still holds {items}: {}.", both_usage(w.usage)),
+            Style::default().fg(CAUTION).add_modifier(Modifier::BOLD),
+        )),
+        Line::from("Their space is not freed until you empty it."),
+        Line::raw(""),
+        key_line(g, &[("e", "Open ToBeDeleted"), ("q", "Quit anyway")]),
+        key_line(g, &[("Esc", "Stay")]),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {

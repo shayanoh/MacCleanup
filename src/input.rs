@@ -15,6 +15,9 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
             || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'));
         return quit.then_some(Action::Quit);
     }
+    if app.filter.editing && app.dialog.is_none() {
+        return filter_key(key);
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Some(Action::Quit),
@@ -28,11 +31,14 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
     }
     match key.code {
         KeyCode::Char('q') => Some(Action::Quit),
-        KeyCode::Esc => Some(if app.stack.len() > 1 {
+        KeyCode::Esc => Some(if app.filter.active() {
+            Action::FilterClear
+        } else if app.stack.len() > 1 {
             Action::Out
         } else {
             Action::Quit
         }),
+        KeyCode::Char('/') if app.screen == Screen::Explorer => Some(Action::FilterOpen),
         KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
         KeyCode::Char('h') | KeyCode::Left => Some(Action::Out),
@@ -61,8 +67,40 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
     }
 }
 
+/// Keys while the filter box has the keyboard: everything printable is text.
+fn filter_key(key: KeyEvent) -> Option<Action> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char('c') if ctrl => Some(Action::Quit),
+        KeyCode::Char('u') if ctrl => Some(Action::FilterClearLine),
+        KeyCode::Char('w') if ctrl => Some(Action::FilterClearWord),
+        KeyCode::Char(_) if ctrl || alt => None,
+        KeyCode::Char(c) => Some(Action::FilterChar(c)),
+        KeyCode::Enter => Some(Action::FilterAccept),
+        KeyCode::Esc => Some(Action::FilterClear),
+        KeyCode::Backspace => Some(Action::FilterBackspace),
+        KeyCode::Delete => Some(Action::FilterDelete),
+        KeyCode::Left => Some(Action::FilterLeft),
+        KeyCode::Right => Some(Action::FilterRight),
+        KeyCode::Home => Some(Action::FilterHome),
+        KeyCode::End => Some(Action::FilterEnd),
+        KeyCode::Up => Some(Action::Up),
+        KeyCode::Down => Some(Action::Down),
+        KeyCode::PageUp => Some(Action::PageUp),
+        KeyCode::PageDown => Some(Action::PageDown),
+        _ => None,
+    }
+}
+
 fn dialog_key(code: KeyCode, dialog: &Dialog) -> Option<Action> {
     match dialog {
+        Dialog::QuitWarning(_) => match code {
+            KeyCode::Char('q') | KeyCode::Char('y') => Some(Action::Confirm),
+            KeyCode::Char('e') => Some(Action::ReviewHeld),
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Enter => Some(Action::Cancel),
+            _ => None,
+        },
         Dialog::Review(_) => match code {
             KeyCode::Enter => Some(Action::Confirm),
             KeyCode::Char('x') => Some(Action::ConfirmIrreversible),
@@ -319,5 +357,143 @@ mod tests {
         e.app.update(Action::GoTo(Screen::Holding));
         assert_eq!(map_key(ch('r'), &e.app), Some(Action::RestoreSelected));
         assert_eq!(map_key(ch('R'), &e.app), None);
+    }
+
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.update(Action::FilterChar(c));
+        }
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn slash_opens_the_filter_only_in_the_explorer() {
+        let mut e = env(FILES);
+        assert_eq!(map_key(ch('/'), &e.app), Some(Action::FilterOpen));
+        e.app.update(Action::GoTo(Screen::Home));
+        assert_eq!(map_key(ch('/'), &e.app), None);
+        e.app.update(Action::GoTo(Screen::Holding));
+        assert_eq!(map_key(ch('/'), &e.app), None);
+    }
+
+    #[test]
+    fn while_editing_every_character_is_text() {
+        let mut e = env(FILES);
+        e.app.update(Action::FilterOpen);
+        for c in [
+            'q', 'j', 'k', '/', ' ', 'd', 'G', '1', 'r', 'R', 'x', 'y', 'n', 'é', '日',
+        ] {
+            assert_eq!(map_key(ch(c), &e.app), Some(Action::FilterChar(c)), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn editing_control_keys() {
+        let mut e = env(FILES);
+        e.app.update(Action::FilterOpen);
+        let app = &e.app;
+        let table: Vec<(KeyEvent, Option<Action>)> = vec![
+            (key(KeyCode::Enter), Some(Action::FilterAccept)),
+            (key(KeyCode::Esc), Some(Action::FilterClear)),
+            (key(KeyCode::Backspace), Some(Action::FilterBackspace)),
+            (key(KeyCode::Delete), Some(Action::FilterDelete)),
+            (key(KeyCode::Left), Some(Action::FilterLeft)),
+            (key(KeyCode::Right), Some(Action::FilterRight)),
+            (key(KeyCode::Home), Some(Action::FilterHome)),
+            (key(KeyCode::End), Some(Action::FilterEnd)),
+            (key(KeyCode::Up), Some(Action::Up)),
+            (key(KeyCode::Down), Some(Action::Down)),
+            (key(KeyCode::PageUp), Some(Action::PageUp)),
+            (key(KeyCode::PageDown), Some(Action::PageDown)),
+            (key(KeyCode::Tab), None),
+            (ctrl('u'), Some(Action::FilterClearLine)),
+            (ctrl('w'), Some(Action::FilterClearWord)),
+            (ctrl('c'), Some(Action::Quit)),
+            (ctrl('x'), None),
+            (KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT), None),
+        ];
+        for (k, expected) in table {
+            assert_eq!(map_key(k, app), expected, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn esc_clears_an_active_filter_before_going_out_or_quitting() {
+        let mut e = env(FILES);
+        e.app.update(Action::FilterOpen);
+        typed(&mut e.app, "a");
+        e.app.update(Action::FilterAccept);
+        assert_eq!(
+            map_key(key(KeyCode::Esc), &e.app),
+            Some(Action::FilterClear)
+        );
+        assert_eq!(
+            map_key(ch('q'), &e.app),
+            Some(Action::Quit),
+            "q still quits"
+        );
+        assert_eq!(
+            map_key(ch('/'), &e.app),
+            Some(Action::FilterOpen),
+            "/ edits it"
+        );
+        e.app.update(Action::FilterClear);
+        assert_eq!(map_key(key(KeyCode::Esc), &e.app), Some(Action::Quit));
+
+        // Deeper in the tree: first Esc clears the filter, the next goes out.
+        e.app.update(Action::Into);
+        e.app.update(Action::FilterOpen);
+        typed(&mut e.app, "f");
+        e.app.update(Action::FilterAccept);
+        assert_eq!(
+            map_key(key(KeyCode::Esc), &e.app),
+            Some(Action::FilterClear)
+        );
+        e.app.update(Action::FilterClear);
+        assert_eq!(map_key(key(KeyCode::Esc), &e.app), Some(Action::Out));
+    }
+
+    #[test]
+    fn the_filter_keys_are_blocked_on_a_too_small_terminal() {
+        let mut e = env(FILES);
+        e.app.too_small = true;
+        assert_eq!(map_key(ch('/'), &e.app), None);
+    }
+
+    #[test]
+    fn quit_warning_keys() {
+        let mut e = env(FILES);
+        select(&mut e.app, "b.bin");
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        crate::testutil::settle(&mut e.app);
+        e.app.update(Action::Cancel);
+        e.app.update(Action::Quit);
+        assert!(matches!(
+            e.app.dialog,
+            Some(crate::app::Dialog::QuitWarning(_))
+        ));
+        let app = &e.app;
+        assert_eq!(map_key(ch('q'), app), Some(Action::Confirm));
+        assert_eq!(map_key(ch('y'), app), Some(Action::Confirm));
+        assert_eq!(map_key(ch('e'), app), Some(Action::ReviewHeld));
+        assert_eq!(map_key(key(KeyCode::Esc), app), Some(Action::Cancel));
+        assert_eq!(map_key(ch('n'), app), Some(Action::Cancel));
+        assert_eq!(
+            map_key(key(KeyCode::Enter), app),
+            Some(Action::Cancel),
+            "Enter stays"
+        );
+        assert_eq!(map_key(ch('x'), app), None);
+        assert_eq!(map_key(ch('j'), app), None);
+        assert_eq!(
+            map_key(ctrl('c'), app),
+            Some(Action::Quit),
+            "Ctrl-C twice quits"
+        );
     }
 }

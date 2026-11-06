@@ -10,6 +10,7 @@ use super::{
 };
 use crate::anim;
 use crate::app::{App, GraphMode, SortBy};
+use crate::filter::{self, Query};
 use crate::fmt::{both_usage, eighths_bar, human_size};
 use crate::scan::Row;
 
@@ -42,11 +43,13 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = panel(&g, title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.height < 6 || inner.width < 24 {
+    // The filter box takes one row above the header while it is shown.
+    let filter_h = u16::from(app.filter.visible());
+    if inner.height < 6 + filter_h || inner.width < 24 {
         return;
     }
-    app.layout.list_top = inner.y + 2;
-    app.layout.list_rows = inner.height - 5;
+    app.layout.list_top = inner.y + 2 + filter_h;
+    app.layout.list_rows = inner.height - 5 - filter_h;
     app.ensure_visible();
 
     // Status line: live scan activity.
@@ -74,6 +77,15 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         Paragraph::new(status),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
+
+    // Filter box.
+    if filter_h > 0 {
+        frame.render_widget(
+            Paragraph::new(filter_line(app, inner.width as usize)),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
+    let query = filter::parse(&app.filter.query);
 
     // Column layout.
     let icon_w = text_width(g.folder()).max(text_width(g.file()));
@@ -125,21 +137,31 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     ]);
     frame.render_widget(
         Paragraph::new(header),
-        Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        Rect::new(inner.x, inner.y + 1 + filter_h, inner.width, 1),
     );
 
     // Rows.
     let list_rows = app.layout.list_rows as usize;
-    let list_area = Rect::new(inner.x, inner.y + 2, inner.width, app.layout.list_rows);
+    let list_area = Rect::new(
+        inner.x,
+        inner.y + 2 + filter_h,
+        inner.width,
+        app.layout.list_rows,
+    );
     let total = app.weight_total().max(1);
     let start = app.offset.min(app.rows.len());
     let end = (start + list_rows).min(app.rows.len());
     let mut lines: Vec<Line> = app.rows[start..end]
         .iter()
         .enumerate()
-        .map(|(i, row)| row_line(app, start + i, row, total, name_w, icon_w, mark_w))
+        .map(|(i, row)| row_line(app, &query, start + i, row, total, name_w, icon_w, mark_w))
         .collect();
-    if app.rows.is_empty() {
+    if app.rows.is_empty() && app.filter.active() {
+        lines.push(Line::from(Span::styled(
+            "(nothing matches the filter)",
+            Style::default().fg(DIM),
+        )));
+    } else if app.rows.is_empty() {
         let msg = if app.current().is_done() {
             "(empty)".to_string()
         } else {
@@ -179,6 +201,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
 #[allow(clippy::too_many_arguments)]
 fn row_line<'a>(
     app: &App,
+    query: &Query,
     idx: usize,
     row: &Row,
     total: u64,
@@ -218,7 +241,7 @@ fn row_line<'a>(
         eighths_bar(app.weight(&r) as f64 / total as f64, 8, g)
     };
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!("{cursor} "), Style::default().fg(ACCENT)),
         Span::styled(format!("{mark} "), Style::default().fg(Color::Magenta)),
         Span::styled(format!("{icon} "), Style::default().fg(ACCENT)),
@@ -226,7 +249,15 @@ fn row_line<'a>(
             format!("{} ", safety_dot(g, safety)),
             Style::default().fg(safety_color(safety)),
         ),
-        Span::styled(fit_pad(&name, name_w, g), name_style),
+    ];
+    // The name, with the letters the filter matched picked out.
+    spans.extend(highlight_spans(
+        &fit_pad(&name, name_w, g),
+        &query.matches(&name).unwrap_or_default(),
+        name_style,
+        name_style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    ));
+    spans.extend([
         Span::styled(
             format!(" {}", right(&human_size(r.size), 9)),
             value_style(app.sort == SortBy::Size),
@@ -237,6 +268,7 @@ fn row_line<'a>(
         ),
         Span::styled(format!(" {share}"), Style::default().fg(Color::Yellow)),
     ]);
+    let line = Line::from(spans);
     if selected {
         line.style(Style::default().bg(SELECTED_BG))
     } else {
@@ -286,4 +318,89 @@ fn detail_lines<'a>(app: &App, width: usize) -> Vec<Line<'a>> {
             Style::default().fg(Color::Yellow),
         )),
     ]
+}
+
+/// Split `text` into spans, styling the characters at `positions`.
+fn highlight_spans(
+    text: &str,
+    positions: &[usize],
+    base: Style,
+    highlight: Style,
+) -> Vec<Span<'static>> {
+    if positions.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_highlighted = false;
+    for (i, c) in text.chars().enumerate() {
+        let highlighted = positions.binary_search(&i).is_ok();
+        if highlighted != run_highlighted && !run.is_empty() {
+            let style = if run_highlighted { highlight } else { base };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        run_highlighted = highlighted;
+        run.push(c);
+    }
+    if !run.is_empty() {
+        let style = if run_highlighted { highlight } else { base };
+        spans.push(Span::styled(run, style));
+    }
+    spans
+}
+
+/// The filter box: `/ query` with a reversed cursor while typing, and on the
+/// right how many rows match (or that none do).
+fn filter_line(app: &App, width: usize) -> Line<'static> {
+    let g = &app.glyphs;
+    let f = &app.filter;
+    let count = format!("{}/{}", app.rows.len(), app.all_rows.len());
+    let mut right_text = if f.active() && app.rows.is_empty() {
+        format!("no matches {count}")
+    } else {
+        count
+    };
+    if !f.editing {
+        right_text.push_str("  esc clears");
+    }
+    let right_color = if f.active() && app.rows.is_empty() {
+        Color::Red
+    } else {
+        DIM
+    };
+
+    let avail = width.saturating_sub(text_width(&right_text) + 3).max(1);
+    let chars: Vec<char> = f.query.chars().collect();
+    // Scroll the query so the cursor stays in view.
+    let cursor = f.cursor.min(chars.len());
+    let start = (cursor + 1).saturating_sub(avail).min(chars.len());
+    let shown: Vec<char> = chars[start..].to_vec();
+    let at = cursor - start;
+
+    let mut spans = vec![Span::styled(
+        "/ ",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )];
+    let text_style = Style::default().fg(Color::White);
+    if f.editing {
+        let before: String = shown[..at.min(shown.len())].iter().collect();
+        let under = shown.get(at).copied().unwrap_or(' ');
+        let after: String = shown.iter().skip(at + 1).collect();
+        spans.push(Span::styled(before, text_style));
+        spans.push(Span::styled(
+            under.to_string(),
+            text_style.add_modifier(Modifier::REVERSED),
+        ));
+        spans.push(Span::styled(after, text_style));
+    } else {
+        spans.push(Span::styled(shown.iter().collect::<String>(), text_style));
+    }
+    let used: usize = spans.iter().map(|s| text_width(&s.content)).sum();
+    let gap = width.saturating_sub(used + text_width(&right_text));
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.push(Span::styled(
+        fit(&right_text, width.saturating_sub(used), g),
+        Style::default().fg(right_color),
+    ));
+    Line::from(spans)
 }
