@@ -25,7 +25,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let active = entry.screen == Some(app.screen);
+            // Looking inside an image or volume is still the Docker page.
+            let here = if app.screen == Screen::DockerFiles {
+                Screen::Docker
+            } else {
+                app.screen
+            };
+            let active = entry.screen == Some(here);
             let is_holding = entry.screen == Some(Screen::Holding);
             let marker = if active { g.cursor() } else { " " };
             let icon = if is_holding {

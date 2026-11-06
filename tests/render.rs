@@ -2373,7 +2373,12 @@ const DOCKER_CONTEXT: &str = include_str!("fixtures/docker/context_inspect.json"
 struct FakeDocker {
     df: String,
     running: bool,
+    /// File listings (of a volume or image) fail.
+    no_listing: bool,
 }
+
+const BROWSE_ROOT: &str =
+    "d\t4096\t1700000000\tsub dir\0f\t12\t1700000100\tb.txt\0f\t2048000\t1700000200\tbig.db\0";
 
 impl maccleanup::catalog::CommandRunner for FakeDocker {
     fn run(
@@ -2401,6 +2406,9 @@ impl maccleanup::catalog::CommandRunner for FakeDocker {
         if full.contains("/_ping") && !self.running {
             return None;
         }
+        if full.contains("--entrypoint sh") && !self.no_listing {
+            return Some(BROWSE_ROOT.to_string());
+        }
         answers
             .iter()
             .find(|(k, _)| full.contains(k))
@@ -2412,6 +2420,16 @@ impl maccleanup::catalog::CommandRunner for FakeDocker {
 }
 
 fn docker_screen_with(mode: GlyphMode, df: &str, running: bool, vm_disk: bool) -> Env {
+    docker_screen_full(mode, df, running, vm_disk, false)
+}
+
+fn docker_screen_full(
+    mode: GlyphMode,
+    df: &str,
+    running: bool,
+    vm_disk: bool,
+    no_listing: bool,
+) -> Env {
     let mut e = make_app_with(&[("a.txt", 10)], mode, |home| {
         if vm_disk {
             let raw = home.join("Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw");
@@ -2422,6 +2440,7 @@ fn docker_screen_with(mode: GlyphMode, df: &str, running: bool, vm_disk: bool) -
     e.app.runner = std::sync::Arc::new(FakeDocker {
         df: df.to_string(),
         running,
+        no_listing,
     });
     e.app.update(Action::GoTo(Screen::Docker));
     for _ in 0..2000 {
@@ -2745,4 +2764,75 @@ fn docker_finish_says_unchanged_when_the_trim_gave_nothing_back() {
     }
     let t = render(&mut e.app, 150, 40);
     assert!(t.contains("unchanged"), "{t}");
+}
+
+/// The Docker page with its volume `pgdata` opened in the file browser.
+fn docker_browsing(mode: GlyphMode, no_listing: bool) -> Env {
+    let mut e = docker_screen_full(mode, DOCKER_DF, true, false, no_listing);
+    docker_cursor(&mut e, "volume:pgdata");
+    e.app.update(Action::Browse);
+    for _ in 0..2000 {
+        e.app.update(Action::Tick);
+        if e.app.docker.browse.as_ref().is_some_and(|b| !b.loading()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e
+}
+
+#[test]
+fn docker_file_browser_lists_names_sizes_and_dates() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    let t = render(&mut e.app, 120, 30);
+    for want in [
+        "volume pgdata",
+        "sub dir",
+        "b.txt",
+        "big.db",
+        "2.0 MB",
+        "4.1 KB",
+        "3 items",
+        "ago",
+        "read-only",
+    ] {
+        assert!(t.contains(want), "missing {want:?}:\n{t}");
+    }
+    let header = t
+        .lines()
+        .find(|l| l.contains("Name") && l.contains("Modified"))
+        .unwrap_or_else(|| panic!("no header:\n{t}"));
+    assert!(header.find("Name") < header.find("Size"));
+    assert!(header.find("Size") < header.find("Modified"));
+    let first = t.lines().position(|l| l.contains("sub dir")).unwrap();
+    let file = t.lines().position(|l| l.contains("b.txt")).unwrap();
+    assert!(first < file, "folders come first:\n{t}");
+}
+
+#[test]
+fn docker_file_browser_says_why_a_listing_failed() {
+    let mut e = docker_browsing(GlyphMode::Nerd, true);
+    let t = render(&mut e.app, 120, 30);
+    assert!(t.contains("Docker did not answer"), "{t}");
+}
+
+#[test]
+fn docker_file_browser_is_ascii_in_ascii_mode() {
+    let mut e = docker_browsing(GlyphMode::Ascii, false);
+    for c in render_cells(&mut e.app, 120, 30) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+#[test]
+fn docker_file_browser_filter_row_and_path_follow_the_folder() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    e.app.update(Action::FilterOpen);
+    e.app.update(Action::FilterChar('i'));
+    e.app.update(Action::FilterChar('g'));
+    let t = render(&mut e.app, 120, 30);
+    assert!(
+        t.contains("big.db") && !t.contains("b.txt") && !t.contains("sub dir"),
+        "{t}"
+    );
 }

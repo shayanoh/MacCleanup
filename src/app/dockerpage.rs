@@ -7,10 +7,12 @@ use super::*;
 use crate::docker::analysis::{
     ItemKind, Refusal, TRIM_ITEM, blockers, frees_of_set, removal_order,
 };
+use crate::docker::browse::BrowseState;
 use crate::docker::cli::{DockerCli, vm_disk_allocated};
 use crate::docker::model::ItemId;
 use crate::docker::state::DockerLoad;
 use crate::docker::view::{DKind, DSection};
+use crate::docker::vmtools::BrowseSource;
 
 /// Is this key in the shared selection one of Docker's?
 pub fn is_docker_id(id: &str) -> bool {
@@ -114,12 +116,16 @@ impl App {
         self.docker_refilter();
     }
 
-    /// `l`: open the folded line under the cursor.
+    /// `l` / Enter: open the folded line under the cursor; on an image or
+    /// volume with nothing to unfold, look inside it.
     pub(super) fn docker_into(&mut self) {
-        if let Some(l) = self.docker.selected().cloned()
-            && l.open == Some(false)
-        {
+        let Some(l) = self.docker.selected().cloned() else {
+            return;
+        };
+        if l.open == Some(false) {
             self.docker_set_open(&l.key, true);
+        } else if l.open.is_none() && matches!(l.kind, DKind::Image | DKind::Volume) {
+            self.docker_browse();
         }
     }
 
@@ -420,6 +426,148 @@ impl App {
     }
 }
 
+impl App {
+    /// `b` (or Enter on an image or volume with nothing to unfold): look
+    /// inside it, read-only. Containers cannot be listed without starting
+    /// them, so they are refused.
+    pub(super) fn docker_browse(&mut self) {
+        let Some(line) = self.docker.selected().cloned() else {
+            return;
+        };
+        let name = self
+            .docker
+            .facts(&line.key)
+            .map(|f| f.name.clone())
+            .unwrap_or_default();
+        let (source, label) = match line.kind {
+            DKind::Image => (
+                BrowseSource::Image(line.key.strip_prefix("image:").unwrap_or(&line.key).into()),
+                format!("image {name}"),
+            ),
+            DKind::Volume => (BrowseSource::Volume(name.clone()), format!("volume {name}")),
+            DKind::Container => {
+                self.notice = Some(
+                    "A container cannot be listed without starting it: look inside its image or its volumes"
+                        .to_string(),
+                );
+                return;
+            }
+            _ => {
+                self.notice = Some("Only images and volumes can be looked into".to_string());
+                return;
+            }
+        };
+        let Some(load) = &self.docker.load else {
+            return;
+        };
+        let (cli, ready) = (load.cli.clone(), load.vm_tools);
+        let mut state = BrowseState::new(source, label);
+        state.start(&cli, "/", ready);
+        self.docker.browse = Some(state);
+        self.goto(Screen::DockerFiles);
+        self.focus = Focus::Main;
+    }
+
+    /// Esc in the file browser: back to the Docker page (no new read).
+    pub(super) fn docker_close_browse(&mut self) {
+        if self.screen != Screen::DockerFiles {
+            return;
+        }
+        self.reset_filter();
+        self.filter.editing = false;
+        self.screen = Screen::Docker;
+        self.transition_start = self.tick;
+        self.docker_refilter();
+    }
+
+    fn list_dir(&mut self, dir: &str) {
+        let Some(load) = &self.docker.load else {
+            return;
+        };
+        let (cli, ready) = (load.cli.clone(), load.vm_tools);
+        if let Some(b) = &mut self.docker.browse {
+            let ready = ready || b.listed_once;
+            b.start(&cli, dir, ready);
+        }
+    }
+
+    pub(super) fn browse_move(&mut self, delta: i64) {
+        if let Some(b) = &mut self.docker.browse {
+            b.cursor = step(b.cursor, delta, b.shown.len());
+        }
+        self.ensure_visible();
+    }
+
+    /// A click on list row `row`: select it, or open it when it is already
+    /// selected.
+    pub(super) fn browse_click(&mut self, row: usize) {
+        let Some(b) = &mut self.docker.browse else {
+            return;
+        };
+        let idx = b.offset + row;
+        if idx >= b.shown.len() {
+            return;
+        }
+        if idx == b.cursor {
+            self.browse_into();
+        } else {
+            b.cursor = idx;
+        }
+    }
+
+    pub(super) fn browse_refilter(&mut self) {
+        let query = crate::filter::parse(&self.filter.query);
+        if let Some(b) = &mut self.docker.browse {
+            b.refilter(&query);
+        }
+        self.ensure_visible();
+    }
+
+    pub(super) fn browse_reload(&mut self) {
+        let dir = self.docker.browse.as_ref().map(|b| b.dir.clone());
+        if let Some(dir) = dir {
+            self.list_dir(&dir);
+        }
+    }
+
+    /// Open the folder under the cursor (files do nothing).
+    pub(super) fn browse_into(&mut self) {
+        let next = self.docker.browse.as_ref().and_then(|b| {
+            b.selected()
+                .filter(|e| e.is_dir)
+                .map(|e| b.child_dir(&e.name))
+        });
+        if let Some(dir) = next {
+            self.reset_filter();
+            self.list_dir(&dir);
+        }
+    }
+
+    /// Up one folder; at the top, back to the Docker page.
+    pub(super) fn browse_out(&mut self) {
+        let up = self
+            .docker
+            .browse
+            .as_ref()
+            .map(|b| (b.dir != "/").then(|| b.parent_dir()));
+        match up {
+            Some(Some(dir)) => {
+                self.reset_filter();
+                self.list_dir(&dir);
+            }
+            Some(None) => self.docker_close_browse(),
+            None => {}
+        }
+    }
+
+    pub(super) fn poll_browse(&mut self) {
+        let query = crate::filter::parse(&self.filter.query);
+        if let Some(b) = &mut self.docker.browse {
+            b.poll(&query);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,7 +863,7 @@ mod tests {
             ("/_ping", "OK"),
             ("/system/df", DF),
             ("/containers/json?all=1", CONTAINERS),
-            ("image inspect", "1"),
+            ("image inspect", crate::docker::vmtools::VERSION),
         ]));
         let mut e = loaded_with(fake);
         mark(&mut e.app, "container:c0ffee2");
@@ -932,6 +1080,197 @@ mod tests {
 
     fn finish_of_none(app: &App) -> bool {
         !matches!(&app.dialog, Some(Dialog::Finish(f)) if f.vm_disk.is_some())
+    }
+
+    // --- browsing inside volumes and images ---------------------------
+
+    const ROOT_LISTING: &str =
+        "d\t4096\t1700000000\tsub\0f\t12\t1700000100\tb.txt\0f\t5\t1700000200\ta.txt\0";
+    const SUB_LISTING: &str = "f\t7\t1700000300\tinner.txt\0";
+
+    fn browsing_fake() -> Arc<FakeRunner> {
+        Arc::new(FakeRunner::new(&["docker"]).answering(&[
+            ("context inspect", CONTEXT),
+            ("/_ping", "OK"),
+            ("/system/df", DF),
+            ("/containers/json?all=1", CONTAINERS),
+            ("/images/sha256:aaa1/history", HISTORY),
+            ("/images/sha256:aaa1/json", INSPECT),
+            // The longer path first: the first matching key answers.
+            ("sh /data/sub", SUB_LISTING),
+            ("sh /data", ROOT_LISTING),
+            ("--entrypoint sh sha256:bbb2 -c", ROOT_LISTING),
+        ]))
+    }
+
+    fn wait_browse(app: &mut App) {
+        for _ in 0..2000 {
+            app.update(Action::Tick);
+            if app.docker.browse.as_ref().is_some_and(|b| !b.loading()) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("listing did not finish");
+    }
+
+    fn browse_names(app: &App) -> Vec<String> {
+        let b = app.docker.browse.as_ref().unwrap();
+        b.shown.iter().map(|&i| b.all[i].name.clone()).collect()
+    }
+
+    #[test]
+    fn b_opens_the_volume_browser_and_lists_it_in_the_background() {
+        let mut e = loaded_with(browsing_fake());
+        cursor_on(&mut e.app, "volume:pgdata");
+        e.app.update(Action::Browse);
+        assert_eq!(e.app.screen, Screen::DockerFiles);
+        assert!(e.app.docker.browse.as_ref().unwrap().loading());
+        wait_browse(&mut e.app);
+        assert_eq!(
+            browse_names(&e.app),
+            ["sub", "a.txt", "b.txt"],
+            "folders first"
+        );
+        let b = e.app.docker.browse.as_ref().unwrap();
+        assert_eq!(b.dir, "/");
+        assert_eq!(b.all[0].size, 4096);
+    }
+
+    #[test]
+    fn enter_descends_into_a_folder_and_h_climbs_back() {
+        let mut e = loaded_with(browsing_fake());
+        cursor_on(&mut e.app, "volume:pgdata");
+        e.app.update(Action::Browse);
+        wait_browse(&mut e.app);
+        e.app.update(Action::Into); // the cursor is on "sub"
+        wait_browse(&mut e.app);
+        assert_eq!(browse_names(&e.app), ["inner.txt"]);
+        assert_eq!(e.app.docker.browse.as_ref().unwrap().dir, "/sub");
+        e.app.update(Action::Out);
+        wait_browse(&mut e.app);
+        assert_eq!(e.app.docker.browse.as_ref().unwrap().dir, "/");
+        assert_eq!(browse_names(&e.app).len(), 3);
+        // A file cannot be entered.
+        e.app.update(Action::Down);
+        e.app.update(Action::Into);
+        assert_eq!(e.app.docker.browse.as_ref().unwrap().dir, "/");
+    }
+
+    #[test]
+    fn closing_the_browser_returns_to_the_docker_page_without_reading_again() {
+        let mut e = loaded_with(browsing_fake());
+        cursor_on(&mut e.app, "volume:pgdata");
+        let reads = e.app.docker.job.spawned;
+        e.app.update(Action::Browse);
+        wait_browse(&mut e.app);
+        e.app.update(Action::CloseBrowse);
+        assert_eq!(e.app.screen, Screen::Docker);
+        assert_eq!(e.app.docker.job.spawned, reads);
+    }
+
+    #[test]
+    fn containers_layers_and_sections_cannot_be_browsed() {
+        let mut e = loaded_with(browsing_fake());
+        for key in ["container:c0ffee2", "layer:sha256:aaa1:0", "section:cache"] {
+            cursor_on(&mut e.app, key);
+            e.app.update(Action::Browse);
+            assert_eq!(e.app.screen, Screen::Docker, "{key}");
+            assert!(e.app.notice.is_some(), "{key}");
+        }
+    }
+
+    #[test]
+    fn browsing_never_marks_reviews_or_removes_anything() {
+        let fake = browsing_fake();
+        let mut e = loaded_with(fake.clone());
+        cursor_on(&mut e.app, "volume:pgdata");
+        e.app.update(Action::Browse);
+        wait_browse(&mut e.app);
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::OpenReview);
+        assert!(e.app.tool_marks.is_empty());
+        assert!(e.app.dialog.is_none());
+        assert!(
+            fake.calls().iter().all(|c| !c.display().contains(" rm ")),
+            "only the helper build ran"
+        );
+    }
+
+    #[test]
+    fn an_image_is_listed_from_the_image_itself_and_never_builds_the_helper() {
+        let fake = browsing_fake();
+        let mut e = loaded_with(fake.clone());
+        cursor_on(&mut e.app, "image:sha256:bbb2");
+        e.app.update(Action::Browse);
+        wait_browse(&mut e.app);
+        assert_eq!(browse_names(&e.app), ["sub", "a.txt", "b.txt"]);
+        assert!(
+            fake.calls().is_empty(),
+            "no helper image needed for an image"
+        );
+    }
+
+    #[test]
+    fn a_missing_helper_image_is_built_before_a_volume_is_listed() {
+        let fake = browsing_fake();
+        let mut e = loaded_with(fake.clone());
+        cursor_on(&mut e.app, "volume:pgdata");
+        e.app.update(Action::Browse);
+        wait_browse(&mut e.app);
+        let ran = fake.calls();
+        assert_eq!(ran.len(), 1);
+        assert!(
+            ran[0]
+                .display()
+                .contains("build -q -t maccleanup/vm-tools -")
+        );
+    }
+
+    #[test]
+    fn a_listing_that_fails_shows_why_and_keeps_the_page_usable() {
+        let fake = Arc::new(FakeRunner::new(&["docker"]).answering(&[
+            ("context inspect", CONTEXT),
+            ("/_ping", "OK"),
+            ("/system/df", DF),
+            ("/containers/json?all=1", CONTAINERS),
+        ]));
+        let mut e = loaded_with(fake);
+        cursor_on(&mut e.app, "image:sha256:bbb2");
+        e.app.update(Action::Browse);
+        wait_browse(&mut e.app);
+        let b = e.app.docker.browse.as_ref().unwrap();
+        assert!(b.error.as_deref().unwrap().contains("no shell"));
+        e.app.update(Action::CloseBrowse);
+        assert_eq!(e.app.screen, Screen::Docker);
+    }
+
+    #[test]
+    fn the_filter_narrows_the_listing_and_clears_when_leaving() {
+        let mut e = loaded_with(browsing_fake());
+        cursor_on(&mut e.app, "volume:pgdata");
+        e.app.update(Action::Browse);
+        wait_browse(&mut e.app);
+        e.app.filter.query = "txt".to_string();
+        e.app.refilter(false);
+        assert_eq!(browse_names(&e.app), ["a.txt", "b.txt"]);
+        e.app.update(Action::CloseBrowse);
+        assert!(!e.app.filter.active());
+    }
+
+    #[test]
+    fn the_sidebar_still_counts_docker_as_the_current_page_while_browsing() {
+        let mut e = loaded_with(browsing_fake());
+        cursor_on(&mut e.app, "volume:pgdata");
+        e.app.update(Action::Browse);
+        wait_browse(&mut e.app);
+        e.app.update(Action::FocusToggle);
+        e.app.update(Action::Down);
+        assert_eq!(
+            e.app.screen,
+            Screen::Holding,
+            "down from Docker, not from Home"
+        );
     }
 
     #[test]

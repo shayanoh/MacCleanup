@@ -43,6 +43,7 @@ pub struct DockerState {
     /// The VM-disk trim was added by marking a removal (and goes away with
     /// the last one); the user marked it themselves; or they took it off
     /// while removals were marked (then marking more does not bring it back).
+    pub browse: Option<crate::docker::browse::BrowseState>,
     pub trim_auto: bool,
     pub trim_declined: bool,
     pub detail_scroll: usize,
@@ -71,6 +72,7 @@ impl DockerState {
             offset: 0,
             stale: false,
             read_once: false,
+            browse: None,
             trim_auto: false,
             trim_declined: false,
             detail_scroll: 0,

@@ -29,6 +29,8 @@ pub enum Screen {
     Explorer,
     Targets,
     Docker,
+    /// Looking inside a Docker image or volume (opened from the Docker page).
+    DockerFiles,
     Holding,
 }
 
@@ -145,6 +147,10 @@ pub enum Action {
     Scroll(i16),
     /// Scroll the details pane of the Docker page (Shift-J / Shift-K).
     DetailScroll(i16),
+    /// Look inside the image or volume under the cursor (Docker page).
+    Browse,
+    /// Leave the file browser, back to the Docker page.
+    CloseBrowse,
     Tick,
     /// Rescan the folder being shown.
     Rescan,
@@ -703,6 +709,9 @@ impl App {
         self.held_offset = window(self.held_cursor, self.held_offset, vis);
         self.toffset = window(self.tcursor, self.toffset, vis);
         self.docker.offset = window(self.docker.cursor, self.docker.offset, vis);
+        if let Some(b) = &mut self.docker.browse {
+            b.offset = window(b.cursor, b.offset, vis);
+        }
     }
 
     /// Re-list the current directory, keeping the cursor on the same path.
@@ -749,6 +758,10 @@ impl App {
     /// Re-apply the query. While typing the selection jumps to the first
     /// match; `keep_selection` keeps the same row selected when it survives.
     fn refilter(&mut self, keep_selection: bool) {
+        if self.screen == Screen::DockerFiles {
+            self.browse_refilter();
+            return;
+        }
         if self.screen == Screen::Docker {
             self.docker_refilter();
             if !keep_selection {
@@ -785,7 +798,7 @@ impl App {
     fn filter_open(&mut self) {
         if !matches!(
             self.screen,
-            Screen::Explorer | Screen::Targets | Screen::Docker
+            Screen::Explorer | Screen::Targets | Screen::Docker | Screen::DockerFiles
         ) {
             return;
         }
@@ -982,6 +995,8 @@ impl App {
             Action::ShrinkGraph => self.graph_pct = self.graph_pct.saturating_sub(5).max(20),
             Action::CycleSort if self.screen == Screen::Docker => self.docker_cycle_sort(),
             Action::DetailScroll(by) => self.docker_scroll_details(by),
+            Action::Browse => self.docker_browse(),
+            Action::CloseBrowse => self.docker_close_browse(),
             Action::CycleSort => {
                 self.sort = match self.sort {
                     // Same order as the column headers: Name, Size, On disk,
@@ -1158,6 +1173,7 @@ impl App {
         self.process_refresh();
         self.poll_targets();
         self.poll_docker();
+        self.poll_browse();
         if self.set_space.poll() || !self.set_space.pending {
             // A review opened while the numbers were being worked out.
             if let (Some(Dialog::Review(r)), Some(j)) = (&mut self.dialog, self.set_space.value)
@@ -1234,10 +1250,9 @@ impl App {
     fn goto(&mut self, screen: Screen) {
         self.filter.editing = false;
         // The filter belongs to one list; it does not follow to another screen.
-        if (matches!(self.screen, Screen::Targets | Screen::Docker)
-            || matches!(screen, Screen::Targets | Screen::Docker))
-            && self.screen != screen
-        {
+        let own_filter =
+            |s: Screen| matches!(s, Screen::Targets | Screen::Docker | Screen::DockerFiles);
+        if (own_filter(self.screen) || own_filter(screen)) && self.screen != screen {
             self.reset_filter();
         }
         self.screen = screen;
@@ -1250,7 +1265,7 @@ impl App {
                 self.rebuild_targets();
             }
             Screen::Docker => self.reload_docker(),
-            Screen::Home => {}
+            Screen::DockerFiles | Screen::Home => {}
         }
         self.refresh_detail();
     }
@@ -1265,7 +1280,12 @@ impl App {
                     Screen::Docker,
                     Screen::Holding,
                 ];
-                let idx = order.iter().position(|s| *s == self.screen).unwrap_or(0) as i64;
+                let here = if self.screen == Screen::DockerFiles {
+                    Screen::Docker
+                } else {
+                    self.screen
+                };
+                let idx = order.iter().position(|s| *s == here).unwrap_or(0) as i64;
                 let next = (idx + delta.signum()).clamp(0, order.len() as i64 - 1) as usize;
                 if order[next] != self.screen {
                     self.goto(order[next]);
@@ -1281,6 +1301,7 @@ impl App {
                 self.ensure_visible();
             }
             (_, Screen::Docker) => self.docker_move(delta),
+            (_, Screen::DockerFiles) => self.browse_move(delta),
             (_, Screen::Targets) => {
                 self.tcursor = step(self.tcursor, delta, self.tlines.len());
                 self.ensure_visible();
@@ -1315,6 +1336,10 @@ impl App {
         if self.screen == Screen::Docker {
             self.reload_docker();
             self.notice = Some("Reading Docker again...".to_string());
+            return;
+        }
+        if self.screen == Screen::DockerFiles {
+            self.browse_reload();
             return;
         }
         if !self.scanner.is_idle() {
@@ -1366,6 +1391,10 @@ impl App {
             self.docker_into();
             return;
         }
+        if self.screen == Screen::DockerFiles {
+            self.browse_into();
+            return;
+        }
         if self.screen != Screen::Explorer {
             return;
         }
@@ -1391,6 +1420,10 @@ impl App {
         }
         if self.focus == Focus::Main && self.screen == Screen::Docker {
             self.docker_out();
+            return;
+        }
+        if self.focus == Focus::Main && self.screen == Screen::DockerFiles {
+            self.browse_out();
             return;
         }
         if self.focus != Focus::Main || self.screen != Screen::Explorer || self.stack.len() <= 1 {
@@ -1908,6 +1941,7 @@ impl App {
                     }
                 }
                 Screen::Docker => self.docker_click(i),
+                Screen::DockerFiles => self.browse_click(i),
                 Screen::Home => {}
             }
         }

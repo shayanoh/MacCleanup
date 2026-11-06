@@ -5,6 +5,7 @@
 pub mod confetti;
 pub mod dialogs;
 pub mod docker;
+pub mod docker_files;
 pub mod explorer;
 pub mod graph;
 pub mod holding;
@@ -225,6 +226,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Explorer => explorer::render(frame, main, app),
         Screen::Targets => targets::render(frame, main, app),
         Screen::Docker => docker::render(frame, main, app),
+        Screen::DockerFiles => docker_files::render(frame, main, app),
         Screen::Holding => holding::render(frame, main, app),
     }
     wipe(frame, main, app);
@@ -339,10 +341,20 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 "/ filter",
                 "space mark",
                 "d review",
+                "b look inside",
                 "J/K scroll details",
                 "r reread",
                 "s sort",
                 "tab menu",
+                "q quit",
+            ],
+            Screen::DockerFiles => &[
+                "j/k move",
+                "l/enter open folder",
+                "h up",
+                "/ filter",
+                "r reread",
+                "esc back",
                 "q quit",
             ],
             Screen::Holding => &[

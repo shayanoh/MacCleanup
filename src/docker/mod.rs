@@ -4,6 +4,7 @@
 
 pub mod analysis;
 pub mod api;
+pub mod browse;
 pub mod cli;
 pub mod model;
 pub mod remove;

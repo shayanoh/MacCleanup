@@ -7,17 +7,39 @@ use crate::docker::cli::DockerCli;
 
 pub const IMAGE: &str = "maccleanup/vm-tools";
 /// Bumped whenever [`DOCKERFILE`] changes, so an old image is rebuilt.
-pub const VERSION: &str = "1";
+pub const VERSION: &str = "2";
 /// Marks everything we create, so it is recognisable and cleanable.
 pub const LABEL: &str = "com.maccleanup=1";
 const VERSION_LABEL: &str = "com.maccleanup.version";
 
 pub const DOCKERFILE: &str = "\
-FROM alpine:3
+FROM busybox:musl
 LABEL com.maccleanup=1
-LABEL com.maccleanup.version=1
-RUN apk add --no-cache findutils
+LABEL com.maccleanup.version=2
 ENTRYPOINT [\"nsenter\", \"-t\", \"1\", \"-m\", \"-u\", \"-n\", \"-i\", \"fstrim\", \"-v\", \"/var/lib/docker\"]
+";
+
+/// Lists the folder given as `$1`: one record per entry, `kind TAB size TAB
+/// modified TAB name NUL`. A folder's size is the total of everything below
+/// it (`du`), like the Explorer's; a file's is its own. Plain POSIX shell
+/// with busybox-or-GNU `stat` and `du`, so it runs in any image that has a
+/// shell, and the NUL ending keeps every name safe. The folder is passed as
+/// an argument, never pasted into the script.
+pub const LIST_SCRIPT: &str = "\
+cd \"$1\" 2>/dev/null || exit 3
+for f in ./* ./.[!.]* ./..?*; do
+  if [ ! -e \"$f\" ] && [ ! -L \"$f\" ]; then continue; fi
+  if [ -d \"$f\" ] && [ ! -L \"$f\" ]; then
+    t=d
+    s=$(du -sk \"$f\" 2>/dev/null | cut -f1)
+    s=$(( ${s:-0} * 1024 ))
+  else
+    t=f
+    s=$(stat -c %s \"$f\" 2>/dev/null)
+  fi
+  m=$(stat -c %Y \"$f\" 2>/dev/null)
+  printf '%s\\t%s\\t%s\\t%s\\0' \"$t\" \"${s:-0}\" \"${m:-0}\" \"${f#./}\"
+done
 ";
 
 /// What to look inside.
@@ -56,8 +78,11 @@ fn clean_dir(dir: &str) -> String {
 }
 
 /// The command that lists one folder of a volume or image, read-only and
-/// without network. `dir` is a path inside it; anything that is not an
-/// absolute path without `..` is treated as `/`.
+/// without network, with [`LIST_SCRIPT`]. `dir` is a path inside it;
+/// anything that is not an absolute path without `..` is treated as `/`.
+/// A volume is mounted read-only into our helper; an image runs only its
+/// own shell with the script (its entrypoint replaced, no network, a
+/// read-only root), so none of its own programs start.
 pub fn browse_spec(cli: &DockerCli, source: &BrowseSource, dir: &str) -> CommandSpec {
     let dir = clean_dir(dir);
     match source {
@@ -75,15 +100,12 @@ pub fn browse_spec(cli: &DockerCli, source: &BrowseSource, dir: &str) -> Command
                 "-v",
                 &mount,
                 "--entrypoint",
-                "find",
+                "sh",
                 IMAGE,
+                "-c",
+                LIST_SCRIPT,
+                "sh",
                 &target,
-                "-mindepth",
-                "1",
-                "-maxdepth",
-                "1",
-                "-printf",
-                "%y\t%s\t%T@\t%f\0",
             ])
         }
         BrowseSource::Image(id) => {
@@ -98,9 +120,11 @@ pub fn browse_spec(cli: &DockerCli, source: &BrowseSource, dir: &str) -> Command
                 "--label",
                 LABEL,
                 "--entrypoint",
-                "ls",
+                "sh",
                 id,
-                "-1Ap",
+                "-c",
+                LIST_SCRIPT,
+                "sh",
                 target,
             ])
         }
@@ -132,9 +156,13 @@ mod tests {
 
     #[test]
     fn dockerfile_has_label_version_and_entrypoint() {
-        assert!(DOCKERFILE.starts_with("FROM alpine:3\n"));
+        assert!(DOCKERFILE.starts_with("FROM busybox:musl\n"));
         assert!(DOCKERFILE.contains(&format!("LABEL {LABEL}\n")));
         assert!(DOCKERFILE.contains(&format!("LABEL {VERSION_LABEL}={VERSION}\n")));
+        assert!(
+            !DOCKERFILE.contains("RUN "),
+            "busybox has every tool: nothing to install, so building needs no package download"
+        );
         assert!(DOCKERFILE.contains(
             "ENTRYPOINT [\"nsenter\", \"-t\", \"1\", \"-m\", \"-u\", \"-n\", \"-i\", \"fstrim\", \"-v\", \"/var/lib/docker\"]"
         ));
@@ -168,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_volume_mounts_read_only_without_network() {
+    fn browse_volume_mounts_read_only_without_network_and_runs_the_listing_script() {
         let spec = browse_spec(
             &cli_with(&[]),
             &BrowseSource::Volume("pgdata".into()),
@@ -181,18 +209,31 @@ mod tests {
         );
         assert!(joined.contains("-v pgdata:/data:ro"), "{joined}");
         assert!(joined.contains(&format!("--label {LABEL}")), "{joined}");
-        assert!(joined.contains("--entrypoint find"), "{joined}");
-        // The folder is a single argument, spaces and all.
         assert!(
-            spec.args.contains(&"/data/sub dir".to_string()),
-            "{:?}",
-            spec.args
+            joined.contains("--entrypoint sh maccleanup/vm-tools -c"),
+            "{joined}"
         );
-        assert!(spec.args.contains(&"-mindepth".to_string()));
+        // The script is one argument, then $0, then the folder as its own
+        // argument (never pasted into the script), spaces and all.
+        let n = spec.args.len();
+        assert_eq!(spec.args[n - 3], LIST_SCRIPT);
+        assert_eq!(spec.args[n - 2], "sh");
+        assert_eq!(spec.args[n - 1], "/data/sub dir");
     }
 
     #[test]
-    fn browse_image_runs_only_ls_read_only_without_network() {
+    fn the_listing_script_prints_nul_ended_records_with_folder_totals() {
+        assert!(LIST_SCRIPT.contains("du -sk"), "folders are summed");
+        assert!(LIST_SCRIPT.contains("stat -c %Y"), "modification time");
+        assert!(LIST_SCRIPT.contains("printf '%s\\t%s\\t%s\\t%s\\0'"));
+        assert!(
+            LIST_SCRIPT.contains("cd \"$1\""),
+            "the folder comes in as $1"
+        );
+    }
+
+    #[test]
+    fn browse_image_runs_only_the_listing_script_read_only_without_network() {
         let spec = browse_spec(
             &cli_with(&[]),
             &BrowseSource::Image("sha256:abc".into()),
@@ -201,11 +242,12 @@ mod tests {
         let joined = spec.args.join(" ");
         assert!(joined.contains("--network none"), "{joined}");
         assert!(joined.contains("--read-only"), "{joined}");
-        assert!(
-            joined.contains("--entrypoint ls sha256:abc -1Ap /etc"),
-            "{joined}"
-        );
         assert!(joined.contains("--pull=never"), "{joined}");
+        assert!(joined.contains("--entrypoint sh sha256:abc -c"), "{joined}");
+        let n = spec.args.len();
+        assert_eq!(spec.args[n - 3], LIST_SCRIPT);
+        assert_eq!(spec.args[n - 1], "/etc");
+        assert!(!joined.contains("-v "), "no volume is mounted");
     }
 
     #[test]
@@ -213,21 +255,17 @@ mod tests {
         let v = BrowseSource::Volume("v".into());
         for bad in ["", "relative", "/a/../../etc", "/..", "../x"] {
             let spec = browse_spec(&cli_with(&[]), &v, bad);
-            assert!(
-                spec.args.contains(&"/data".to_string()),
-                "{bad:?} -> {:?}",
-                spec.args
-            );
+            assert_eq!(spec.args.last().unwrap(), "/data", "{bad:?}");
         }
         let spec = browse_spec(&cli_with(&[]), &v, "/ok/deeper");
-        assert!(spec.args.contains(&"/data/ok/deeper".to_string()));
+        assert_eq!(spec.args.last().unwrap(), "/data/ok/deeper");
     }
 
     #[test]
     fn image_present_checks_the_version_label() {
-        assert!(is_present(&cli_with(&[("image inspect", "1")])));
+        assert!(is_present(&cli_with(&[("image inspect", VERSION)])));
         assert!(
-            !is_present(&cli_with(&[("image inspect", "0")])),
+            !is_present(&cli_with(&[("image inspect", "1")])),
             "old version"
         );
         assert!(!is_present(&cli_with(&[])), "no image");
