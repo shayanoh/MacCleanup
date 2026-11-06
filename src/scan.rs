@@ -1,7 +1,10 @@
-use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
+use std::iter::Sum;
+use std::ops::Add;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -9,14 +12,79 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
-use crate::usage::Usage;
-
 /// Publish partial totals after this many files so counters keep moving
 /// even while scanning one huge folder.
 const FLUSH_EVERY: u64 = 4096;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What the filesystem says about how a file's data is shared (APFS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloneFacts {
+    /// Bytes that deleting this file alone would free right now: not shared
+    /// with a clone and not held by a Time Machine local snapshot.
+    pub private: u64,
+    /// Identifies a set of files that are clones of each other.
+    pub clone_id: u64,
+    /// How many files are in that set (on the whole volume).
+    pub refcnt: u32,
+}
+
+// getattrlist(2) extended attributes (sys/attr.h). They are requested in
+// `forkattr` together with FSOPT_ATTR_CMN_EXTENDED.
+const ATTR_CMNEXT_PRIVATESIZE: u32 = 0x0000_0008;
+const ATTR_CMNEXT_CLONEID: u32 = 0x0000_0100;
+const ATTR_CMNEXT_CLONE_REFCNT: u32 = 0x0000_1000;
+const FSOPT_NOFOLLOW: libc::c_uint = 0x0000_0001;
+const FSOPT_ATTR_CMN_EXTENDED: libc::c_uint = 0x0000_0020;
+
+/// Ask macOS for a file's private size, clone id and clone count. `None` if
+/// the call fails (not APFS, file gone, permission): callers then treat the
+/// file as plain and unshared.
+pub fn clone_facts(path: &Path) -> Option<CloneFacts> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `attrlist` is plain-old-data; zero means "nothing requested".
+    let mut request: libc::attrlist = unsafe { std::mem::zeroed() };
+    request.bitmapcount = 5; // ATTR_BIT_MAP_COUNT
+    request.forkattr = ATTR_CMNEXT_PRIVATESIZE | ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_CLONE_REFCNT;
+    let mut buf = [0u8; 64];
+    // SAFETY: valid NUL-terminated path, request struct and output buffer.
+    let rc = unsafe {
+        libc::getattrlist(
+            c_path.as_ptr(),
+            (&mut request as *mut libc::attrlist).cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            FSOPT_NOFOLLOW | FSOPT_ATTR_CMN_EXTENDED,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // Packed result: u32 length, u64 private size, u64 clone id, u32 refcount.
+    let length = u32::from_ne_bytes(buf[0..4].try_into().ok()?) as usize;
+    if length < 24 {
+        return None;
+    }
+    Some(CloneFacts {
+        private: u64::from_ne_bytes(buf[4..12].try_into().ok()?),
+        clone_id: u64::from_ne_bytes(buf[12..20].try_into().ok()?),
+        refcnt: u32::from_ne_bytes(buf[20..24].try_into().ok()?),
+    })
+}
+
+/// Running totals added to a folder and all its ancestors.
+#[derive(Clone, Copy, Debug, Default)]
+struct Tally {
+    size: u64,
+    disk: u64,
+    files: u64,
+    /// Bytes freed right now by deleting these files (their private size).
+    private: u64,
+    /// Bytes of unshared files that only a local snapshot keeps alive.
+    snap: u64,
 }
 
 /// A scanned directory. Totals cover its whole subtree and grow live while
@@ -30,6 +98,8 @@ pub struct Node {
     size: AtomicU64,
     disk: AtomicU64,
     files: AtomicU64,
+    private: AtomicU64,
+    snap: AtomicU64,
     /// 1 for this directory's own listing plus one per unfinished child.
     pending: AtomicUsize,
     done: AtomicBool,
@@ -46,6 +116,8 @@ impl Node {
             size: AtomicU64::new(0),
             disk: AtomicU64::new(0),
             files: AtomicU64::new(0),
+            private: AtomicU64::new(0),
+            snap: AtomicU64::new(0),
             pending: AtomicUsize::new(1),
             done: AtomicBool::new(false),
             subdirs: Mutex::new(Vec::new()),
@@ -57,13 +129,24 @@ impl Node {
         self.size.load(Ordering::Relaxed)
     }
 
-    /// Allocated bytes on disk in the subtree (`blocks * 512`).
+    /// Allocated bytes on disk in the subtree (`blocks * 512`, each file
+    /// counted in full, hard links once).
     pub fn disk(&self) -> u64 {
         self.disk.load(Ordering::Relaxed)
     }
 
     pub fn files(&self) -> u64 {
         self.files.load(Ordering::Relaxed)
+    }
+
+    /// Bytes deleting the unshared files here would free right now.
+    pub fn private(&self) -> u64 {
+        self.private.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of unshared files kept alive only by local snapshots.
+    pub fn snapshot_held(&self) -> u64 {
+        self.snap.load(Ordering::Relaxed)
     }
 
     /// True once the whole subtree has been scanned.
@@ -79,21 +162,33 @@ impl Node {
     pub fn subdir(&self, path: &Path) -> Option<Arc<Node>> {
         lock(&self.subdirs).iter().find(|n| n.path == path).cloned()
     }
+
+    fn tally(&self) -> Tally {
+        Tally {
+            size: self.size(),
+            disk: self.disk(),
+            files: self.files(),
+            private: self.private(),
+            snap: self.snapshot_held(),
+        }
+    }
 }
 
 /// Add to a node and every ancestor.
-fn add_up(node: &Arc<Node>, size: u64, disk: u64, files: u64) {
+fn add_up(node: &Arc<Node>, t: &Tally) {
     let mut cur = Some(Arc::clone(node));
     while let Some(n) = cur {
-        n.size.fetch_add(size, Ordering::Relaxed);
-        n.disk.fetch_add(disk, Ordering::Relaxed);
-        n.files.fetch_add(files, Ordering::Relaxed);
+        n.size.fetch_add(t.size, Ordering::Relaxed);
+        n.disk.fetch_add(t.disk, Ordering::Relaxed);
+        n.files.fetch_add(t.files, Ordering::Relaxed);
+        n.private.fetch_add(t.private, Ordering::Relaxed);
+        n.snap.fetch_add(t.snap, Ordering::Relaxed);
         cur = n.parent.upgrade();
     }
 }
 
 /// Subtract from a node and every ancestor (never below zero).
-fn sub_up(node: &Arc<Node>, size: u64, disk: u64, files: u64) {
+fn sub_up(node: &Arc<Node>, t: &Tally) {
     let sub = |counter: &AtomicU64, by: u64| {
         let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(by))
@@ -101,9 +196,11 @@ fn sub_up(node: &Arc<Node>, size: u64, disk: u64, files: u64) {
     };
     let mut cur = Some(Arc::clone(node));
     while let Some(n) = cur {
-        sub(&n.size, size);
-        sub(&n.disk, disk);
-        sub(&n.files, files);
+        sub(&n.size, t.size);
+        sub(&n.disk, t.disk);
+        sub(&n.files, t.files);
+        sub(&n.private, t.private);
+        sub(&n.snap, t.snap);
         cur = n.parent.upgrade();
     }
 }
@@ -131,6 +228,46 @@ pub struct ScanStats {
     pub disk: u64,
 }
 
+/// Where a folder's disk space would go. All numbers are bytes on disk, and
+/// `footprint == frees_now + snapshots + shared_inside + shared_outside`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Space {
+    /// What the folder's files really occupy: clone data and hard links
+    /// counted once.
+    pub footprint: u64,
+    /// Freed right now if everything here were deleted.
+    pub frees_now: u64,
+    /// Kept alive only by Time Machine local snapshots; freed when they expire.
+    pub snapshots: u64,
+    /// Also referenced from outside the folder (a clone or hard link); stays.
+    pub shared_outside: u64,
+    /// Shared only among files inside the folder; goes when the whole folder
+    /// does (unless a snapshot also holds it).
+    pub shared_inside: u64,
+    /// What clones and hard links inside the folder already save.
+    pub saved: u64,
+}
+
+impl Add for Space {
+    type Output = Space;
+    fn add(self, o: Space) -> Space {
+        Space {
+            footprint: self.footprint.saturating_add(o.footprint),
+            frees_now: self.frees_now.saturating_add(o.frees_now),
+            snapshots: self.snapshots.saturating_add(o.snapshots),
+            shared_outside: self.shared_outside.saturating_add(o.shared_outside),
+            shared_inside: self.shared_inside.saturating_add(o.shared_inside),
+            saved: self.saved.saturating_add(o.saved),
+        }
+    }
+}
+
+impl Sum for Space {
+    fn sum<I: Iterator<Item = Space>>(iter: I) -> Space {
+        iter.fold(Space::default(), |a, b| a + b)
+    }
+}
+
 /// One entry shown in the explorer list.
 #[derive(Clone)]
 pub struct Row {
@@ -138,10 +275,14 @@ pub struct Row {
     pub path: PathBuf,
     pub is_dir: bool,
     pub size: u64,
+    /// For a folder with a known [`Space`] this is its footprint; otherwise
+    /// the allocation of its files summed.
     pub disk: u64,
     pub files: u64,
     pub scanning: bool,
     pub node: Option<Arc<Node>>,
+    /// Clone- and snapshot-aware numbers, known once the scan has finished.
+    pub space: Option<Space>,
 }
 
 impl Row {
@@ -150,7 +291,12 @@ impl Row {
         match &self.node {
             Some(n) => Row {
                 size: n.size(),
-                disk: n.disk(),
+                // Keep the footprint once it is known.
+                disk: if self.space.is_some() {
+                    self.disk
+                } else {
+                    n.disk()
+                },
                 files: n.files(),
                 scanning: !n.is_done(),
                 ..self.clone()
@@ -167,21 +313,59 @@ struct LinkGroup {
     nlink: u64,
     size: u64,
     disk: u64,
+    /// Bytes of the file that deleting it (all links) would free right now.
+    private: u64,
     /// The folder whose totals include this file (the first one scanned).
     counted_by: Option<PathBuf>,
     /// Every link path seen.
     paths: Vec<PathBuf>,
 }
 
-/// How a folder's on-disk space splits between files only it holds and
-/// files that also have a hard link somewhere else.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Breakdown {
-    /// Every link to these files is inside the folder: deleting it frees them.
-    pub unique: Usage,
-    /// These files also have a link outside the folder: deleting it frees
-    /// nothing for them.
-    pub shared: Usage,
+/// A set of APFS clones of each other, as far as the scan has seen them.
+struct CloneGroup {
+    /// Files in the set on the whole volume.
+    refcnt: u32,
+    /// Bytes of data the members share.
+    shared: u64,
+    /// The folder holding each member that was scanned.
+    members: Vec<Arc<Node>>,
+}
+
+const CLONE_SHARDS: u64 = 64;
+
+/// Clone sets, sharded by clone id so scan threads rarely contend.
+struct CloneTable {
+    shards: Vec<Mutex<HashMap<u64, CloneGroup>>>,
+}
+
+impl CloneTable {
+    fn new() -> Self {
+        Self {
+            shards: (0..CLONE_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn shard(&self, id: u64) -> MutexGuard<'_, HashMap<u64, CloneGroup>> {
+        lock(&self.shards[(id % CLONE_SHARDS) as usize])
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            lock(shard).clear();
+        }
+    }
+
+    /// Forget members inside `prefix` (a folder about to be rescanned).
+    fn forget_under(&self, prefix: &Path) {
+        for shard in &self.shards {
+            lock(shard).retain(|_, group| {
+                group.members.retain(|dir| !dir.path.starts_with(prefix));
+                !group.members.is_empty()
+            });
+        }
+    }
 }
 
 /// Find the scanned folder node for `dir`, walking down from `root`.
@@ -195,28 +379,72 @@ pub fn locate(root: &Arc<Node>, dir: &Path) -> Option<Arc<Node>> {
     Some(cur)
 }
 
-/// Unique/shared for a single file: a hard-linked file frees nothing when
-/// one link is removed.
-pub fn file_breakdown(path: &Path) -> std::io::Result<Breakdown> {
+/// Space numbers for a single file, asked of the filesystem directly. A
+/// hard-linked file frees nothing when one link is removed; a clone's shared
+/// data stays while its partners exist.
+pub fn file_space(path: &Path) -> io::Result<Space> {
     let md = fs::symlink_metadata(path)?;
-    let usage = Usage::new(md.len(), md.blocks() * 512);
-    Ok(if md.is_file() && md.nlink() > 1 {
-        Breakdown {
-            unique: Usage::default(),
-            shared: usage,
+    let alloc = md.blocks() * 512;
+    let mut space = Space {
+        footprint: alloc,
+        ..Space::default()
+    };
+    if md.is_file() && md.nlink() > 1 {
+        space.shared_outside = alloc;
+    } else if md.is_file() && alloc > 0 {
+        match clone_facts(path) {
+            Some(f) => {
+                let private = f.private.min(alloc);
+                space.frees_now = private;
+                if f.refcnt > 1 {
+                    space.shared_outside = alloc - private;
+                } else {
+                    space.snapshots = alloc - private;
+                }
+            }
+            None => space.frees_now = alloc,
         }
     } else {
-        Breakdown {
-            unique: usage,
-            shared: Usage::default(),
+        space.frees_now = alloc;
+    }
+    Ok(space)
+}
+
+/// Accumulates one folder's [`Space`] while the clone and link tables are
+/// read once for many folders.
+#[derive(Default)]
+struct Acc {
+    disk: u64,
+    private: u64,
+    snap: u64,
+    frees_links: u64,
+    snap_links: u64,
+    inside: u64,
+    outside: u64,
+    saved_clones: u64,
+    saved_links: u64,
+    extra_links: u64,
+}
+
+impl Acc {
+    fn finish(self) -> Space {
+        Space {
+            // Hard-linked data credited to another folder is not in `disk`.
+            footprint: (self.disk + self.extra_links).saturating_sub(self.saved_clones),
+            frees_now: self.private + self.frees_links,
+            snapshots: self.snap + self.snap_links,
+            shared_outside: self.outside,
+            shared_inside: self.inside,
+            saved: self.saved_clones + self.saved_links,
         }
-    })
+    }
 }
 
 struct Shared {
-    /// Every hard-linked file seen, by (device, inode). Kept so the explorer
-    /// can tell space unique to a folder from space shared with other places.
+    /// Every hard-linked file seen, by (device, inode).
     links: Mutex<HashMap<(u64, u64), LinkGroup>>,
+    /// Every APFS clone set with more than one member.
+    clones: CloneTable,
     denied: Mutex<Vec<PathBuf>>,
     threads: Mutex<HashSet<ThreadId>>,
     files_seen: AtomicU64,
@@ -248,6 +476,7 @@ impl Scanner {
             pool,
             shared: Arc::new(Shared {
                 links: Mutex::new(HashMap::new()),
+                clones: CloneTable::new(),
                 denied: Mutex::new(Vec::new()),
                 threads: Mutex::new(HashSet::new()),
                 files_seen: AtomicU64::new(0),
@@ -274,7 +503,9 @@ impl Scanner {
 
     /// List one directory's entries. Sub-directories carry their live node
     /// (or `node: None, scanning: true` if not yet discovered); files are
-    /// stat'ed directly.
+    /// stat'ed directly. Once the whole scan is done, folder rows also carry
+    /// their clone- and snapshot-aware [`Space`], worked out for all of them
+    /// in one pass.
     pub fn list_children(&self, dir: &Arc<Node>) -> Vec<Row> {
         let Ok(rd) = fs::read_dir(&dir.path) else {
             return Vec::new();
@@ -299,6 +530,7 @@ impl Scanner {
                         files: n.files(),
                         scanning: !n.is_done(),
                         node: Some(Arc::clone(n)),
+                        space: None,
                     }),
                     None => rows.push(Row {
                         name,
@@ -310,6 +542,7 @@ impl Scanner {
                         // A different device (mount point) is never scanned.
                         scanning: md.dev() == dir.dev,
                         node: None,
+                        space: None,
                     }),
                 }
             } else {
@@ -322,10 +555,110 @@ impl Scanner {
                     files: 1,
                     scanning: false,
                     node: None,
+                    space: None,
                 });
             }
         }
+        if self.is_idle() {
+            self.fill_spaces(dir, &mut rows);
+        }
         rows
+    }
+
+    /// Give every folder row its [`Space`] and make its `disk` the footprint.
+    fn fill_spaces(&self, dir: &Arc<Node>, rows: &mut [Row]) {
+        let nodes: Vec<Arc<Node>> = rows.iter().filter_map(|r| r.node.clone()).collect();
+        if nodes.is_empty() {
+            return;
+        }
+        let index: HashMap<&OsStr, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.name.as_os_str(), i))
+            .collect();
+        // A path belongs to the child folder named by its first component
+        // below `dir`; files directly in `dir` belong to no child.
+        let locate = |p: &Path| -> Option<usize> {
+            let rel = p.strip_prefix(&dir.path).ok()?;
+            let first = rel.components().next()?;
+            index.get(first.as_os_str()).copied()
+        };
+        let mut spaces = self.compute(&nodes, &locate).into_iter();
+        for row in rows.iter_mut().filter(|r| r.node.is_some()) {
+            if let Some(space) = spaces.next() {
+                row.disk = space.footprint;
+                row.space = Some(space);
+            }
+        }
+    }
+
+    /// Where one folder's disk space would go: what deleting it frees now,
+    /// what only snapshots hold, and what is shared by clone or hard link.
+    /// Only complete once the whole scan has finished.
+    pub fn space(&self, node: &Arc<Node>) -> Space {
+        let locate = |p: &Path| p.starts_with(&node.path).then_some(0);
+        self.compute(std::slice::from_ref(node), &locate)
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// Read the clone and hard-link tables once and work out the [`Space`]
+    /// of every node. `locate` says which node (by index) a path belongs to.
+    fn compute(&self, nodes: &[Arc<Node>], locate: &dyn Fn(&Path) -> Option<usize>) -> Vec<Space> {
+        let mut acc: Vec<Acc> = nodes
+            .iter()
+            .map(|n| Acc {
+                disk: n.disk(),
+                private: n.private(),
+                snap: n.snapshot_held(),
+                ..Acc::default()
+            })
+            .collect();
+        let mut counts: HashMap<usize, u64> = HashMap::new();
+
+        for shard in &self.shared.clones.shards {
+            for group in lock(shard).values() {
+                counts.clear();
+                for dir in &group.members {
+                    if let Some(i) = locate(&dir.path) {
+                        *counts.entry(i).or_default() += 1;
+                    }
+                }
+                for (&i, &members) in &counts {
+                    let a = &mut acc[i];
+                    if members >= u64::from(group.refcnt) {
+                        a.inside += group.shared;
+                    } else {
+                        a.outside += group.shared;
+                    }
+                    a.saved_clones += group.shared.saturating_mul(members - 1);
+                }
+            }
+        }
+
+        for group in lock(&self.shared.links).values() {
+            counts.clear();
+            for path in &group.paths {
+                if let Some(i) = locate(path) {
+                    *counts.entry(i).or_default() += 1;
+                }
+            }
+            let credited = group.counted_by.as_deref().and_then(locate);
+            for (&i, &links) in &counts {
+                let a = &mut acc[i];
+                if credited != Some(i) {
+                    a.extra_links += group.disk;
+                }
+                if links >= group.nlink {
+                    a.frees_links += group.private;
+                    a.snap_links += group.disk - group.private;
+                } else {
+                    a.outside += group.disk;
+                }
+                a.saved_links += group.disk.saturating_mul(links - 1);
+            }
+        }
+        acc.into_iter().map(Acc::finish).collect()
     }
 
     /// Drop the hard-link entries inside a rescanned folder. A file that this
@@ -358,49 +691,17 @@ impl Scanner {
         }
         for (dir, size, disk) in handoffs {
             if let Some(owner) = locate(&top, &dir) {
-                add_up(&owner, size, disk, 1);
+                let t = Tally {
+                    size,
+                    disk,
+                    files: 1,
+                    ..Tally::default()
+                };
+                add_up(&owner, &t);
                 self.shared.files_seen.fetch_add(1, Ordering::Relaxed);
                 self.shared.bytes_seen.fetch_add(size, Ordering::Relaxed);
                 self.shared.disk_seen.fetch_add(disk, Ordering::Relaxed);
             }
-        }
-    }
-
-    /// Split a folder's space into what only it holds (deleting it frees
-    /// this) and what is shared with hard links elsewhere (this stays).
-    /// Independent of which folder the scanner happened to credit first.
-    pub fn breakdown(&self, node: &Arc<Node>) -> Breakdown {
-        let total = Usage::new(node.size(), node.disk());
-        let mut credited_here = Usage::default();
-        let mut unique_links = Usage::default();
-        let mut shared = Usage::default();
-        for group in lock(&self.shared.links).values() {
-            let inside = group
-                .paths
-                .iter()
-                .filter(|p| p.starts_with(&node.path))
-                .count() as u64;
-            if inside == 0 {
-                continue;
-            }
-            let usage = Usage::new(group.size, group.disk);
-            if group
-                .counted_by
-                .as_deref()
-                .is_some_and(|dir| dir.starts_with(&node.path))
-            {
-                credited_here += usage;
-            }
-            if inside >= group.nlink {
-                unique_links += usage;
-            } else {
-                shared += usage;
-            }
-        }
-        // Plain files plus hard-linked files whose every link is inside.
-        Breakdown {
-            unique: total.saturating_sub(credited_here) + unique_links,
-            shared,
         }
     }
 
@@ -411,6 +712,7 @@ impl Scanner {
             return None;
         }
         lock(&self.shared.links).clear();
+        self.shared.clones.clear();
         lock(&self.shared.denied).clear();
         for counter in [
             &self.shared.files_seen,
@@ -432,20 +734,21 @@ impl Scanner {
         let Some(parent) = node.parent.upgrade() else {
             return self.rescan_all(&node.path);
         };
-        let (size, disk, files) = (node.size(), node.disk(), node.files());
+        let old = node.tally();
 
         // Forget what the old subtree contributed.
-        sub_up(&parent, size, disk, files);
+        sub_up(&parent, &old);
         for (counter, by) in [
-            (&self.shared.files_seen, files),
-            (&self.shared.bytes_seen, size),
-            (&self.shared.disk_seen, disk),
+            (&self.shared.files_seen, old.files),
+            (&self.shared.bytes_seen, old.size),
+            (&self.shared.disk_seen, old.disk),
         ] {
             let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(by))
             });
         }
         self.forget_links_under(node, &parent);
+        self.shared.clones.forget_under(&node.path);
         lock(&self.shared.denied).retain(|p| !p.starts_with(&node.path));
 
         // Swap in a fresh node and mark every ancestor unfinished until the
@@ -537,16 +840,16 @@ fn scan_dir(shared: &Arc<Shared>, node: &Arc<Node>) {
             return;
         }
     };
-    let (mut size, mut disk, mut files) = (0u64, 0u64, 0u64);
-    let flush = |size: &mut u64, disk: &mut u64, files: &mut u64| {
-        if *files == 0 && *size == 0 {
+    let mut tally = Tally::default();
+    let flush = |t: &mut Tally| {
+        if t.files == 0 && t.size == 0 {
             return;
         }
-        add_up(node, *size, *disk, *files);
-        shared.files_seen.fetch_add(*files, Ordering::Relaxed);
-        shared.bytes_seen.fetch_add(*size, Ordering::Relaxed);
-        shared.disk_seen.fetch_add(*disk, Ordering::Relaxed);
-        (*size, *disk, *files) = (0, 0, 0);
+        add_up(node, t);
+        shared.files_seen.fetch_add(t.files, Ordering::Relaxed);
+        shared.bytes_seen.fetch_add(t.size, Ordering::Relaxed);
+        shared.disk_seen.fetch_add(t.disk, Ordering::Relaxed);
+        *t = Tally::default();
     };
     for entry in rd {
         let Ok(entry) = entry else { continue };
@@ -567,38 +870,89 @@ fn scan_dir(shared: &Arc<Shared>, node: &Arc<Node>) {
             let sh = Arc::clone(shared);
             rayon::spawn(move || walk(sh, child));
         } else {
-            if md.nlink() > 1 && md.is_file() {
-                let mut links = lock(&shared.links);
-                let group = links
-                    .entry((md.dev(), md.ino()))
-                    .or_insert_with(|| LinkGroup {
-                        nlink: md.nlink(),
-                        size: md.len(),
-                        disk: md.blocks() * 512,
-                        counted_by: None,
-                        paths: Vec::new(),
-                    });
-                group.paths.push(entry.path());
-                if group.counted_by.is_some() {
+            let alloc = md.blocks() * 512;
+            let is_file = md.is_file();
+            let (mut private, mut snap) = (0u64, 0u64);
+            if is_file && md.nlink() > 1 {
+                // Hard-linked: count the data once, and keep every link so
+                // folders can tell shared from unique. Whether it frees
+                // anything depends on the folder, so no private/snapshot
+                // numbers go into the running totals here.
+                let key = (md.dev(), md.ino());
+                let path = entry.path();
+                let first_sight = match lock(&shared.links).get_mut(&key) {
+                    Some(group) => {
+                        group.paths.push(path.clone());
+                        false
+                    }
+                    None => true,
+                };
+                if !first_sight {
                     continue; // hard link already counted
                 }
-                group.counted_by = Some(node.path.clone());
+                let private_part = if alloc > 0 {
+                    clone_facts(&path).map_or(alloc, |f| f.private.min(alloc))
+                } else {
+                    0
+                };
+                match lock(&shared.links).entry(key) {
+                    Entry::Occupied(mut e) => {
+                        e.get_mut().paths.push(path);
+                        continue; // another thread got there first
+                    }
+                    Entry::Vacant(v) => {
+                        v.insert(LinkGroup {
+                            nlink: md.nlink(),
+                            size: md.len(),
+                            disk: alloc,
+                            private: private_part,
+                            counted_by: Some(node.path.clone()),
+                            paths: vec![path],
+                        });
+                    }
+                }
+            } else if is_file && alloc > 0 {
+                match clone_facts(&entry.path()) {
+                    Some(f) => {
+                        private = f.private.min(alloc);
+                        let shared_part = alloc - private;
+                        if f.refcnt > 1 && shared_part > 0 {
+                            let mut shard = shared.clones.shard(f.clone_id);
+                            let group = shard.entry(f.clone_id).or_insert_with(|| CloneGroup {
+                                refcnt: f.refcnt,
+                                shared: 0,
+                                members: Vec::new(),
+                            });
+                            group.refcnt = group.refcnt.max(f.refcnt);
+                            group.shared = group.shared.max(shared_part);
+                            group.members.push(Arc::clone(node));
+                        } else {
+                            // Not cloned, yet not fully private: a local
+                            // snapshot still holds these blocks.
+                            snap = shared_part;
+                        }
+                    }
+                    None => private = alloc,
+                }
+            } else {
+                private = alloc; // empty files, symlinks and the like
             }
-            size += md.len();
-            disk += md.blocks() * 512;
-            files += 1;
-            if files >= FLUSH_EVERY {
-                flush(&mut size, &mut disk, &mut files);
+            tally.size += md.len();
+            tally.disk += alloc;
+            tally.files += 1;
+            tally.private += private;
+            tally.snap += snap;
+            if tally.files >= FLUSH_EVERY {
+                flush(&mut tally);
             }
         }
     }
-    flush(&mut size, &mut disk, &mut files);
+    flush(&mut tally);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usage::Usage;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -955,82 +1309,6 @@ mod tests {
     }
 
     #[test]
-    fn breakdown_of_a_plain_folder_is_all_unique() {
-        let dir = tempfile::tempdir().unwrap();
-        write(&dir.path().join("a/f1"), 5000);
-        write(&dir.path().join("a/f2"), 6000);
-        let (s, root) = scan(dir.path(), 2);
-        let a = root.subdir(&dir.path().join("a")).unwrap();
-        let b = s.breakdown(&a);
-        assert_eq!(b.shared, Usage::default());
-        assert_eq!(b.unique, Usage::new(a.size(), a.disk()));
-    }
-
-    #[test]
-    fn breakdown_splits_shared_hard_links_whichever_thread_won() {
-        // store/pkg is hard-linked into proj/nm/pkg; proj/nm/own is a plain file.
-        // Which folder the scanner credits with pkg is a race; the breakdown
-        // must not depend on it.
-        for _ in 0..6 {
-            let dir = tempfile::tempdir().unwrap();
-            let r = dir.path();
-            write(&r.join("store/pkg"), 8192);
-            write(&r.join("proj/nm/own"), 4096);
-            link(r, "store/pkg", "proj/nm/pkg");
-            let (s, root) = scan(r, 4);
-            let proj = root.subdir(&r.join("proj")).unwrap();
-            let store = root.subdir(&r.join("store")).unwrap();
-
-            let bp = s.breakdown(&proj);
-            assert_eq!((bp.unique.size, bp.shared.size), (4096, 8192), "proj");
-            let bs = s.breakdown(&store);
-            assert_eq!((bs.unique.size, bs.shared.size), (0, 8192), "store");
-            // Everything is inside the root, so nothing is shared there.
-            let br = s.breakdown(&root);
-            assert_eq!((br.unique.size, br.shared.size), (8192 + 4096, 0), "root");
-        }
-    }
-
-    #[test]
-    fn breakdown_counts_links_outside_the_scan_root_as_shared() {
-        let outer = tempfile::tempdir().unwrap();
-        let o = outer.path();
-        write(&o.join("store/pkg"), 8192);
-        write(&o.join("proj/own"), 4096);
-        link(o, "store/pkg", "proj/pkg");
-        // Scan only proj: the store link is never seen, but nlink says it exists.
-        let (s, root) = scan(&o.join("proj"), 2);
-        let b = s.breakdown(&root);
-        assert_eq!((b.unique.size, b.shared.size), (4096, 8192));
-    }
-
-    #[test]
-    fn breakdown_hard_links_inside_one_folder_are_unique_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let r = dir.path();
-        write(&r.join("a/x"), 8192);
-        link(r, "a/x", "a/y");
-        let (s, root) = scan(r, 2);
-        let a = root.subdir(&r.join("a")).unwrap();
-        let b = s.breakdown(&a);
-        assert_eq!((b.unique.size, b.shared.size), (8192, 0));
-    }
-
-    #[test]
-    fn file_breakdown_tells_linked_files_from_plain_ones() {
-        let dir = tempfile::tempdir().unwrap();
-        let r = dir.path();
-        write(&r.join("plain"), 100);
-        write(&r.join("one"), 200);
-        link(r, "one", "two");
-        let plain = file_breakdown(&r.join("plain")).unwrap();
-        assert_eq!((plain.unique.size, plain.shared.size), (100, 0));
-        let linked = file_breakdown(&r.join("one")).unwrap();
-        assert_eq!((linked.unique.size, linked.shared.size), (0, 200));
-        assert!(file_breakdown(&r.join("missing")).is_err());
-    }
-
-    #[test]
     fn rescan_dir_hands_a_shared_file_to_the_other_folder() {
         // Delete the link inside the rescanned folder. If that folder was the
         // one credited with the file, the credit must move to the other
@@ -1060,5 +1338,380 @@ mod tests {
             assert_eq!(a.size() + b.size(), 8192, "counted exactly once");
             assert_eq!(s.stats().files, 1);
         }
+    }
+
+    /// `cp -c`: an APFS clone. Needs the temp dir to be on APFS (it is on macOS).
+    fn clone_file(root: &Path, from: &str, to: &str) {
+        fs::create_dir_all(root.join(to).parent().unwrap()).unwrap();
+        let ok = std::process::Command::new("cp")
+            .arg("-c")
+            .arg(root.join(from))
+            .arg(root.join(to))
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "cp -c failed: these tests need an APFS volume");
+    }
+
+    fn hard_link(root: &Path, from: &str, to: &str) {
+        fs::create_dir_all(root.join(to).parent().unwrap()).unwrap();
+        fs::hard_link(root.join(from), root.join(to)).unwrap();
+    }
+
+    fn identity_holds(sp: &Space) -> bool {
+        sp.footprint == sp.frees_now + sp.snapshots + sp.shared_inside + sp.shared_outside
+    }
+
+    #[test]
+    fn clone_facts_tell_plain_files_from_clones() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("plain"), 8192);
+        write(&r.join("orig"), 8192);
+        clone_file(r, "orig", "clone");
+        let plain = clone_facts(&r.join("plain")).unwrap();
+        assert_eq!(plain.refcnt, 1);
+        assert!(plain.private <= 8192);
+        let orig = clone_facts(&r.join("orig")).unwrap();
+        let clone = clone_facts(&r.join("clone")).unwrap();
+        assert_eq!((orig.refcnt, clone.refcnt), (2, 2));
+        assert_eq!(orig.clone_id, clone.clone_id);
+        assert_eq!((orig.private, clone.private), (0, 0), "all of it is shared");
+        assert!(clone_facts(&r.join("missing")).is_none());
+    }
+
+    #[test]
+    fn a_folder_of_plain_files_has_no_sharing() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a/f1"), 8192);
+        write(&dir.path().join("a/f2"), 4096);
+        let (s, root) = scan(dir.path(), 2);
+        let a = root.subdir(&dir.path().join("a")).unwrap();
+        let sp = s.space(&a);
+        assert_eq!(sp.footprint, a.disk());
+        assert_eq!(sp.footprint, 8192 + 4096);
+        assert_eq!((sp.shared_inside, sp.shared_outside, sp.saved), (0, 0, 0));
+        // Everything is either freed now or held by a snapshot.
+        assert_eq!(sp.frees_now + sp.snapshots, sp.footprint);
+        assert!(identity_holds(&sp));
+    }
+
+    #[test]
+    fn clones_inside_one_folder_are_counted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/orig"), 8192);
+        clone_file(r, "a/orig", "a/clone");
+        let (s, root) = scan(r, 2);
+        let a = root.subdir(&r.join("a")).unwrap();
+        assert_eq!(a.disk(), 16384, "per-file allocations add up");
+        let sp = s.space(&a);
+        assert_eq!(sp.footprint, 8192, "the shared data occupies disk once");
+        assert_eq!(sp.saved, 8192);
+        assert_eq!((sp.shared_inside, sp.shared_outside), (8192, 0));
+        assert_eq!((sp.frees_now, sp.snapshots), (0, 0));
+        assert!(identity_holds(&sp));
+    }
+
+    #[test]
+    fn clones_across_folders_are_shared_with_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/orig"), 8192);
+        clone_file(r, "a/orig", "b/clone");
+        let (s, root) = scan(r, 2);
+        let a = s.space(&root.subdir(&r.join("a")).unwrap());
+        let b = s.space(&root.subdir(&r.join("b")).unwrap());
+        for sp in [a, b] {
+            assert_eq!(
+                (sp.footprint, sp.shared_outside, sp.shared_inside),
+                (8192, 8192, 0)
+            );
+            assert_eq!(sp.frees_now, 0, "the other clone keeps the data alive");
+            assert!(identity_holds(&sp));
+        }
+        // Together they hold every member, so at the root it is all inside.
+        let top = s.space(&root);
+        assert_eq!(
+            (top.footprint, top.shared_inside, top.shared_outside),
+            (8192, 8192, 0)
+        );
+        assert_eq!(top.saved, 8192);
+        assert!(identity_holds(&top));
+    }
+
+    #[test]
+    fn a_clone_whose_partner_is_outside_the_scan_root_is_shared() {
+        let outer = tempfile::tempdir().unwrap();
+        let o = outer.path();
+        write(&o.join("store/orig"), 8192);
+        clone_file(o, "store/orig", "proj/clone");
+        let (s, root) = scan(&o.join("proj"), 2);
+        let sp = s.space(&root);
+        assert_eq!(
+            (sp.footprint, sp.shared_outside, sp.frees_now),
+            (8192, 8192, 0)
+        );
+        assert!(identity_holds(&sp));
+    }
+
+    #[test]
+    fn hard_links_all_inside_are_not_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/x"), 8192);
+        hard_link(r, "a/x", "a/y");
+        let (s, root) = scan(r, 2);
+        let sp = s.space(&root.subdir(&r.join("a")).unwrap());
+        assert_eq!(sp.footprint, 8192, "one inode, counted once");
+        assert_eq!(sp.shared_outside, 0);
+        assert_eq!(sp.frees_now + sp.snapshots, 8192);
+        assert_eq!(sp.saved, 8192, "the second link costs nothing");
+        assert!(identity_holds(&sp));
+    }
+
+    #[test]
+    fn a_hard_link_with_a_link_outside_is_shared_whichever_folder_was_credited() {
+        for _ in 0..6 {
+            let dir = tempfile::tempdir().unwrap();
+            let r = dir.path();
+            write(&r.join("a/f"), 8192);
+            hard_link(r, "a/f", "b/f");
+            let (s, root) = scan(r, 4);
+            for name in ["a", "b"] {
+                let sp = s.space(&root.subdir(&r.join(name)).unwrap());
+                assert_eq!(
+                    (sp.footprint, sp.shared_outside, sp.frees_now),
+                    (8192, 8192, 0),
+                    "{name}"
+                );
+                assert!(identity_holds(&sp), "{name}");
+            }
+            let top = s.space(&root);
+            assert_eq!((top.footprint, top.shared_outside), (8192, 0));
+            assert_eq!(top.frees_now + top.snapshots, 8192);
+        }
+    }
+
+    #[test]
+    fn a_hard_link_to_a_file_outside_the_scan_root_is_shared() {
+        let outer = tempfile::tempdir().unwrap();
+        let o = outer.path();
+        write(&o.join("store/f"), 8192);
+        hard_link(o, "store/f", "proj/f");
+        let (s, root) = scan(&o.join("proj"), 2);
+        let sp = s.space(&root);
+        assert_eq!(
+            (sp.footprint, sp.shared_outside, sp.frees_now),
+            (8192, 8192, 0)
+        );
+    }
+
+    fn mixed_tree(r: &Path) {
+        write(&r.join("plain/a"), 8192);
+        write(&r.join("plain/b"), 100);
+        write(&r.join("dup/orig"), 8192);
+        clone_file(r, "dup/orig", "dup/clone1");
+        clone_file(r, "dup/orig", "other/clone2");
+        write(&r.join("hl/x"), 4096);
+        hard_link(r, "hl/x", "hl/y");
+        hard_link(r, "hl/x", "other/z");
+        write(&r.join("deep/one/two/f"), 12288);
+        clone_file(r, "deep/one/two/f", "deep/one/g");
+        fs::create_dir_all(r.join("empty")).unwrap();
+        write(&r.join("zero"), 0);
+    }
+
+    #[test]
+    fn the_space_identity_holds_everywhere_in_a_mixed_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        mixed_tree(dir.path());
+        let (s, root) = scan(dir.path(), 4);
+        let top_footprint = s.space(&root).footprint;
+        let mut stack = vec![Arc::clone(&root)];
+        let mut checked = 0;
+        while let Some(n) = stack.pop() {
+            let sp = s.space(&n);
+            assert!(identity_holds(&sp), "{:?}: {sp:?}", n.path);
+            // Whichever folder the scanner credited a hard link to, no folder
+            // can occupy more than the whole tree.
+            assert!(
+                sp.footprint <= top_footprint,
+                "{:?}: {} > {top_footprint}",
+                n.path,
+                sp.footprint
+            );
+            checked += 1;
+            stack.extend(n.children());
+        }
+        assert!(checked >= 8, "walked {checked} folders");
+        let top = s.space(&root);
+        assert_eq!(top.shared_outside, 0, "everything is inside the root");
+    }
+
+    #[test]
+    fn batch_spaces_for_rows_match_the_single_folder_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        mixed_tree(dir.path());
+        let (s, root) = scan(dir.path(), 4);
+        let rows = s.list_children(&root);
+        let mut dirs = 0;
+        for row in rows.iter().filter(|r| r.is_dir) {
+            let node = row.node.as_ref().expect("scanned folder");
+            let expected = s.space(node);
+            assert_eq!(row.space, Some(expected), "{:?}", row.name);
+            assert_eq!(
+                row.disk, expected.footprint,
+                "disk is the footprint: {:?}",
+                row.name
+            );
+            dirs += 1;
+        }
+        assert!(dirs >= 5);
+        // Files keep their own allocation and carry no folder-level space.
+        for row in rows.iter().filter(|r| !r.is_dir) {
+            assert_eq!(row.space, None);
+        }
+    }
+
+    #[test]
+    fn rows_show_plain_allocation_while_a_scan_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("dup/orig"), 8192);
+        clone_file(dir.path(), "dup/orig", "dup/clone");
+        let (s, root) = scan(dir.path(), 2);
+        s.set_busy(true);
+        let rows = s.list_children(&root);
+        s.set_busy(false);
+        let dup = rows.iter().find(|r| r.name == "dup").unwrap();
+        assert_eq!(
+            dup.space, None,
+            "clone data is only known once the scan is done"
+        );
+        assert_eq!(dup.disk, 16384);
+        let done = s.list_children(&root);
+        let dup = done.iter().find(|r| r.name == "dup").unwrap();
+        assert_eq!(dup.disk, 8192, "the footprint counts the clone once");
+    }
+
+    #[test]
+    fn live_rows_keep_the_footprint() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("dup/orig"), 8192);
+        clone_file(dir.path(), "dup/orig", "dup/clone");
+        let (s, root) = scan(dir.path(), 2);
+        let rows = s.list_children(&root);
+        let dup = rows.iter().find(|r| r.name == "dup").unwrap().live();
+        assert_eq!(
+            dup.disk, 8192,
+            "live() must not fall back to the summed allocation"
+        );
+    }
+
+    #[test]
+    fn file_space_for_single_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("plain"), 8192);
+        write(&r.join("linked"), 8192);
+        hard_link(r, "linked", "linked2");
+        write(&r.join("orig"), 8192);
+        clone_file(r, "orig", "cloned");
+        let plain = file_space(&r.join("plain")).unwrap();
+        assert_eq!(plain.footprint, 8192);
+        assert_eq!(plain.frees_now + plain.snapshots, 8192);
+        assert_eq!(plain.shared_outside, 0);
+        let linked = file_space(&r.join("linked")).unwrap();
+        assert_eq!(
+            (linked.footprint, linked.shared_outside, linked.frees_now),
+            (8192, 8192, 0)
+        );
+        let cloned = file_space(&r.join("cloned")).unwrap();
+        assert_eq!(
+            (cloned.footprint, cloned.shared_outside, cloned.frees_now),
+            (8192, 8192, 0)
+        );
+        assert!(file_space(&r.join("missing")).is_err());
+        for sp in [plain, linked, cloned] {
+            assert!(identity_holds(&sp));
+        }
+    }
+
+    #[test]
+    fn empty_files_and_unreadable_folders_do_not_disturb_the_space_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a/empty"), 0);
+        write(&dir.path().join("a/f"), 4096);
+        let (s, root) = scan(dir.path(), 2);
+        let sp = s.space(&root);
+        assert_eq!(sp.footprint, 4096);
+        assert!(identity_holds(&sp));
+        assert_eq!(s.space(&root.subdir(&dir.path().join("a")).unwrap()), sp);
+    }
+
+    #[test]
+    fn rescanning_a_folder_leaves_the_space_numbers_equal_to_a_fresh_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/orig"), 8192);
+        clone_file(r, "a/orig", "a/clone");
+        write(&r.join("b/f"), 4096);
+        let (s, root) = scan(r, 2);
+        // Change b, then rescan only b.
+        write(&r.join("b/g"), 4096);
+        let b = root.subdir(&r.join("b")).unwrap();
+        s.rescan_dir(&b).unwrap();
+        wait(&s);
+        let after = s.space(&root);
+        let (fresh_scanner, fresh_root) = scan(r, 2);
+        assert_eq!(after, fresh_scanner.space(&fresh_root));
+        assert!(identity_holds(&after));
+    }
+
+    #[test]
+    fn rescanning_forgets_clone_members_inside_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/orig"), 8192);
+        clone_file(r, "a/orig", "a/clone");
+        let (s, root) = scan(r, 2);
+        assert_eq!(s.space(&root).saved, 8192);
+        fs::remove_file(r.join("a/clone")).unwrap();
+        let a = root.subdir(&r.join("a")).unwrap();
+        s.rescan_dir(&a).unwrap();
+        wait(&s);
+        let sp = s.space(&root);
+        assert_eq!(sp.saved, 0, "the clone is gone: no stale members");
+        assert_eq!(sp.footprint, 8192);
+        assert!(identity_holds(&sp));
+    }
+
+    #[test]
+    fn rescanning_everything_matches_a_fresh_scan_even_with_clones() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        mixed_tree(r);
+        let (s, root) = scan(r, 4);
+        let before = s.space(&root);
+        let again = s.rescan_all(r).unwrap();
+        wait(&s);
+        assert_eq!(s.space(&again), before);
+    }
+
+    #[test]
+    fn space_adds_up_for_review_totals() {
+        let a = Space {
+            footprint: 10,
+            frees_now: 4,
+            snapshots: 3,
+            shared_outside: 2,
+            shared_inside: 1,
+            saved: 5,
+        };
+        let sum: Space = [a, a].into_iter().sum();
+        assert_eq!(sum.footprint, 20);
+        assert_eq!(sum.snapshots, 6);
+        assert_eq!(sum.saved, 10);
+        assert_eq!(a + Space::default(), a);
     }
 }

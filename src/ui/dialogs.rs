@@ -14,7 +14,6 @@ use crate::app::{App, DeleteProgress, Dialog, FinishInfo, ForeverTarget, QuitWar
 use crate::fmt::{both_usage, eighths_bar, human_size};
 use crate::glyphs::Glyphs;
 use crate::jobs::Phase;
-use crate::usage::Usage;
 
 /// Ticks a window takes to grow to full size (about a third of a second).
 pub const GROW_TICKS: u64 = 7;
@@ -137,8 +136,8 @@ fn quit_warning(frame: &mut Frame, area: Rect, g: &Glyphs, w: &QuitWarning, scal
 
 fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
     let width = area.width.saturating_sub(4).min(96);
-    let wanted = r.items.len() as u16 + 11;
-    let height = wanted.min(area.height.saturating_sub(2)).max(11);
+    let wanted = r.items.len() as u16 + 14;
+    let height = wanted.min(area.height.saturating_sub(2)).max(13);
     let Some(inner) = popup(
         frame,
         area,
@@ -151,7 +150,7 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
     ) else {
         return;
     };
-    let room = (inner.height as usize).saturating_sub(8);
+    let room = (inner.height as usize).saturating_sub(12);
     let name_w = (inner.width as usize).saturating_sub(34);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -199,22 +198,48 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
     lines.push(Line::from(
         "It is not freed until you empty ToBeDeleted.".to_string(),
     ));
-    lines.push(Line::from(Span::styled(
-        if r.shared == Usage::default() {
-            "Deleting for good frees all of it.".to_string()
-        } else {
+    let sp = r.space;
+    if sp.frees_now >= sp.footprint {
+        lines.push(Line::from(Span::styled(
+            "Deleting for good frees all of it right now.",
+            Style::default().fg(SAFE),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
             format!(
-                "Deleting for good frees about {}; {} is shared with other places and stays.",
-                both_usage(r.unique),
-                both_usage(r.shared)
-            )
-        },
-        Style::default().fg(if r.shared == Usage::default() {
-            SAFE
-        } else {
-            CAUTION
-        }),
-    )));
+                "Deleting for good frees about {} right now.",
+                human_size(sp.frees_now)
+            ),
+            Style::default().fg(SAFE),
+        )));
+        if sp.snapshots > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} more is freed once Time Machine snapshots expire.",
+                    human_size(sp.snapshots)
+                ),
+                Style::default().fg(CAUTION),
+            )));
+        }
+        if sp.shared_inside > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} is shared only among these files and goes with them (unless a snapshot holds it).",
+                    human_size(sp.shared_inside)
+                ),
+                Style::default().fg(CAUTION),
+            )));
+        }
+        if sp.shared_outside > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} is shared with other places and stays.",
+                    human_size(sp.shared_outside)
+                ),
+                Style::default().fg(CAUTION),
+            )));
+        }
+    }
     lines.push(key_line(
         g,
         &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],

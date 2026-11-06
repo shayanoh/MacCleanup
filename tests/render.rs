@@ -663,39 +663,6 @@ fn select_row(app: &mut App, name: &str) {
 }
 
 #[test]
-fn explorer_detail_shows_unique_and_shared_space() {
-    let mut e = shared_app(GlyphMode::Nerd);
-    select_row(&mut e.app, "proj");
-    let text = render(&mut e.app, 130, 30);
-    let unique = text.lines().find(|l| l.contains("unique")).unwrap_or("");
-    let shared = text.lines().find(|l| l.contains("shared")).unwrap_or("");
-    assert!(unique.contains("4.1 KB"), "unique line: {unique}\n{text}");
-    assert!(shared.contains("8.2 KB"), "shared line: {shared}\n{text}");
-    assert!(text.contains("deleting frees"), "{text}");
-}
-
-#[test]
-fn explorer_detail_for_a_plain_folder_has_nothing_shared() {
-    let mut e = make_app(FILES, GlyphMode::Nerd);
-    e.app.update(Action::GoTo(Screen::Explorer));
-    select_row(&mut e.app, "mid");
-    let text = render(&mut e.app, 130, 30);
-    let shared = text.lines().find(|l| l.contains("shared")).unwrap_or("");
-    assert!(shared.contains("0 B (0 B on disk)"), "{shared}");
-}
-
-#[test]
-fn review_dialog_explains_what_is_shared_and_stays() {
-    let mut e = shared_app(GlyphMode::Nerd);
-    select_row(&mut e.app, "proj");
-    e.app.update(Action::ToggleMark);
-    e.app.update(Action::OpenReview);
-    let text = render(&mut e.app, 130, 32);
-    assert!(text.contains("frees about"), "{text}");
-    assert!(text.contains("shared") && text.contains("stays"), "{text}");
-}
-
-#[test]
 fn shared_detail_is_ascii_in_ascii_mode() {
     let mut e = shared_app(GlyphMode::Ascii);
     select_row(&mut e.app, "proj");
@@ -1124,4 +1091,133 @@ fn the_quit_warning_is_ascii_in_ascii_mode() {
     for c in render_cells(&mut e.app, 120, 30) {
         assert!(c.is_ascii(), "{c:?}");
     }
+}
+
+#[test]
+fn explorer_detail_shows_where_the_space_would_go() {
+    let mut e = shared_app(GlyphMode::Nerd);
+    select_row(&mut e.app, "proj");
+    let text = render(&mut e.app, 140, 30);
+    let frees = text.lines().find(|l| l.contains("frees now")).unwrap_or("");
+    let shared = text
+        .lines()
+        .find(|l| l.contains("shared with other places"))
+        .unwrap_or("");
+    assert!(
+        frees.contains("held by snapshots"),
+        "frees line: {frees}\n{text}"
+    );
+    assert!(shared.contains("8.2 KB"), "shared line: {shared}\n{text}");
+    assert!(shared.contains("stays"), "{shared}");
+}
+
+#[test]
+fn the_detail_for_a_plain_folder_shares_nothing() {
+    let mut e = make_app(FILES, GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    select_row(&mut e.app, "mid");
+    let text = render(&mut e.app, 140, 30);
+    let shared = text
+        .lines()
+        .find(|l| l.contains("shared with other places"))
+        .unwrap_or("");
+    assert!(shared.contains("0 B"), "{shared}\n{text}");
+}
+
+#[test]
+fn the_detail_says_what_cloning_inside_a_folder_saves() {
+    let mut e = make_app_with(
+        &[("dup/orig", 8192), ("solo/f", 4096)],
+        GlyphMode::Nerd,
+        |home| {
+            let status = std::process::Command::new("cp")
+                .arg("-c")
+                .arg(home.join("dup/orig"))
+                .arg(home.join("dup/clone"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "needs APFS");
+        },
+    );
+    e.app.update(Action::GoTo(Screen::Explorer));
+    select_row(&mut e.app, "dup");
+    let text = render(&mut e.app, 140, 30);
+    assert!(text.contains("cloning inside saves 8.2 KB"), "{text}");
+    select_row(&mut e.app, "solo");
+    let text = render(&mut e.app, 140, 30);
+    assert!(text.contains("no clones inside"), "{text}");
+}
+
+#[test]
+fn review_dialog_says_what_frees_now_and_what_stays() {
+    let mut e = shared_app(GlyphMode::Nerd);
+    select_row(&mut e.app, "proj");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    let text = render(&mut e.app, 140, 34);
+    assert!(text.contains("frees about"), "{text}");
+    assert!(text.contains("right now"), "{text}");
+    assert!(
+        text.contains("shared with other places") && text.contains("stays"),
+        "{text}"
+    );
+}
+
+fn clone_pair_app() -> Env {
+    let mut e = make_app_with(
+        &[("dup/orig", 8192), ("solo/f", 4096)],
+        GlyphMode::Nerd,
+        |home| {
+            let status = std::process::Command::new("cp")
+                .arg("-c")
+                .arg(home.join("dup/orig"))
+                .arg(home.join("dup/clone"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "needs APFS");
+        },
+    );
+    e.app.update(Action::GoTo(Screen::Explorer));
+    e
+}
+
+#[test]
+fn review_explains_data_shared_only_among_the_marked_files() {
+    let mut e = clone_pair_app();
+    select_row(&mut e.app, "dup");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    let text = render(&mut e.app, 140, 36);
+    assert!(
+        text.contains("shared only among these files"),
+        "the clone data is not private, so say where it goes:\n{text}"
+    );
+    assert!(text.contains("unless a snapshot holds it"), "{text}");
+    assert!(
+        !text.contains("frees all of it right now"),
+        "must not claim everything is freed now:\n{text}"
+    );
+}
+
+#[test]
+fn the_detail_lines_fit_a_narrow_pane() {
+    let mut e = clone_pair_app();
+    select_row(&mut e.app, "dup");
+    // 100 columns leaves the list pane about 50 wide.
+    let text = render(&mut e.app, 100, 30);
+    for needle in [
+        "frees now",
+        "held by snapshots",
+        "shared with other places",
+        "(stays)",
+        "shared inside",
+        "cloning inside saves",
+    ] {
+        let line = text.lines().find(|l| l.contains(needle));
+        assert!(line.is_some(), "missing {needle:?}:\n{text}");
+    }
+    assert!(
+        !text.contains("shared inside\u{2026}"),
+        "no cut-off label:\n{text}"
+    );
 }

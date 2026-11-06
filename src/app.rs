@@ -11,7 +11,7 @@ use crate::fmt::both_usage;
 use crate::glyphs::Glyphs;
 use crate::jobs::{DeleteEvent, DeleteJob, DeleteMode, Phase};
 use crate::safety::{Policy, Safety};
-use crate::scan::{Breakdown, Node, Row, Scanner, file_breakdown, locate};
+use crate::scan::{Node, Row, Scanner, Space, file_space, locate};
 use crate::softdelete::{HeldItem, Holding};
 use crate::usage::Usage;
 use crate::volume;
@@ -163,11 +163,9 @@ pub struct ReviewItem {
 pub struct Review {
     pub items: Vec<ReviewItem>,
     pub total: Usage,
-    /// Of the total, what deleting actually frees (every hard link is in the
-    /// marked items)...
-    pub unique: Usage,
-    /// ...and what also has a hard link elsewhere and so stays on disk.
-    pub shared: Usage,
+    /// Where the marked items' disk space would go: freed now, held by
+    /// snapshots, or shared with clones and hard links that stay.
+    pub space: Space,
 }
 
 #[derive(Clone, Debug)]
@@ -249,11 +247,11 @@ pub enum Dialog {
     Notice(String),
 }
 
-/// Unique vs shared space for the selected row.
+/// Where the selected row's disk space would go.
 #[derive(Clone, Debug)]
 pub struct Detail {
     pub path: PathBuf,
-    pub breakdown: Breakdown,
+    pub space: Space,
     /// False while the folder is still being scanned (numbers still growing).
     pub complete: bool,
 }
@@ -270,6 +268,8 @@ pub struct App {
     pub all_rows: Vec<Row>,
     pub filter: FilterState,
     pub detail: Option<Detail>,
+    /// The current folder's own space numbers, known once the scan is done.
+    pub current_space: Option<Space>,
     pub cursor: usize,
     pub offset: usize,
     /// Marked paths with their size and on-disk size (kept live while scanning).
@@ -361,6 +361,7 @@ impl App {
             all_rows: Vec::new(),
             filter: FilterState::default(),
             detail: None,
+            current_space: None,
             cursor: 0,
             offset: 0,
             marks: BTreeMap::new(),
@@ -421,7 +422,9 @@ impl App {
     pub fn weight_total(&self) -> u64 {
         match self.sort {
             SortBy::Size => self.current().size(),
-            SortBy::Disk | SortBy::Name => self.current().disk(),
+            SortBy::Disk | SortBy::Name => self
+                .current_space
+                .map_or_else(|| self.current().disk(), |s| s.footprint),
         }
     }
 
@@ -452,6 +455,7 @@ impl App {
             .or_else(|| self.selected_row().map(|r| r.path.clone()));
         let node = Arc::clone(self.current());
         let mut rows = self.scanner.list_children(&node);
+        self.current_space = self.scanner.is_idle().then(|| self.scanner.space(&node));
         sort_rows(&mut rows, self.sort);
         self.rows_synced_done = node.is_done();
         for r in &rows {
@@ -899,21 +903,18 @@ impl App {
                 .then_with(|| a.path.cmp(&b.path))
         });
         let total = items.iter().map(|i| i.usage).sum();
-        let (mut unique, mut shared) = (Usage::default(), Usage::default());
-        for item in &items {
-            let split = self.breakdown_of(&item.path, item.usage);
-            unique += split.unique;
-            shared += split.shared;
-        }
+        let space = items
+            .iter()
+            .map(|item| self.space_of(&item.path, item.usage))
+            .sum();
         self.dialog = Some(Dialog::Review(Review {
             items,
             total,
-            unique,
-            shared,
+            space,
         }));
     }
 
-    /// Unique vs shared space for the selected row (explorer only).
+    /// Where the selected row's disk space would go (explorer only).
     pub fn refresh_detail(&mut self) {
         self.detail = if self.screen == Screen::Explorer {
             self.selected_row().and_then(|row| self.detail_for(row))
@@ -925,33 +926,48 @@ impl App {
     fn detail_for(&self, row: &Row) -> Option<Detail> {
         if row.is_dir {
             let node = row.node.as_ref()?;
+            let (space, complete) = match row.space {
+                Some(space) => (space, true),
+                // Still scanning: only the additive numbers are known yet.
+                None => (
+                    Space {
+                        footprint: node.disk(),
+                        frees_now: node.private(),
+                        snapshots: node.snapshot_held(),
+                        ..Space::default()
+                    },
+                    false,
+                ),
+            };
             Some(Detail {
                 path: row.path.clone(),
-                breakdown: self.scanner.breakdown(node),
-                complete: node.is_done(),
+                space,
+                complete,
             })
         } else {
             Some(Detail {
                 path: row.path.clone(),
-                breakdown: file_breakdown(&row.path).ok()?,
+                space: file_space(&row.path).ok()?,
                 complete: true,
             })
         }
     }
 
-    /// Unique/shared for a marked path; unknown paths count as all unique.
-    fn breakdown_of(&self, path: &Path, usage: Usage) -> Breakdown {
+    /// Where a marked path's disk space would go. Unknown paths count as
+    /// plain files that free everything.
+    fn space_of(&self, path: &Path, usage: Usage) -> Space {
         let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
         if is_dir {
             if let Some(node) = locate(&self.stack[0], path) {
-                return self.scanner.breakdown(&node);
+                return self.scanner.space(&node);
             }
-        } else if let Ok(split) = file_breakdown(path) {
-            return split;
+        } else if let Ok(space) = file_space(path) {
+            return space;
         }
-        Breakdown {
-            unique: usage,
-            shared: Usage::default(),
+        Space {
+            footprint: usage.disk,
+            frees_now: usage.disk,
+            ..Space::default()
         }
     }
 
@@ -1916,26 +1932,6 @@ mod tests {
     }
 
     #[test]
-    fn detail_splits_unique_and_shared_for_the_selected_folder() {
-        let mut e = shared_env();
-        let app = &mut e.app;
-        select(app, "proj");
-        let d = app.detail.as_ref().expect("a detail for the selected row");
-        assert!(d.path.ends_with("proj"));
-        assert!(d.complete);
-        assert_eq!(
-            (d.breakdown.unique.size, d.breakdown.shared.size),
-            (4096, 8192)
-        );
-        select(app, "store");
-        let d = app.detail.as_ref().unwrap();
-        assert_eq!(
-            (d.breakdown.unique.size, d.breakdown.shared.size),
-            (0, 8192)
-        );
-    }
-
-    #[test]
     fn detail_follows_the_cursor_and_clears_off_screen() {
         let mut e = shared_env();
         let app = &mut e.app;
@@ -1947,87 +1943,6 @@ mod tests {
         app.update(Action::GoTo(Screen::Home));
         // Detail is only meaningful in the explorer, but never stale-wrong.
         assert!(app.detail.is_none() || app.screen == Screen::Home);
-    }
-
-    #[test]
-    fn detail_for_a_hard_linked_file_is_all_shared() {
-        let mut e = shared_env();
-        let app = &mut e.app;
-        app.update(Action::GoTo(Screen::Explorer));
-        select(app, "proj");
-        app.update(Action::Into);
-        select(app, "pkg");
-        let d = app.detail.as_ref().unwrap();
-        assert_eq!(
-            (d.breakdown.unique.size, d.breakdown.shared.size),
-            (0, 8192)
-        );
-        select(app, "own");
-        let d = app.detail.as_ref().unwrap();
-        assert_eq!(
-            (d.breakdown.unique.size, d.breakdown.shared.size),
-            (4096, 0)
-        );
-    }
-
-    #[test]
-    fn review_splits_what_deleting_frees_from_what_is_shared() {
-        let mut e = shared_env();
-        let app = &mut e.app;
-        select(app, "proj");
-        app.update(Action::ToggleMark);
-        app.update(Action::OpenReview);
-        match &app.dialog {
-            Some(Dialog::Review(r)) => {
-                assert_eq!((r.unique.size, r.shared.size), (4096, 8192));
-            }
-            other => panic!("expected review, got {}", other.is_some()),
-        }
-    }
-
-    #[test]
-    fn review_of_a_plain_folder_has_nothing_shared() {
-        let mut e = env(FILES);
-        let app = &mut e.app;
-        select(app, "a");
-        app.update(Action::ToggleMark);
-        app.update(Action::OpenReview);
-        match &app.dialog {
-            Some(Dialog::Review(r)) => {
-                assert_eq!(r.shared, Usage::default());
-                assert_eq!(r.unique.size, 12288);
-            }
-            other => panic!("expected review, got {}", other.is_some()),
-        }
-    }
-
-    fn fresh_app() -> App {
-        // Same setup as `env`, but without navigating anywhere.
-        use crate::accounting::Accounting;
-        use crate::glyphs::{GlyphMode, Glyphs};
-        use crate::safety::Policy;
-        use crate::scan::Scanner;
-        use crate::softdelete::Holding;
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().canonicalize().unwrap();
-        let home = base.join("home");
-        fs::create_dir_all(&home).unwrap();
-        let scanner = Scanner::new(2);
-        let root = scanner.scan_root(&home);
-        let hold = base.join("hold");
-        let policy = Policy::new(&home, &hold);
-        let holding = Holding::open(hold).unwrap();
-        let app = App::new(
-            scanner,
-            root,
-            policy,
-            holding,
-            Accounting::new(0),
-            Glyphs::new(GlyphMode::Nerd),
-            false,
-        );
-        std::mem::forget(dir); // keep the sandbox alive for the app's lifetime
-        app
     }
 
     #[test]
@@ -2656,5 +2571,171 @@ mod tests {
         app.update(Action::Quit);
         assert!(!app.should_quit);
         assert!(matches!(app.dialog, Some(Dialog::QuitWarning(_))));
+    }
+
+    fn clone_env() -> crate::testutil::Env {
+        // store/orig (8192) is cloned into proj/pkg; proj/own is plain (4096).
+        crate::testutil::env_with(&[("store/orig", 8192), ("proj/own", 4096)], |home| {
+            crate::testutil::clone_file(&home.join("store/orig"), &home.join("proj/pkg"))
+        })
+    }
+
+    #[test]
+    fn detail_splits_the_space_of_the_selected_folder() {
+        let mut e = shared_env(); // hard link store/pkg <-> proj/pkg
+        let app = &mut e.app;
+        select(app, "proj");
+        let d = app.detail.as_ref().expect("a detail for the selected row");
+        assert!(d.path.ends_with("proj"));
+        assert!(d.complete);
+        let sp = d.space;
+        assert_eq!((sp.footprint, sp.shared_outside), (12288, 8192));
+        assert_eq!(sp.frees_now + sp.snapshots, 4096);
+        select(app, "store");
+        let sp = app.detail.as_ref().unwrap().space;
+        assert_eq!(
+            (sp.footprint, sp.shared_outside, sp.frees_now),
+            (8192, 8192, 0)
+        );
+    }
+
+    #[test]
+    fn detail_counts_clones_as_shared_too() {
+        let mut e = clone_env();
+        let app = &mut e.app;
+        select(app, "proj");
+        let sp = app.detail.as_ref().unwrap().space;
+        assert_eq!((sp.footprint, sp.shared_outside), (12288, 8192));
+        assert_eq!(sp.frees_now + sp.snapshots, 4096);
+        select(app, "store");
+        let sp = app.detail.as_ref().unwrap().space;
+        assert_eq!(
+            (sp.footprint, sp.shared_outside, sp.frees_now),
+            (8192, 8192, 0)
+        );
+    }
+
+    #[test]
+    fn detail_for_single_files_knows_links_and_clones() {
+        let mut e = clone_env();
+        let app = &mut e.app;
+        select(app, "proj");
+        app.update(Action::Into);
+        select(app, "pkg"); // the clone
+        let sp = app.detail.as_ref().unwrap().space;
+        assert_eq!(
+            (sp.footprint, sp.shared_outside, sp.frees_now),
+            (8192, 8192, 0)
+        );
+        select(app, "own"); // plain
+        let sp = app.detail.as_ref().unwrap().space;
+        assert_eq!((sp.footprint, sp.shared_outside), (4096, 0));
+        assert_eq!(sp.frees_now + sp.snapshots, 4096);
+    }
+
+    #[test]
+    fn folders_are_sorted_and_sized_by_their_real_footprint() {
+        // dup holds a file and its clone: 16384 allocated, 8192 really.
+        // solo holds one 12288 file. By footprint solo is bigger.
+        let mut e = crate::testutil::env_with(&[("dup/orig", 8192), ("solo/f", 12288)], |home| {
+            crate::testutil::clone_file(&home.join("dup/orig"), &home.join("dup/clone"))
+        });
+        let app = &mut e.app;
+        assert_eq!(names(app), ["solo", "dup"]);
+        let dup = app.rows.iter().find(|r| r.name == "dup").unwrap();
+        assert_eq!(dup.disk, 8192, "the row shows the footprint");
+        assert!(dup.space.is_some());
+    }
+
+    #[test]
+    fn shares_are_relative_to_the_folders_footprint() {
+        let mut e = crate::testutil::env_with(&[("dup/orig", 8192), ("solo/f", 12288)], |home| {
+            crate::testutil::clone_file(&home.join("dup/orig"), &home.join("dup/clone"))
+        });
+        let app = &mut e.app;
+        let sp = app.current_space.expect("the scan is done");
+        assert_eq!(sp.footprint, 8192 + 12288);
+        assert_eq!(app.weight_total(), 8192 + 12288);
+        app.update(Action::CycleSort); // by size: the logical total
+        assert_eq!(app.weight_total(), app.current().size());
+    }
+
+    #[test]
+    fn review_reports_what_frees_now_what_snapshots_hold_and_what_stays() {
+        let mut e = clone_env();
+        let app = &mut e.app;
+        select(app, "proj");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        match &app.dialog {
+            Some(Dialog::Review(r)) => {
+                assert_eq!(r.space.shared_outside, 8192);
+                assert_eq!(r.space.frees_now + r.space.snapshots, 4096);
+            }
+            other => panic!("expected review, got {}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn review_of_a_plain_folder_has_nothing_shared() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        select(app, "a");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        match &app.dialog {
+            Some(Dialog::Review(r)) => {
+                assert_eq!(r.space.shared_outside, 0);
+                assert_eq!(r.space.footprint, 12288);
+                assert_eq!(r.space.frees_now + r.space.snapshots, 12288);
+            }
+            other => panic!("expected review, got {}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn review_of_a_single_hard_linked_file_frees_nothing() {
+        let mut e = shared_env();
+        let app = &mut e.app;
+        select(app, "proj");
+        app.update(Action::Into);
+        select(app, "pkg");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        match &app.dialog {
+            Some(Dialog::Review(r)) => {
+                assert_eq!((r.space.frees_now, r.space.shared_outside), (0, 8192));
+            }
+            other => panic!("expected review, got {}", other.is_some()),
+        }
+    }
+
+    fn fresh_app() -> App {
+        // Same setup as `env`, but without navigating anywhere.
+        use crate::accounting::Accounting;
+        use crate::glyphs::{GlyphMode, Glyphs};
+        use crate::safety::Policy;
+        use crate::scan::Scanner;
+        use crate::softdelete::Holding;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let scanner = Scanner::new(2);
+        let root = scanner.scan_root(&home);
+        let hold = base.join("hold");
+        let policy = Policy::new(&home, &hold);
+        let holding = Holding::open(hold).unwrap();
+        let app = App::new(
+            scanner,
+            root,
+            policy,
+            holding,
+            Accounting::new(0),
+            Glyphs::new(GlyphMode::Nerd),
+            false,
+        );
+        std::mem::forget(dir); // keep the sandbox alive for the app's lifetime
+        app
     }
 }

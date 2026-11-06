@@ -109,3 +109,16 @@ pub fn wait_scan(app: &mut App) {
     }
     panic!("scan did not finish");
 }
+
+/// An APFS clone (`cp -c`) of `from` at `to`. Panics if the volume cannot clone.
+pub fn clone_file(from: &Path, to: &Path) {
+    fs::create_dir_all(to.parent().unwrap()).unwrap();
+    let ok = std::process::Command::new("cp")
+        .arg("-c")
+        .arg(from)
+        .arg(to)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "cp -c failed: this test needs an APFS volume");
+}

@@ -116,3 +116,13 @@ Before running any cleanup, snapshot the relevant measure (affected paths and ov
 ## 11. Reference: what exists on the user's Mac today (read-only survey, 2026-11-06)
 
 Used only to prioritize; not a contract. Docker 31 GB (about 4.8 GB images, 4.3 GB volumes, 2.2 GB build cache reclaimable by Docker's own count), Xcode simulators 10.6 GB with 358 unavailable entries, `~/Library/Caches` 14.9 GB, `~/.cache` 6 GB, package-manager caches about 10 GB, `~/.android` 4.3 GB, Telegram 4.2 GB, 9 Time Machine local snapshots, brew cache 0.45 GB. Large items that are not cleanup targets: Photos library (32 GB), `Application Support/Claude` (13.6 GB), Autodesk (12 GB), two vault images in Pictures. Tools present: docker, brew, fnm, pnpm, npm, yarn, cargo, rustup, uv, pip, go, flutter, dart, xcodebuild, pod.
+
+## 12. Real space: clones and snapshots (decided 2026-11-06)
+
+**[User]** decisions, after measuring on the user's Mac that pnpm clones files (APFS copy-on-write) instead of hard-linking and that Time Machine local snapshots keep deleted data alive:
+
+- **On disk** for a folder is its real **footprint**: data shared by clone or hard link is counted once. For a single file it is the file's own allocation, shared or not.
+- A detail area names where a row's space would go: **frees now**, **held by snapshots**, **shared with other places** (clone or hard link with files outside; stays), **shared inside**, and what **cloning inside saves**. Cloned files appear as shared.
+- Everything is collected in the **initial scan** (one extra system call per file, about 2.5x scan time on the measured 182k-file tree; a batched per-folder call is the known way to win it back) and derived in memory for any folder, not re-read per selection.
+- The Time Machine snapshots screen (list, sizes, thin/delete through the "copy this command" flow) is **its own later phase**; this release only reports the bytes snapshots hold.
+- **[My call]** "private size" is also what macOS uses for snapshot-held bytes (verified by timestamps, undocumented), so `frees now` can understate what a delete will eventually free; `held by snapshots` says so.

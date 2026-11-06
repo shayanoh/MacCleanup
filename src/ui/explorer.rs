@@ -45,11 +45,11 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(block, area);
     // The filter box takes one row above the header while it is shown.
     let filter_h = u16::from(app.filter.visible());
-    if inner.height < 6 + filter_h || inner.width < 24 {
+    if inner.height < 7 + filter_h || inner.width < 24 {
         return;
     }
     app.layout.list_top = inner.y + 2 + filter_h;
-    app.layout.list_rows = inner.height - 5 - filter_h;
+    app.layout.list_rows = inner.height - 6 - filter_h;
     app.ensure_visible();
 
     // Status line: live scan activity.
@@ -171,12 +171,12 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     frame.render_widget(Paragraph::new(lines), list_area);
 
-    // Unique vs shared space for the selected row.
-    let detail_y = inner.y + inner.height - 3;
+    // Where the selected row's space would go.
+    let detail_y = inner.y + inner.height - 4;
     let detail_lines = detail_lines(app, inner.width as usize);
     frame.render_widget(
         Paragraph::new(detail_lines),
-        Rect::new(inner.x, detail_y, inner.width, 2),
+        Rect::new(inner.x, detail_y, inner.width, 3),
     );
 
     // Marked summary.
@@ -285,37 +285,59 @@ fn value_style(sorted: bool) -> Style {
     }
 }
 
-/// Two lines under the list: what deleting the selected row frees, and what
-/// it shares with hard links elsewhere (which stays on disk).
+/// Three lines under the list saying where the selected row's disk space
+/// would go: what deleting it frees now, what only snapshots hold, what is
+/// shared with clones and hard links elsewhere (and stays), and what cloning
+/// inside it already saves.
 fn detail_lines<'a>(app: &App, width: usize) -> Vec<Line<'a>> {
     let g = &app.glyphs;
     let Some(d) = &app.detail else {
         return vec![
             Line::from(Span::styled("nothing selected", Style::default().fg(DIM))),
             Line::raw(""),
+            Line::raw(""),
         ];
     };
+    let sp = d.space;
     let scanning = if d.complete {
         String::new()
     } else {
         format!(" (still scanning{})", g.ellipsis())
     };
-    let unique = format!(
-        "unique  {}  deleting frees this{scanning}",
-        both_usage(d.breakdown.unique)
+    let dot = g.dot();
+    let first = format!(
+        "frees now {} {dot} held by snapshots {}{scanning}",
+        human_size(sp.frees_now),
+        human_size(sp.snapshots)
     );
-    let shared = format!(
-        "shared  {}  also linked elsewhere, stays",
-        both_usage(d.breakdown.shared)
+    let second = format!(
+        "shared with other places {} (stays)",
+        human_size(sp.shared_outside)
     );
+    let third = if sp.saved > 0 {
+        format!(
+            "shared inside {} {dot} cloning inside saves {}",
+            human_size(sp.shared_inside),
+            human_size(sp.saved)
+        )
+    } else {
+        format!(
+            "shared inside {} {dot} no clones inside",
+            human_size(sp.shared_inside)
+        )
+    };
     vec![
         Line::from(Span::styled(
-            fit(&unique, width, g),
+            fit(&first, width, g),
             Style::default().fg(Color::Green),
         )),
         Line::from(Span::styled(
-            fit(&shared, width, g),
+            fit(&second, width, g),
             Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            fit(&third, width, g),
+            Style::default().fg(DIM),
         )),
     ]
 }

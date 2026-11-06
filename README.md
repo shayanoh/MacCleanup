@@ -12,7 +12,7 @@ A colorful, animated terminal app (Rust TUI) for macOS that shows where your dis
 - **ToBeDeleted indicator and quit warning:** the menu shows when ToBeDeleted is empty and, when it holds something, lights its icon and shows how many items are waiting. Quitting with items still in it asks first (`e` opens it, `q` quits anyway, `Esc` stays).
 - **Always responsive:** every move and every permanent delete runs in the background with a live progress bar (by bytes, so one huge folder still moves it). Big trees are deleted in parallel. Quitting while a delete runs waits for it to finish.
 - **Soft delete:** "delete" moves items to `~/ToBeDeleted` (or `--holding-dir`). Browse that folder, restore items to where they came from, delete items for good, or empty it. Moved files count as **pending**, not freed, because nothing is freed until the folder is emptied.
-- **Unique vs shared space:** under the list, the selected folder or file shows what deleting it actually **frees** (every hard link to those files is inside it) and what it **shares** with hard links elsewhere, which stays on disk. This is what to look at for pnpm's `node_modules`, which hard-links into the pnpm store. The review dialog sums it for everything you marked ("frees about X; Y is shared and stays"). It does not depend on which folder the scanner happened to credit first.
+- **Where the space would go:** under the list, the selected folder or file shows what deleting it would really do, because on a Mac sizes lie. APFS clones (what pnpm uses for `node_modules`) look full-size but cost nothing extra, and Time Machine local snapshots keep deleted files' blocks alive. Three lines: **frees now** and **held by snapshots** (freed only when those hourly snapshots expire), **shared with other places** (clones or hard links with files outside the folder, which stay) and **shared inside**, and what **cloning inside** already saves. A folder's **On disk** is its real footprint (clone data and hard links counted once), so the sort order and graphs use real space. The review dialog sums it for everything you marked. The numbers are final once the scan has finished; the scan is about 2.5 times slower for this (one extra system call per file).
 - **Rescan:** `r` rescans the folder you are viewing and updates the totals above it; `R` rescans everything from the scan root.
 - **Graphs:** a bar graph and a treemap (box area equals size) that follow your selection. Cycle bars, treemap and hidden with `t`; resize the panel with `[` (bigger) and `]` (smaller). Graphs and share bars follow the sorted size (on-disk by default).
 - **Motion:** windows grow in, and the congratulations window rains confetti. `--no-animation` turns all of it off.
@@ -21,6 +21,8 @@ A colorful, animated terminal app (Rust TUI) for macOS that shows where your dis
 - **Safety:** a hard-coded protected list, a review screen before every delete, and an extra explicit confirmation for anything irreversible (see below).
 
 ## Planned
+
+A Time Machine snapshots screen (list them with sizes, thin or delete them) is the next phase; for now the app only tells you how much they hold.
 
 App leftovers, app uninstaller, caches (npm, pnpm, cargo, Xcode, Playwright and more, cleaned through each tool's own command), project artifacts (`node_modules`, `.next`, `.turbo`, Rust `target`, Xcode `DerivedData`), a Docker panel, Time Machine snapshots, simulators, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed.
 
