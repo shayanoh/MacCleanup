@@ -351,6 +351,14 @@ pub struct Space {
     pub saved: u64,
 }
 
+impl Space {
+    /// What deleting everything in a *set* frees: also the data shared only
+    /// among the set's own files (its holders are all being deleted).
+    pub fn frees_all(&self) -> u64 {
+        self.frees_now.saturating_add(self.shared_inside)
+    }
+}
+
 impl Add for Space {
     type Output = Space;
     fn add(self, o: Space) -> Space {
@@ -736,60 +744,26 @@ impl Scanner {
     /// Read the clone and hard-link tables once and work out the [`Space`]
     /// of every node. `locate` says which node (by index) a path belongs to.
     fn compute(&self, nodes: &[Arc<Node>], locate: &dyn Fn(&Path) -> Option<usize>) -> Vec<Space> {
-        let mut acc: Vec<Acc> = nodes
-            .iter()
-            .map(|n| Acc {
-                disk: n.disk(),
-                private: n.private(),
-                snap: n.snapshot_held(),
-                ..Acc::default()
-            })
-            .collect();
-        let mut counts: HashMap<usize, u64> = HashMap::new();
+        compute_with(&self.shared, seeds(nodes), locate)
+    }
 
-        for shard in &self.shared.clones.shards {
-            for group in lock(shard).values() {
-                counts.clear();
-                for dir in &group.members {
-                    if let Some(i) = locate(&dir.path) {
-                        *counts.entry(i).or_default() += 1;
-                    }
-                }
-                for (&i, &members) in &counts {
-                    let a = &mut acc[i];
-                    if members >= u64::from(group.refcnt) {
-                        a.inside += group.shared;
-                    } else {
-                        a.outside += group.shared;
-                    }
-                    a.saved_clones += group.shared.saturating_mul(members - 1);
-                }
-            }
+    /// A cheap handle that can work out set-wise space on another thread.
+    pub fn view(&self) -> SpaceView {
+        SpaceView {
+            shared: Arc::clone(&self.shared),
         }
+    }
 
-        for group in lock(&self.shared.links).values() {
-            counts.clear();
-            for path in &group.paths {
-                if let Some(i) = locate(path) {
-                    *counts.entry(i).or_default() += 1;
-                }
-            }
-            let credited = group.counted_by.as_deref().and_then(locate);
-            for (&i, &links) in &counts {
-                let a = &mut acc[i];
-                if credited != Some(i) {
-                    a.extra_links += group.disk;
-                }
-                if links >= group.nlink {
-                    a.frees_links += group.private;
-                    a.snap_links += group.disk - group.private;
-                } else {
-                    a.outside += group.disk;
-                }
-                a.saved_links += group.disk.saturating_mul(links - 1);
-            }
-        }
-        acc.into_iter().map(Acc::finish).collect()
+    /// Where the space of a whole set of (disjoint) folders would go if they
+    /// were all deleted together: a clone set frees only when every holder
+    /// is inside the set.
+    pub fn space_of_set(&self, nodes: &[Arc<Node>]) -> Space {
+        self.view().space_of_set(nodes)
+    }
+
+    /// [`Scanner::space`] for many disjoint folders in one pass.
+    pub fn spaces_of(&self, nodes: &[Arc<Node>]) -> Vec<Space> {
+        self.view().spaces_of(nodes)
     }
 
     /// Drop the hard-link entries inside a rescanned folder. A file that this
@@ -952,6 +926,107 @@ impl Scanner {
             thread::sleep(Duration::from_millis(5));
         }
         true
+    }
+}
+
+/// Starting numbers for each node (what its own plain files add up to).
+fn seeds(nodes: &[Arc<Node>]) -> Vec<Acc> {
+    nodes
+        .iter()
+        .map(|n| Acc {
+            disk: n.disk(),
+            private: n.private(),
+            snap: n.snapshot_held(),
+            ..Acc::default()
+        })
+        .collect()
+}
+
+/// Read the clone and hard-link tables once and finish every seed.
+fn compute_with(
+    shared: &Shared,
+    mut acc: Vec<Acc>,
+    locate: &dyn Fn(&Path) -> Option<usize>,
+) -> Vec<Space> {
+    let mut counts: HashMap<usize, u64> = HashMap::new();
+    for shard in &shared.clones.shards {
+        for group in lock(shard).values() {
+            counts.clear();
+            for dir in &group.members {
+                if let Some(i) = locate(&dir.path) {
+                    *counts.entry(i).or_default() += 1;
+                }
+            }
+            for (&i, &members) in &counts {
+                let a = &mut acc[i];
+                if members >= u64::from(group.refcnt) {
+                    a.inside += group.shared;
+                } else {
+                    a.outside += group.shared;
+                }
+                a.saved_clones += group.shared.saturating_mul(members - 1);
+            }
+        }
+    }
+    for group in lock(&shared.links).values() {
+        counts.clear();
+        for path in &group.paths {
+            if let Some(i) = locate(path) {
+                *counts.entry(i).or_default() += 1;
+            }
+        }
+        let credited = group.counted_by.as_deref().and_then(locate);
+        for (&i, &links) in &counts {
+            let a = &mut acc[i];
+            if credited != Some(i) {
+                a.extra_links += group.disk;
+            }
+            if links >= group.nlink {
+                a.frees_links += group.private;
+                a.snap_links += group.disk - group.private;
+            } else {
+                a.outside += group.disk;
+            }
+            a.saved_links += group.disk.saturating_mul(links - 1);
+        }
+    }
+    acc.into_iter().map(Acc::finish).collect()
+}
+
+/// Set-wise space, usable from any thread while the scanner lives on.
+#[derive(Clone)]
+pub struct SpaceView {
+    shared: Arc<Shared>,
+}
+
+impl SpaceView {
+    /// See [`Scanner::space_of_set`].
+    pub fn space_of_set(&self, nodes: &[Arc<Node>]) -> Space {
+        if nodes.is_empty() {
+            return Space::default();
+        }
+        let mut seed = Acc::default();
+        for s in seeds(nodes) {
+            seed.disk += s.disk;
+            seed.private += s.private;
+            seed.snap += s.snap;
+        }
+        let roots: HashSet<&Path> = nodes.iter().map(|n| n.path.as_path()).collect();
+        let locate = |p: &Path| p.ancestors().any(|a| roots.contains(a)).then_some(0);
+        compute_with(&self.shared, vec![seed], &locate)
+            .pop()
+            .unwrap_or_default()
+    }
+
+    /// See [`Scanner::spaces_of`].
+    pub fn spaces_of(&self, nodes: &[Arc<Node>]) -> Vec<Space> {
+        let index: HashMap<&Path, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.path.as_path(), i))
+            .collect();
+        let locate = |p: &Path| p.ancestors().find_map(|a| index.get(a).copied());
+        compute_with(&self.shared, seeds(nodes), &locate)
     }
 }
 
@@ -1497,6 +1572,59 @@ mod tests {
 
     fn identity_holds(sp: &Space) -> bool {
         sp.footprint == sp.frees_now + sp.snapshots + sp.shared_inside + sp.shared_outside
+    }
+
+    /// store/f with clones in a/f and b/f: three holders of one block.
+    fn three_holders(r: &Path) -> (Scanner, Arc<Node>) {
+        write(&r.join("store/f"), 200_000);
+        clone_file(r, "store/f", "a/f");
+        clone_file(r, "store/f", "b/f");
+        scan(r, 2)
+    }
+
+    #[test]
+    fn set_frees_clone_data_only_when_every_holder_is_in_the_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let (s, root) = three_holders(r);
+        let node = |n: &str| root.subdir(&r.join(n)).unwrap();
+        let (store, a, b) = (node("store"), node("a"), node("b"));
+        assert_eq!(s.space_of_set(&[a.clone()]).frees_all(), 0);
+        assert_eq!(s.space_of_set(&[a.clone(), b.clone()]).frees_all(), 0);
+        assert_eq!(s.space_of_set(&[store.clone(), a.clone()]).frees_all(), 0);
+        let all = s.space_of_set(&[store, a, b]);
+        assert!(all.frees_all() >= 200_000, "{all:?}");
+        assert_eq!(all.shared_outside, 0);
+    }
+
+    #[test]
+    fn set_space_identity_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let (s, root) = three_holders(r);
+        let store = root.subdir(&r.join("store")).unwrap();
+        let a = root.subdir(&r.join("a")).unwrap();
+        assert!(identity_holds(&s.space_of_set(&[store, a])));
+    }
+
+    #[test]
+    fn spaces_of_matches_space_for_disjoint_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let (s, root) = three_holders(r);
+        let a = root.subdir(&r.join("a")).unwrap();
+        let b = root.subdir(&r.join("b")).unwrap();
+        let many = s.spaces_of(&[a.clone(), b.clone()]);
+        assert_eq!(many, vec![s.space(&a), s.space(&b)]);
+    }
+
+    #[test]
+    fn a_set_of_one_node_equals_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        let (s, root) = three_holders(r);
+        let a = root.subdir(&r.join("a")).unwrap();
+        assert_eq!(s.space_of_set(std::slice::from_ref(&a)), s.space(&a));
     }
 
     #[test]
