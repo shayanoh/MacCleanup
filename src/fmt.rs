@@ -102,6 +102,24 @@ pub fn ago(now: i64, then: i64) -> String {
     }
 }
 
+/// `2026-10-23` for a Unix time (UTC); "-" when unknown (0 or less).
+pub fn date(secs: i64) -> String {
+    if secs <= 0 {
+        return "-".to_string();
+    }
+    // Howard Hinnant's civil-from-days.
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 pub fn both_usage(u: Usage) -> String {
     both(u.size, u.disk)
 }
@@ -186,6 +204,15 @@ mod tests {
     fn both_shows_size_and_on_disk() {
         assert_eq!(both(1500, 4096), "1.5 KB (4.1 KB on disk)");
         assert_eq!(both(0, 0), "0 B (0 B on disk)");
+    }
+
+    #[test]
+    fn date_formats_utc_days() {
+        assert_eq!(date(0), "-");
+        assert_eq!(date(-5), "-");
+        assert_eq!(date(1), "1970-01-01");
+        assert_eq!(date(1_792_767_623), "2026-10-23");
+        assert_eq!(date(951_782_400), "2000-02-29", "a leap day");
     }
 
     #[test]

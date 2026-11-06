@@ -2543,3 +2543,138 @@ fn docker_status_line_shows_the_vm_disk() {
     let t = render(&mut e.app, 150, 40);
     assert!(t.contains("VM disk"), "{t}");
 }
+
+fn docker_cursor(e: &mut Env, key: &str) {
+    let at = e
+        .app
+        .docker
+        .lines
+        .iter()
+        .position(|l| l.key == key)
+        .unwrap_or_else(|| panic!("no line {key}"));
+    e.app.docker.cursor = at;
+}
+
+fn docker_text_at(e: &mut Env, key: &str) -> String {
+    docker_cursor(e, key);
+    render(&mut e.app, 210, 50)
+}
+
+#[test]
+fn docker_layer_rows_show_command_size_and_the_biggest_one() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 210, 50);
+    assert!(t.contains("pnpm install"), "tidied command:\n{t}");
+    assert!(!t.contains("buildkit"), "noise is dropped:\n{t}");
+    let biggest: Vec<&str> = t.lines().filter(|l| l.contains("biggest")).collect();
+    assert_eq!(biggest.len(), 1, "exactly one biggest layer:\n{t}");
+    assert!(biggest[0].contains("alpine-minirootfs"), "{}", biggest[0]);
+}
+
+#[test]
+fn docker_image_details_explain_the_proxy_layers_and_what_holds_it() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = docker_text_at(&mut e, "image:sha256:aaa1");
+    for want in [
+        "tags: web:latest",
+        "layers: 5",
+        "worked out from its containers",
+        "web-1",
+        "cannot be removed",
+    ] {
+        assert!(t.contains(want), "missing {want:?}:\n{t}");
+    }
+}
+
+#[test]
+fn docker_image_with_stopped_containers_says_to_remove_them_first() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = docker_text_at(&mut e, "image:sha256:bbb2");
+    assert!(t.contains("remove these containers first"), "{t}");
+    assert!(t.contains("old"), "{t}");
+}
+
+#[test]
+fn docker_container_volume_cache_and_layer_details() {
+    let mut e = docker_screen(GlyphMode::Nerd);
+    let t = docker_text_at(&mut e, "container:c0ffee2");
+    assert!(t.contains("stopped") && !t.contains("volumes:"), "{t}");
+    let t = docker_text_at(&mut e, "volume:pgdata");
+    assert!(t.contains("cannot be recovered"), "{t}");
+    assert!(t.contains("web-1"), "{t}");
+    let t = docker_text_at(&mut e, "cache:child1");
+    assert!(t.contains("mount / from exec"), "the original wording: {t}");
+    assert!(t.contains("used 2 times"), "{t}");
+    let t = docker_text_at(&mut e, "layer:sha256:aaa1:3");
+    assert!(t.contains("RUN /bin/sh -c pnpm install"), "{t}");
+    assert!(t.contains("only in this image"), "{t}");
+}
+
+/// A build step too long for any pane, ending in a marker.
+fn long_step_df() -> String {
+    let long = format!(
+        "mount / from exec /bin/sh -c {} TAILMARK",
+        "apt-get install -y some-quite-long-package-name ".repeat(12)
+    );
+    DOCKER_DF.replace("mount / from exec /bin/sh -c apt-get update", &long)
+}
+
+#[test]
+fn docker_details_show_the_whole_command_line() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, &long_step_df(), true, false);
+    let t = docker_text_at(&mut e, "cache:child1");
+    assert!(
+        t.contains("TAILMARK"),
+        "the end of the command is shown:\n{t}"
+    );
+    assert!(
+        t.matches("some-quite-long-package-name").count() >= 6,
+        "wrapped over several lines, not cut:\n{t}"
+    );
+}
+
+#[test]
+fn docker_details_scroll_with_the_detail_keys_when_they_do_not_fit() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, &long_step_df(), true, false);
+    docker_cursor(&mut e, "cache:child1");
+    // A short terminal: the wrapped command cannot fit in the pane.
+    let top = render(&mut e.app, 150, 22);
+    assert!(!top.contains("TAILMARK"), "starts at the top:\n{top}");
+    let mut seen = false;
+    for _ in 0..60 {
+        e.app.update(Action::DetailScroll(1));
+        if render(&mut e.app, 150, 22).contains("TAILMARK") {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "scrolling down reaches the end of the command");
+    // It stops at the end: more presses change nothing and need no catching up.
+    for _ in 0..50 {
+        e.app.update(Action::DetailScroll(1));
+    }
+    let end = render(&mut e.app, 150, 22);
+    assert!(end.contains("TAILMARK"));
+    e.app.update(Action::DetailScroll(-1));
+    let up = render(&mut e.app, 150, 22);
+    assert_ne!(end, up, "one press up moves it at once");
+    for _ in 0..100 {
+        e.app.update(Action::DetailScroll(-1));
+    }
+    assert!(!render(&mut e.app, 150, 22).contains("TAILMARK"));
+}
+
+#[test]
+fn docker_details_scroll_resets_when_the_selection_changes() {
+    let mut e = docker_screen_with(GlyphMode::Nerd, &long_step_df(), true, false);
+    docker_cursor(&mut e, "cache:child1");
+    render(&mut e.app, 150, 22);
+    for _ in 0..8 {
+        e.app.update(Action::DetailScroll(1));
+        render(&mut e.app, 150, 22);
+    }
+    assert!(e.app.docker.detail_scroll > 0);
+    docker_cursor(&mut e, "cache:root1");
+    render(&mut e.app, 150, 22);
+    assert_eq!(e.app.docker.detail_scroll, 0);
+}

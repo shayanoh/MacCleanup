@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use super::explorer::{Cols, cols, value_style};
 use super::graph::{self, GraphData};
@@ -465,6 +465,45 @@ pub fn tidy_command(text: &str) -> String {
     t.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The other images that hold the same layer as `image`'s layer `diff`.
+fn layer_shared_with(app: &App, image: &str, diff: &Option<String>) -> Vec<String> {
+    let Some(diff) = diff else {
+        return Vec::new();
+    };
+    let Some(all) = app.docker.layers() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<&String> = all
+        .iter()
+        .filter(|(id, ls)| {
+            id.as_str() != image && ls.iter().any(|l| l.diff_id.as_ref() == Some(diff))
+        })
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort();
+    ids.into_iter()
+        .map(|id| {
+            app.docker
+                .facts(&format!("image:{id}"))
+                .map_or_else(|| id.clone(), |f| f.name.clone())
+        })
+        .collect()
+}
+
+/// Is layer `n` the biggest of its image (the first one if tied)?
+fn is_biggest_layer(app: &App, image: &str, n: usize) -> bool {
+    let Some(layers) = app.docker.layers().and_then(|l| l.get(image)) else {
+        return false;
+    };
+    let best = layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.size > 0)
+        .max_by_key(|(i, l)| (l.size, std::cmp::Reverse(*i)))
+        .map(|(i, _)| i);
+    best == Some(n)
+}
+
 /// `(image id, layer number)` of a layer line's key.
 fn layer_ref(key: &str) -> Option<(&str, usize)> {
     let (image, n) = key.strip_prefix("layer:")?.rsplit_once(':')?;
@@ -501,23 +540,17 @@ fn row_line(
                 .layers()
                 .and_then(|l| l.get(image))
                 .and_then(|l| l.get(n));
-            let shared = layer.is_some_and(|l| {
-                l.diff_id.as_ref().is_some_and(|d| {
-                    app.docker
-                        .layers()
-                        .into_iter()
-                        .flat_map(|all| all.iter())
-                        .filter(|(id, ls)| {
-                            id.as_str() != image && ls.iter().any(|x| x.diff_id.as_ref() == Some(d))
-                        })
-                        .count()
-                        > 0
-                })
-            });
+            let shared =
+                layer.is_some_and(|l| !layer_shared_with(app, image, &l.diff_id).is_empty());
+            let biggest = is_biggest_layer(app, image, n);
             let size = layer.map_or(0, |l| l.size);
             (
                 layer.map_or_else(String::new, |l| tidy_command(&l.command)),
-                if shared { "  shared" } else { "" }.to_string(),
+                format!(
+                    "{}{}",
+                    if shared { "  shared" } else { "" },
+                    if biggest { "  biggest" } else { "" }
+                ),
                 Some(size),
                 Some(if size == 0 {
                     "-".to_string()
@@ -744,7 +777,7 @@ fn summary_line(app: &App, width: usize) -> TextLine<'static> {
 }
 
 /// The graph (unless hidden) over the details pane.
-fn render_side(frame: &mut Frame, area: Rect, app: &App) -> Vec<graph::GraphHit> {
+fn render_side(frame: &mut Frame, area: Rect, app: &mut App) -> Vec<graph::GraphHit> {
     let g = app.glyphs;
     if app.graph == GraphMode::Hidden || area.height < 16 {
         render_detail(frame, area, app, &g);
@@ -819,7 +852,7 @@ fn graph_data(app: &App) -> GraphData {
     }
 }
 
-fn render_detail(frame: &mut Frame, area: Rect, app: &App, g: &Glyphs) {
+fn render_detail(frame: &mut Frame, area: Rect, app: &mut App, g: &Glyphs) {
     let block = panel(g, " Details ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -827,38 +860,444 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, g: &Glyphs) {
         return;
     }
     let lines = detail_lines(app, inner.width as usize);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    // Another line selected: start at the top again. The scroll can never
+    // pass the point where the last line is at the bottom.
+    let key = app
+        .docker
+        .selected()
+        .map(|l| l.key.clone())
+        .unwrap_or_default();
+    if app.docker.detail_key != key {
+        app.docker.detail_key = key;
+        app.docker.detail_scroll = 0;
+    }
+    let max = lines.len().saturating_sub(inner.height as usize);
+    app.docker.detail_max = max;
+    app.docker.detail_scroll = app.docker.detail_scroll.min(max);
+    let from = app.docker.detail_scroll;
+    let shown: Vec<TextLine> = lines
+        .into_iter()
+        .skip(from)
+        .take(inner.height as usize)
+        .collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+    if max > 0 {
+        let mut state = ScrollbarState::new(max).position(from);
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some(g.scroll_track()))
+            .thumb_symbol(g.scroll_thumb())
+            .style(Style::default().fg(ACCENT));
+        frame.render_stateful_widget(bar, inner, &mut state);
+    }
 }
 
+/// Break `text` into lines of at most `width` columns: at spaces where it
+/// can, in the middle of a word only when one word is wider than a line.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split(' ') {
+        let w = text_width(word);
+        if w > width {
+            // Flush, then cut the long word into pieces.
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            for ch in word.chars() {
+                let cw = ch.width().unwrap_or(0);
+                if cur_w + cw > width {
+                    out.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                cur.push(ch);
+                cur_w += cw;
+            }
+            continue;
+        }
+        let needed = if cur.is_empty() { w } else { cur_w + 1 + w };
+        if needed > width {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+            cur_w += 1;
+        }
+        cur.push_str(word);
+        cur_w += w;
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// A details line as one or more lines of at most `width` columns. A line
+/// made of several spans is wrapped as a whole in its last span's style.
+fn wrap_line(line: TextLine<'static>, width: usize) -> Vec<TextLine<'static>> {
+    let total: usize = line.spans.iter().map(|s| text_width(&s.content)).sum();
+    if total <= width {
+        return vec![line];
+    }
+    let style = line.spans.last().map(|s| s.style).unwrap_or_default();
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    wrap_text(&text, width)
+        .into_iter()
+        .map(|l| TextLine::from(Span::styled(l, style)))
+        .collect()
+}
+
+/// The details pane's lines, each wrapped to `width`.
 fn detail_lines(app: &App, width: usize) -> Vec<TextLine<'static>> {
+    detail_lines_raw(app, width)
+        .into_iter()
+        .flat_map(|l| wrap_line(l, width))
+        .collect()
+}
+
+fn detail_lines_raw(app: &App, width: usize) -> Vec<TextLine<'static>> {
     let g = &app.glyphs;
     let dim = Style::default().fg(DIM);
     let Some(line) = app.docker.selected() else {
         return vec![TextLine::from(Span::styled("nothing selected", dim))];
     };
-    if let DKind::Section(_) = line.kind {
-        return vec![TextLine::from(Span::styled(
-            "space marks everything here that is safe to remove in bulk",
-            dim,
-        ))];
+    let mut out: Vec<TextLine<'static>> = Vec::new();
+    let plain = |t: String| TextLine::from(clean_text(&t, g));
+    let warn = |t: String| {
+        TextLine::from(Span::styled(
+            clean_text(&t, g),
+            Style::default().fg(Color::Yellow),
+        ))
+    };
+    let now = now_secs();
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    match line.kind {
+        DKind::Section(_) => {
+            out.push(TextLine::from(Span::styled(
+                "space marks everything here that is safe to remove in bulk",
+                dim,
+            )));
+            return out;
+        }
+        DKind::Layer(n) => {
+            let Some((image, _)) = layer_ref(&line.key) else {
+                return out;
+            };
+            let layer = app
+                .docker
+                .layers()
+                .and_then(|l| l.get(image))
+                .and_then(|l| l.get(n));
+            let Some(l) = layer else {
+                return out;
+            };
+            out.push(TextLine::from(Span::styled(
+                format!("layer {} of {}", n + 1, image_name(app, image)),
+                bold,
+            )));
+            out.push(plain(clean_text(&l.command, g)));
+            out.push(TextLine::raw(""));
+            out.push(plain(format!(
+                "size {} {} created {}",
+                human_size(l.size),
+                g.dot(),
+                crate::fmt::date(l.created)
+            )));
+            let with = layer_shared_with(app, image, &l.diff_id);
+            if l.size == 0 {
+                out.push(TextLine::from(Span::styled(
+                    "an empty step: it adds no data",
+                    dim,
+                )));
+            } else if with.is_empty() {
+                out.push(plain(
+                    "only in this image: removing the image frees it".to_string(),
+                ));
+            } else {
+                out.push(warn(format!(
+                    "also in: {} (stays while they stay)",
+                    with.join(", ")
+                )));
+            }
+            return out;
+        }
+        _ => {}
     }
     let Some(f) = app.docker.facts(&line.key) else {
         return vec![TextLine::from(Span::styled(fit(&line.key, width, g), dim))];
     };
     let safety = safety_of(f);
-    vec![
-        TextLine::from(vec![
-            Span::styled(
-                format!("{} ", safety_dot(g, safety)),
-                Style::default().fg(safety_color(safety)),
+    out.push(TextLine::from(vec![
+        Span::styled(
+            format!("{} ", safety_dot(g, safety)),
+            Style::default().fg(safety_color(safety)),
+        ),
+        Span::styled(fit(&f.name, width.saturating_sub(3), g), bold),
+    ]));
+    if f.kind != ItemKind::CacheRecord {
+        out.push(TextLine::from(Span::styled(
+            fit_start(&line.key, width, g),
+            dim,
+        )));
+    }
+    let data = app.docker.data();
+    let holder_names = |f: &ItemFacts| -> Vec<String> {
+        f.holders
+            .iter()
+            .filter_map(|id| {
+                let c = data?
+                    .containers
+                    .iter()
+                    .find(|c| format!("container:{}", c.id) == *id)?;
+                Some(format!("{} ({})", c.name, state_word(c.state)))
+            })
+            .collect()
+    };
+    let last_used = |out: &mut Vec<TextLine<'static>>| {
+        let when = ago(now, f.last_used);
+        if !f.last_used_is_proxy {
+            out.push(plain(format!("last used: {when}")));
+        } else if f.holders.is_empty() {
+            out.push(plain(format!(
+                "last used: not recorded; never used by a container (created {})",
+                ago(now, f.created)
+            )));
+        } else {
+            out.push(plain(format!(
+                "last used: {when} (worked out from its containers)"
+            )));
+        }
+    };
+    match f.kind {
+        ItemKind::Image => {
+            let tags = app
+                .docker
+                .data()
+                .and_then(|d| {
+                    d.images
+                        .iter()
+                        .find(|i| format!("image:{}", i.id) == line.key)
+                })
+                .map(|i| i.tags.clone())
+                .unwrap_or_default();
+            out.push(plain(if tags.is_empty() {
+                "no tags (dangling)".to_string()
+            } else {
+                format!("tags: {}", tags.join(", "))
+            }));
+            out.push(plain(format!(
+                "created {} ({})",
+                crate::fmt::date(f.created),
+                ago(now, f.created)
+            )));
+            last_used(&mut out);
+            out.push(TextLine::from(Span::styled(
+                "comes back: pull it again, or rebuild it",
+                dim,
+            )));
+            out.push(TextLine::raw(""));
+            out.push(TextLine::from(Span::styled(
+                format!(
+                    "frees now {} {} kept by other images {}",
+                    human_size(f.frees_alone),
+                    g.dot(),
+                    human_size(f.kept_by_others)
+                ),
+                Style::default().fg(Color::Green),
+            )));
+            if f.approximate {
+                out.push(warn(
+                    "layer information is incomplete: shared figures are a guess".to_string(),
+                ));
+            }
+            let image_id = line.key.strip_prefix("image:").unwrap_or(&line.key);
+            if let Some(ls) = app.docker.layers().and_then(|l| l.get(image_id))
+                && !ls.is_empty()
+            {
+                let big = ls.iter().max_by_key(|l| l.size);
+                out.push(plain(format!(
+                    "layers: {} {} biggest {}",
+                    ls.len(),
+                    g.dot(),
+                    big.map_or_else(
+                        || "-".to_string(),
+                        |b| format!("{} ({})", human_size(b.size), tidy_command(&b.command))
+                    )
+                )));
+            }
+        }
+        ItemKind::Container => {
+            if let Some(c) = data.and_then(|d| {
+                d.containers
+                    .iter()
+                    .find(|c| format!("container:{}", c.id) == line.key)
+            }) {
+                out.push(plain(format!(
+                    "{} {} image {}",
+                    state_word(c.state),
+                    g.dot(),
+                    image_name(app, &c.image_id)
+                )));
+                out.push(plain(format!(
+                    "created {} {} started {} {} finished {}",
+                    crate::fmt::date(c.created),
+                    g.dot(),
+                    crate::fmt::date(c.started),
+                    g.dot(),
+                    crate::fmt::date(c.finished)
+                )));
+                if !c.volumes.is_empty() {
+                    out.push(plain(format!("volumes: {}", c.volumes.join(", "))));
+                }
+            }
+        }
+        ItemKind::Volume => {
+            if let Some(v) = data.and_then(|d| {
+                d.volumes
+                    .iter()
+                    .find(|v| format!("volume:{}", v.name) == line.key)
+            }) {
+                out.push(TextLine::from(Span::styled(
+                    fit_start(&v.mountpoint, width, g),
+                    dim,
+                )));
+                out.push(plain(format!(
+                    "{} {} created {}",
+                    human_size(v.size),
+                    g.dot(),
+                    crate::fmt::date(v.created)
+                )));
+            }
+            last_used(&mut out);
+            let users = holder_names(f);
+            out.push(plain(if users.is_empty() {
+                "used by no container".to_string()
+            } else {
+                format!("used by: {}", users.join(", "))
+            }));
+            out.push(warn(
+                "data in a volume cannot be recovered once it is removed".to_string(),
+            ));
+        }
+        ItemKind::CacheRecord => {
+            out.push(plain(clean_text(&f.name, g)));
+            if let Some(r) = data.and_then(|d| {
+                d.cache
+                    .iter()
+                    .find(|r| format!("cache:{}", r.id) == line.key)
+            }) {
+                out.push(TextLine::raw(""));
+                out.push(plain(format!(
+                    "{} {} used {} times {} {}",
+                    r.kind,
+                    g.dot(),
+                    r.usage_count,
+                    g.dot(),
+                    if r.shared { "shared" } else { "not shared" }
+                )));
+                out.push(plain(format!(
+                    "created {} {} last used {}",
+                    crate::fmt::date(f.created),
+                    g.dot(),
+                    ago(now, f.last_used)
+                )));
+                let children = data
+                    .map(|d| {
+                        d.cache
+                            .iter()
+                            .filter(|c| c.parents.first() == Some(&r.id))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if !r.parents.is_empty() || children > 0 {
+                    out.push(plain(format!(
+                        "built on {} earlier step(s); {} later step(s) build on it",
+                        r.parents.len(),
+                        children
+                    )));
+                }
+            }
+        }
+        ItemKind::VmTrim => {}
+    }
+    if !matches!(f.kind, ItemKind::Container | ItemKind::CacheRecord) {
+        let users = holder_names(f);
+        if !users.is_empty() && f.kind == ItemKind::Image {
+            out.push(TextLine::raw(""));
+            out.push(TextLine::from(Span::styled("used by:", bold)));
+            for u in users {
+                out.push(plain(format!("  {u}")));
+            }
+        }
+    }
+    if !f.needs.is_empty() && f.removable.is_ok() {
+        let names: Vec<String> = f
+            .needs
+            .iter()
+            .map(|id| {
+                app.docker
+                    .facts(id)
+                    .map_or_else(|| id.clone(), |c| c.name.clone())
+            })
+            .collect();
+        out.push(warn(format!(
+            "remove these containers first: {} (m marks them)",
+            names.join(", ")
+        )));
+    }
+    match &f.removable {
+        Err(Refusal::Running(names)) => out.push(TextLine::from(Span::styled(
+            format!(
+                "cannot be removed: used by running container(s) {}",
+                names.join(", ")
             ),
-            Span::styled(
-                fit(&f.name, width.saturating_sub(3), g),
-                Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red),
+        ))),
+        Err(Refusal::CacheInUse) => out.push(TextLine::from(Span::styled(
+            "cannot be removed: a build is using it right now",
+            Style::default().fg(Color::Red),
+        ))),
+        Ok(()) => {}
+    }
+    if !app.docker_marked().is_empty() {
+        out.push(TextLine::raw(""));
+        out.push(TextLine::from(Span::styled(
+            format!(
+                "with everything you marked: frees {} in Docker",
+                app.docker_frees()
+                    .map_or_else(|| g.ellipsis().to_string(), human_size)
             ),
-        ]),
-        TextLine::from(Span::styled(fit_start(&line.key, width, g), dim)),
-    ]
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    out
+}
+
+fn state_word(s: ContainerState) -> &'static str {
+    match s {
+        ContainerState::Running => "running",
+        ContainerState::Stopped => "stopped",
+        ContainerState::Other => "paused",
+    }
+}
+
+fn image_name(app: &App, image_id: &str) -> String {
+    app.docker
+        .facts(&format!("image:{image_id}"))
+        .map_or_else(|| image_id.to_string(), |f| f.name.clone())
+}
+
+/// Text from Docker made safe to draw (control characters, ASCII mode).
+fn clean_text(text: &str, g: &Glyphs) -> String {
+    super::clean(text, g)
 }
 
 #[cfg(test)]

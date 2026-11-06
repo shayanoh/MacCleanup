@@ -57,7 +57,11 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::PageDown => Some(Action::PageDown),
         KeyCode::Char(' ') => Some(Action::ToggleMark),
         KeyCode::Char('d') => Some(Action::OpenReview),
-        KeyCode::Char('m') if app.screen == Screen::Targets => Some(Action::MarkRelated),
+        KeyCode::Char('J') if app.screen == Screen::Docker => Some(Action::DetailScroll(1)),
+        KeyCode::Char('K') if app.screen == Screen::Docker => Some(Action::DetailScroll(-1)),
+        KeyCode::Char('m') if matches!(app.screen, Screen::Targets | Screen::Docker) => {
+            Some(Action::MarkRelated)
+        }
         KeyCode::Char('g') => Some(Action::Top),
         KeyCode::Char('t') => Some(Action::CycleGraph),
         KeyCode::Char('s') => Some(Action::CycleSort),
@@ -702,6 +706,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn shift_j_and_k_scroll_the_docker_details_only_on_that_page() {
+        let mut e = env(FILES);
+        let k = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+        e.app.update(Action::GoTo(Screen::Docker));
+        assert_eq!(map_key(k('J'), &e.app), Some(Action::DetailScroll(1)));
+        assert_eq!(map_key(k('K'), &e.app), Some(Action::DetailScroll(-1)));
+        e.app.update(Action::GoTo(Screen::Explorer));
+        assert_eq!(map_key(k('J'), &e.app), None);
     }
 
     #[test]

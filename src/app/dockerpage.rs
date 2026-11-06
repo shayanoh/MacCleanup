@@ -151,6 +151,46 @@ impl App {
         }
     }
 
+    /// `m`: mark the stopped containers the selected image or volume needs
+    /// removed first (Docker refuses to remove it otherwise).
+    pub(super) fn docker_mark_needed(&mut self) {
+        let Some(line) = self.docker.selected().cloned() else {
+            return;
+        };
+        let needs: Vec<String> = self
+            .docker
+            .facts(&line.key)
+            .map(|f| f.needs.clone())
+            .unwrap_or_default();
+        let mut changed = 0;
+        for id in needs {
+            let ok = self.docker.facts(&id).is_some_and(|f| f.removable.is_ok());
+            if ok && self.tool_marks.insert(id) {
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.marks_changed();
+            self.notice = Some(format!(
+                "Marked {changed} container(s) that must go with it"
+            ));
+        } else {
+            self.notice = Some("Nothing more to mark here".to_string());
+        }
+    }
+
+    /// Shift-J / Shift-K: scroll the details pane, never past its ends.
+    pub(super) fn docker_scroll_details(&mut self, by: i16) {
+        if self.screen != Screen::Docker {
+            return;
+        }
+        let d = &mut self.docker;
+        d.detail_scroll = d
+            .detail_scroll
+            .saturating_add_signed(isize::from(by))
+            .min(d.detail_max);
+    }
+
     pub(super) fn docker_cycle_sort(&mut self) {
         self.docker.view.sort = self.docker.view.sort.next();
         self.docker_refilter();
@@ -417,6 +457,20 @@ mod tests {
             "image:sha256:bbb2",
             "from a leaf, out goes to the parent"
         );
+    }
+
+    #[test]
+    fn m_marks_the_stopped_containers_an_image_needs() {
+        let mut e = loaded_app();
+        cursor_on(&mut e.app, "image:sha256:bbb2");
+        e.app.update(Action::MarkRelated);
+        assert!(e.app.tool_marks.contains("container:c0ffee2"));
+        assert!(
+            !e.app.tool_marks.contains("image:sha256:bbb2"),
+            "only the related ones"
+        );
+        e.app.update(Action::MarkRelated);
+        assert_eq!(e.app.notice.as_deref(), Some("Nothing more to mark here"));
     }
 
     #[test]

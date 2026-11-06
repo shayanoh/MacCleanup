@@ -143,6 +143,8 @@ pub enum Action {
         y: u16,
     },
     Scroll(i16),
+    /// Scroll the details pane of the Docker page (Shift-J / Shift-K).
+    DetailScroll(i16),
     Tick,
     /// Rescan the folder being shown.
     Rescan,
@@ -969,6 +971,7 @@ impl App {
             Action::GrowGraph => self.graph_pct = (self.graph_pct + 5).min(70),
             Action::ShrinkGraph => self.graph_pct = self.graph_pct.saturating_sub(5).max(20),
             Action::CycleSort if self.screen == Screen::Docker => self.docker_cycle_sort(),
+            Action::DetailScroll(by) => self.docker_scroll_details(by),
             Action::CycleSort => {
                 self.sort = match self.sort {
                     // Same order as the column headers: Name, Size, On disk,
@@ -1692,6 +1695,10 @@ impl App {
 
     /// `m`: mark the selected folder and every folder that shares its data.
     fn mark_related(&mut self) {
+        if self.screen == Screen::Docker {
+            self.docker_mark_needed();
+            return;
+        }
         if self.screen != Screen::Targets {
             return;
         }

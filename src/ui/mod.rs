@@ -339,6 +339,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 "/ filter",
                 "space mark",
                 "d review",
+                "J/K scroll details",
                 "r reread",
                 "s sort",
                 "tab menu",

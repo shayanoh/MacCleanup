@@ -34,6 +34,12 @@ pub struct DockerState {
     pub stale: bool,
     /// Something read at least once (successfully or not).
     pub read_once: bool,
+    /// How many lines the details pane is scrolled down, how far it can go
+    /// (written by the drawing code, which knows the pane's size), and which
+    /// line the scroll belongs to (it starts over for another one).
+    pub detail_scroll: usize,
+    pub detail_max: usize,
+    pub detail_key: String,
 }
 
 impl Default for DockerState {
@@ -57,6 +63,9 @@ impl DockerState {
             offset: 0,
             stale: false,
             read_once: false,
+            detail_scroll: 0,
+            detail_max: 0,
+            detail_key: String::new(),
         }
     }
 
