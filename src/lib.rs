@@ -1,4 +1,5 @@
 pub mod accounting;
+pub mod anim;
 pub mod app;
 pub mod cli;
 pub mod fmt;
