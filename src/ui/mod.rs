@@ -31,7 +31,7 @@ pub const MIN_HEIGHT: u16 = 14;
 pub const SIDEBAR_WIDTH: u16 = 23;
 
 pub const ACCENT: Color = Color::Cyan;
-pub const DIM: Color = Color::DarkGray;
+pub const DIM: Color = Color::Rgb(170, 176, 192);
 pub const SAFE: Color = Color::Green;
 pub const CAUTION: Color = Color::Yellow;
 pub const DANGER: Color = Color::Red;
@@ -353,6 +353,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 "l/enter open folder",
                 "h up",
                 "/ filter",
+                "s sort",
+                "t graph type",
+                "[ ] resize",
                 "r reread",
                 "esc back",
                 "q quit",
@@ -381,6 +384,19 @@ mod tests {
 
     fn ascii() -> Glyphs {
         Glyphs::new(GlyphMode::Ascii)
+    }
+
+    #[test]
+    fn the_dim_colour_is_light_enough_to_read_on_a_dark_terminal() {
+        // Borders and column headers use it: the terminal's own "dark gray"
+        // is nearly invisible on many dark themes, so it is a fixed light
+        // gray, still clearly dimmer than white text.
+        let Color::Rgb(r, g, b) = DIM else {
+            panic!("DIM must be a fixed colour, not the terminal's dark gray: {DIM:?}");
+        };
+        for c in [r, g, b] {
+            assert!((150..=205).contains(&c), "{DIM:?}");
+        }
     }
 
     #[test]

@@ -1004,6 +1004,7 @@ impl App {
             Action::GrowGraph => self.graph_pct = (self.graph_pct + 5).min(70),
             Action::ShrinkGraph => self.graph_pct = self.graph_pct.saturating_sub(5).max(20),
             Action::CycleSort if self.screen == Screen::Docker => self.docker_cycle_sort(),
+            Action::CycleSort if self.screen == Screen::DockerFiles => self.browse_cycle_sort(),
             Action::DetailScroll(by) => self.docker_scroll_details(by),
             Action::Browse => self.docker_browse(),
             Action::CloseBrowse => self.docker_close_browse(),
@@ -2168,6 +2169,18 @@ impl App {
                 self.cursor = row;
                 self.ensure_visible();
                 self.refresh_detail();
+            }
+            Screen::DockerFiles
+                if self
+                    .docker
+                    .browse
+                    .as_ref()
+                    .is_some_and(|b| group < b.shown.len()) =>
+            {
+                if let Some(b) = &mut self.docker.browse {
+                    b.cursor = group;
+                }
+                self.ensure_visible();
             }
             Screen::Docker if group < self.docker.lines.len() => {
                 self.docker.cursor = group;

@@ -50,13 +50,40 @@ pub fn parse_listing(out: &str) -> Vec<FileEntry> {
         .collect()
 }
 
-/// Folders first, then by name without regard to case.
-pub fn sort_entries(entries: &mut [FileEntry]) {
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+/// What the listing is sorted by, in the order of the column headers (the
+/// order `s` walks), like the Explorer: folders sort with the rest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowseSort {
+    Name,
+    #[default]
+    Size,
+    Modified,
+}
+
+impl BrowseSort {
+    /// The next column to the right (back to the first after the last).
+    pub fn next(self) -> BrowseSort {
+        match self {
+            BrowseSort::Name => BrowseSort::Size,
+            BrowseSort::Size => BrowseSort::Modified,
+            BrowseSort::Modified => BrowseSort::Name,
+        }
+    }
+}
+
+/// Name A to Z without regard to case; size and modified biggest/newest
+/// first, ties by name.
+pub fn sort_entries(entries: &mut [FileEntry], sort: BrowseSort) {
+    let by_name = |a: &FileEntry, b: &FileEntry| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
             .then_with(|| a.name.cmp(&b.name))
+    };
+    entries.sort_by(|a, b| match sort {
+        BrowseSort::Name => by_name(a, b),
+        BrowseSort::Size => b.size.cmp(&a.size).then_with(|| by_name(a, b)),
+        BrowseSort::Modified => b.mtime.cmp(&a.mtime).then_with(|| by_name(a, b)),
     });
 }
 
@@ -73,6 +100,7 @@ pub struct BrowseState {
     pub all: Vec<FileEntry>,
     /// Indexes into `all` that match the filter.
     pub shown: Vec<usize>,
+    pub sort: BrowseSort,
     pub cursor: usize,
     pub offset: usize,
     pub error: Option<String>,
@@ -89,6 +117,7 @@ impl BrowseState {
             dir: "/".to_string(),
             all: Vec::new(),
             shown: Vec::new(),
+            sort: BrowseSort::default(),
             cursor: 0,
             offset: 0,
             error: None,
@@ -125,6 +154,19 @@ impl BrowseState {
     /// Keep only the entries matching `query`, the cursor on the same one.
     pub fn refilter(&mut self, query: &crate::filter::Query) {
         let keep = self.selected().map(|e| e.name.clone());
+        self.refilter_keeping(query, keep);
+    }
+
+    /// Next sort column (`s`): the same entries in a new order, the cursor
+    /// still on the entry it was on. Nothing is listed again.
+    pub fn cycle_sort(&mut self, query: &crate::filter::Query) {
+        let keep = self.selected().map(|e| e.name.clone());
+        self.sort = self.sort.next();
+        sort_entries(&mut self.all, self.sort);
+        self.refilter_keeping(query, keep);
+    }
+
+    fn refilter_keeping(&mut self, query: &crate::filter::Query, keep: Option<String>) {
         self.shown = (0..self.all.len())
             .filter(|&i| query.is_empty() || query.matches(&self.all[i].name).is_some())
             .collect();
@@ -159,9 +201,7 @@ impl BrowseState {
                     BrowseSource::Volume(_) => "Docker did not answer".to_string(),
                 });
             };
-            let mut entries = parse_listing(&out);
-            sort_entries(&mut entries);
-            Ok((dir, entries))
+            Ok((dir, parse_listing(&out)))
         });
     }
 
@@ -171,7 +211,8 @@ impl BrowseState {
             return;
         }
         match self.job.value.take() {
-            Some(Ok((dir, entries))) => {
+            Some(Ok((dir, mut entries))) => {
+                sort_entries(&mut entries, self.sort);
                 self.dir = dir;
                 self.all = entries;
                 self.error = None;
@@ -219,12 +260,58 @@ mod tests {
         assert!(parse_listing("f\t1\t1\t\0").is_empty(), "no name");
     }
 
+    fn entry(name: &str, is_dir: bool, size: u64, mtime: i64) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            is_dir,
+            size,
+            mtime,
+        }
+    }
+
+    fn sorted_names(sort: BrowseSort) -> Vec<String> {
+        let mut e = vec![
+            entry("a", false, 5, 30),
+            entry("B", true, 12, 10),
+            entry("c", false, 5, 20),
+        ];
+        sort_entries(&mut e, sort);
+        e.into_iter().map(|x| x.name).collect()
+    }
+
     #[test]
-    fn entries_sort_folders_first_then_by_name_ignoring_case() {
-        let mut e = parse_listing("f\t1\t1\tb.txt\0f\t1\t1\tA.txt\0d\t1\t1\tzdir\0d\t1\t1\tadir\0");
-        sort_entries(&mut e);
-        let names: Vec<&str> = e.iter().map(|x| x.name.as_str()).collect();
-        assert_eq!(names, ["adir", "zdir", "A.txt", "b.txt"]);
+    fn sorting_follows_the_chosen_column_like_the_explorer() {
+        // Folders are not pulled to the top: they sort with the rest.
+        assert_eq!(
+            sorted_names(BrowseSort::Name),
+            ["a", "B", "c"],
+            "ignoring case"
+        );
+        assert_eq!(
+            sorted_names(BrowseSort::Size),
+            ["B", "a", "c"],
+            "biggest first, ties by name"
+        );
+        assert_eq!(
+            sorted_names(BrowseSort::Modified),
+            ["a", "c", "B"],
+            "newest first"
+        );
+    }
+
+    #[test]
+    fn the_sort_cycle_follows_the_header_order_and_starts_on_size() {
+        let mut s = BrowseSort::default();
+        assert_eq!(s, BrowseSort::Size, "a listing starts biggest first");
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            s = s.next();
+            seen.push(s);
+        }
+        assert_eq!(
+            seen,
+            [BrowseSort::Modified, BrowseSort::Name, BrowseSort::Size]
+        );
     }
 
     #[test]

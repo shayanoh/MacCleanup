@@ -644,6 +644,15 @@ impl App {
         }
     }
 
+    /// `s` in the file browser: the next sort column.
+    pub(super) fn browse_cycle_sort(&mut self) {
+        let query = crate::filter::parse(&self.filter.query);
+        if let Some(b) = &mut self.docker.browse {
+            b.cycle_sort(&query);
+        }
+        self.ensure_visible();
+    }
+
     pub(super) fn browse_refilter(&mut self) {
         let query = crate::filter::parse(&self.filter.query);
         if let Some(b) = &mut self.docker.browse {
@@ -1444,8 +1453,8 @@ mod tests {
         wait_browse(&mut e.app);
         assert_eq!(
             browse_names(&e.app),
-            ["sub", "a.txt", "b.txt"],
-            "folders first"
+            ["sub", "b.txt", "a.txt"],
+            "biggest first, like the Explorer"
         );
         let b = e.app.docker.browse.as_ref().unwrap();
         assert_eq!(b.dir, "/");
@@ -1470,6 +1479,44 @@ mod tests {
         e.app.update(Action::Down);
         e.app.update(Action::Into);
         assert_eq!(e.app.docker.browse.as_ref().unwrap().dir, "/");
+    }
+
+    #[test]
+    fn s_changes_the_sort_column_in_the_file_browser_without_listing_again() {
+        let fake = browsing_fake();
+        let mut e = loaded_with(fake.clone());
+        cursor_on(&mut e.app, "volume:pgdata");
+        e.app.update(Action::Browse);
+        wait_browse(&mut e.app);
+        let builds = fake.calls().len();
+        e.app.update(Action::CycleSort);
+        assert_eq!(
+            browse_names(&e.app),
+            ["a.txt", "b.txt", "sub"],
+            "modified: newest first"
+        );
+        e.app.update(Action::CycleSort);
+        assert_eq!(browse_names(&e.app), ["a.txt", "b.txt", "sub"], "name");
+        e.app.update(Action::CycleSort);
+        assert_eq!(
+            browse_names(&e.app),
+            ["sub", "b.txt", "a.txt"],
+            "size again"
+        );
+        assert_eq!(fake.calls().len(), builds, "re-sorting reads nothing");
+        assert!(!e.app.docker.browse.as_ref().unwrap().loading());
+    }
+
+    #[test]
+    fn the_cursor_stays_on_the_same_entry_when_the_sort_changes() {
+        let mut e = loaded_with(browsing_fake());
+        cursor_on(&mut e.app, "volume:pgdata");
+        e.app.update(Action::Browse);
+        wait_browse(&mut e.app);
+        e.app.update(Action::Down); // b.txt
+        e.app.update(Action::CycleSort);
+        let b = e.app.docker.browse.as_ref().unwrap();
+        assert_eq!(b.selected().unwrap().name, "b.txt");
     }
 
     #[test]
@@ -1519,7 +1566,7 @@ mod tests {
         cursor_on(&mut e.app, "image:sha256:bbb2");
         e.app.update(Action::Browse);
         wait_browse(&mut e.app);
-        assert_eq!(browse_names(&e.app), ["sub", "a.txt", "b.txt"]);
+        assert_eq!(browse_names(&e.app), ["sub", "b.txt", "a.txt"]);
         assert!(
             fake.calls().is_empty(),
             "no helper image needed for an image"
@@ -1568,7 +1615,7 @@ mod tests {
         wait_browse(&mut e.app);
         e.app.filter.query = "txt".to_string();
         e.app.refilter(false);
-        assert_eq!(browse_names(&e.app), ["a.txt", "b.txt"]);
+        assert_eq!(browse_names(&e.app), ["b.txt", "a.txt"]);
         e.app.update(Action::CloseBrowse);
         assert!(!e.app.filter.active());
     }

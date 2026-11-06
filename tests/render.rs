@@ -551,13 +551,13 @@ fn sorted_column_is_white_and_the_others_gray() {
     let disk = find_text(&mut e.app, 120, 30, "On disk").unwrap();
     let size = find_text(&mut e.app, 120, 30, "Size").unwrap();
     assert_eq!(disk.fg, Some(Color::White));
-    assert_eq!(size.fg, Some(Color::DarkGray));
+    assert_eq!(size.fg, Some(maccleanup::ui::DIM));
 
     e.app.update(Action::CycleSort); // by Frees
     let disk = find_text(&mut e.app, 120, 30, "On disk").unwrap();
     let frees = find_text(&mut e.app, 120, 30, "Frees").unwrap();
     assert_eq!(frees.fg, Some(Color::White));
-    assert_eq!(disk.fg, Some(Color::DarkGray));
+    assert_eq!(disk.fg, Some(maccleanup::ui::DIM));
 
     e.app.update(Action::CycleSort); // by Modified
     e.app.update(Action::CycleSort); // by Name
@@ -565,7 +565,7 @@ fn sorted_column_is_white_and_the_others_gray() {
     let frees = find_text(&mut e.app, 120, 30, "Frees").unwrap();
     let size = find_text(&mut e.app, 120, 30, "Size").unwrap();
     assert_eq!(size.fg, Some(Color::White));
-    assert_eq!(frees.fg, Some(Color::DarkGray));
+    assert_eq!(frees.fg, Some(maccleanup::ui::DIM));
 }
 
 #[test]
@@ -586,7 +586,7 @@ fn sorted_column_values_are_white_and_the_other_size_column_gray() {
     let disk = find_text(&mut e.app, 120, 30, &big_disk).unwrap();
     let size = find_text(&mut e.app, 120, 30, &big_size).unwrap();
     assert_eq!(disk.fg, Some(Color::White));
-    assert_eq!(size.fg, Some(Color::DarkGray));
+    assert_eq!(size.fg, Some(maccleanup::ui::DIM));
 }
 
 #[test]
@@ -2942,4 +2942,58 @@ fn the_finish_screen_summarises_a_long_list_of_command_results() {
     assert!(t.contains("rec07"), "the failed one is always listed:\n{t}");
     assert!(t.contains("and 32 more"), "{t}");
     assert!(!t.contains("rec39"), "the rest are summarised:\n{t}");
+}
+
+#[test]
+fn docker_file_browser_has_the_graph_at_the_side_like_the_explorer() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    let t = render(&mut e.app, 150, 30);
+    assert!(t.contains("Treemap"), "{t}");
+    assert!(!e.app.graph_hits.is_empty(), "boxes are clickable");
+    // `t` cycles the graph like in the Explorer.
+    e.app.update(Action::CycleGraph);
+    let t = render(&mut e.app, 150, 30);
+    assert!(t.contains("Distribution") || !t.contains("Treemap"), "{t}");
+    e.app.update(Action::CycleGraph);
+    e.app.update(Action::CycleGraph);
+    let narrow = render(&mut e.app, 70, 30);
+    assert!(
+        !narrow.contains("Treemap") && !narrow.contains("Distribution"),
+        "{narrow}"
+    );
+    assert!(narrow.contains("big.db"), "the list still shows: {narrow}");
+}
+
+#[test]
+fn docker_file_browser_graph_click_selects_the_entry() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    render(&mut e.app, 150, 30);
+    let hits = e.app.graph_hits.clone();
+    // The biggest entry always has a box; start on the last (tiny) one.
+    let (rect, key) = hits
+        .iter()
+        .find(|(_, k)| k.0 == 0)
+        .cloned()
+        .expect("a box for the biggest entry");
+    e.app.update(Action::Down);
+    e.app.update(Action::Down);
+    assert_eq!(e.app.docker.browse.as_ref().unwrap().cursor, 2);
+    e.app.update(Action::Click {
+        x: rect.x + rect.width / 2,
+        y: rect.y + rect.height / 2,
+    });
+    assert_eq!(e.app.docker.browse.as_ref().unwrap().cursor, key.0);
+}
+
+#[test]
+fn docker_file_browser_header_marks_the_sorted_column_and_s_moves_it() {
+    let mut e = docker_browsing(GlyphMode::Nerd, false);
+    let t = render(&mut e.app, 150, 30);
+    assert!(t.contains("Size ▼"), "biggest first by default:\n{t}");
+    e.app.update(Action::CycleSort);
+    let t = render(&mut e.app, 150, 30);
+    assert!(t.contains("Modified ▼") && !t.contains("Size ▼"), "{t}");
+    e.app.update(Action::CycleSort);
+    let t = render(&mut e.app, 150, 30);
+    assert!(t.contains("Name ▲"), "{t}");
 }

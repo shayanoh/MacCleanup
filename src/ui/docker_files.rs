@@ -3,24 +3,84 @@
 //! can be marked or changed.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
+use super::explorer::value_style;
+use super::graph::{self, GraphData};
 use super::targets::highlight;
 use super::{ACCENT, DIM, SELECTED_BG, fit, fit_start, pad, panel, right, text_width};
 use crate::anim;
-use crate::app::App;
-use crate::docker::browse::BrowseState;
+use crate::app::{App, GraphMode};
+use crate::docker::browse::{BrowseSort, BrowseState};
 use crate::filter;
-use crate::fmt::{ago, human_size, now_secs};
+use crate::fmt::{ago, eighths_bar, human_size, now_secs};
 use crate::glyphs::Glyphs;
+use crate::safety::Safety;
+use crate::scan::Row;
+
+/// Below this width the graph would be unreadable, so only the list shows.
+const SIDE_MIN_TOTAL: u16 = 76;
 
 const SIZE_W: usize = 9;
 const MODIFIED_W: usize = 10;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.graph != GraphMode::Hidden && area.width >= SIDE_MIN_TOTAL {
+        let [list, side] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Percentage(app.graph_pct)])
+                .areas(area);
+        render_list(frame, list, app);
+        if let Some(b) = app.docker.browse.as_ref() {
+            let g = app.glyphs;
+            app.graph_hits = graph::render_data(frame, side, &g, app.graph, &graph_data(b));
+        }
+    } else {
+        render_list(frame, area, app);
+    }
+}
+
+/// The graph shows the listed entries, sized by their size (folders with
+/// everything inside); a click on a box selects that entry.
+fn graph_data(b: &BrowseState) -> GraphData {
+    let rows: Vec<Row> = b
+        .shown
+        .iter()
+        .map(|&i| {
+            let e = &b.all[i];
+            Row {
+                name: e.name.clone().into(),
+                path: std::path::PathBuf::new(),
+                is_dir: e.is_dir,
+                size: e.size,
+                disk: e.size,
+                files: 0,
+                scanning: false,
+                node: None,
+                space: None,
+                frees: None,
+                mtime: e.mtime,
+            }
+        })
+        .collect();
+    let weights: Vec<u64> = rows.iter().map(|r| r.size).collect();
+    GraphData {
+        total: weights.iter().sum(),
+        // Read-only: nothing here is offered for deletion, so no colour
+        // says "safe".
+        safeties: vec![Safety::Caution; rows.len()],
+        marked: vec![false; rows.len()],
+        keys: (0..rows.len()).map(|i| (i, 0)).collect(),
+        cursor: (!rows.is_empty()).then(|| b.cursor.min(rows.len() - 1)),
+        scope: b.dir.clone(),
+        weights,
+        rows,
+    }
+}
+
+fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let g = app.glyphs;
     let Some(b) = app.docker.browse.as_ref() else {
         return;
@@ -62,11 +122,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         );
     }
     let prefix_w = 2 + text_width(g.folder()).max(text_width(g.file())) + 1;
+    let fixed = 1 + prefix_w + 1 + SIZE_W + 1 + MODIFIED_W;
+    let show_share = width >= fixed + 9 + 16;
     let name_w = width
-        .saturating_sub(1 + prefix_w + 1 + SIZE_W + 1 + MODIFIED_W)
+        .saturating_sub(fixed + if show_share { 9 } else { 0 })
         .max(4);
     frame.render_widget(
-        Paragraph::new(header_line(prefix_w, name_w)),
+        Paragraph::new(header_line(b.sort, prefix_w, name_w, show_share, &g)),
         Rect::new(inner.x, inner.y + 2 + filter_h, inner.width, 1),
     );
 
@@ -81,11 +143,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let start = b.offset.min(b.shown.len());
     let end = (start + list_rows).min(b.shown.len());
     let now = now_secs();
+    let total: u64 = b.all.iter().map(|e| e.size).sum();
     let mut lines: Vec<TextLine> = (start..end)
         .map(|i| {
             let e = &b.all[b.shown[i]];
             let selected = i == b.cursor;
-            let text = entry_line(&g, &query, e, selected, name_w, now);
+            let text = entry_line(
+                &g,
+                &query,
+                e,
+                &RowCtx {
+                    selected,
+                    name_w,
+                    now,
+                    sort: b.sort,
+                    share: show_share.then_some(total),
+                },
+            );
             if selected {
                 text.style(Style::default().bg(SELECTED_BG))
             } else {
@@ -249,34 +323,82 @@ fn filter_line(app: &App, b: &BrowseState, width: usize) -> TextLine<'static> {
     TextLine::from(spans)
 }
 
-fn header_line(prefix_w: usize, name_w: usize) -> TextLine<'static> {
-    let dim = Style::default().fg(DIM);
-    TextLine::from(vec![
+fn header_line(
+    sort: BrowseSort,
+    prefix_w: usize,
+    name_w: usize,
+    show_share: bool,
+    g: &Glyphs,
+) -> TextLine<'static> {
+    // The sorted column is white with an arrow, the others gray.
+    let head = |by: BrowseSort, text: &str, w: usize| -> Span<'static> {
+        let sorted = sort == by;
+        let arrow = if !sorted {
+            String::new()
+        } else if by == BrowseSort::Name {
+            format!(" {}", g.sort_asc())
+        } else {
+            format!(" {}", g.sort_desc())
+        };
+        let style = if sorted {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        Span::styled(right(&format!("{text}{arrow}"), w), style)
+    };
+    let name_style = if sort == BrowseSort::Name {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+    let name_arrow = if sort == BrowseSort::Name {
+        format!(" {}", g.sort_asc())
+    } else {
+        String::new()
+    };
+    let mut spans = vec![
         Span::raw(" ".repeat(prefix_w)),
-        Span::styled(pad("Name".to_string(), name_w), dim),
+        Span::styled(pad(format!("Name{name_arrow}"), name_w), name_style),
         Span::raw(" "),
-        Span::styled(right("Size", SIZE_W), dim),
+        head(BrowseSort::Size, "Size", SIZE_W),
         Span::raw(" "),
-        Span::styled(right("Modified", MODIFIED_W), dim),
-    ])
+        head(BrowseSort::Modified, "Modified", MODIFIED_W),
+    ];
+    if show_share {
+        spans.push(Span::styled(" Share", Style::default().fg(DIM)));
+    }
+    TextLine::from(spans)
+}
+
+/// What a row needs besides its entry.
+struct RowCtx {
+    selected: bool,
+    name_w: usize,
+    now: i64,
+    sort: BrowseSort,
+    /// Sum of the listed sizes when the share bar is shown.
+    share: Option<u64>,
 }
 
 fn entry_line(
     g: &Glyphs,
     query: &filter::Query,
     e: &crate::docker::browse::FileEntry,
-    selected: bool,
-    name_w: usize,
-    now: i64,
+    ctx: &RowCtx,
 ) -> TextLine<'static> {
-    let cursor = if selected { g.cursor() } else { " " };
+    let cursor = if ctx.selected { g.cursor() } else { " " };
     let icon = if e.is_dir { g.folder() } else { g.file() };
     let style = if e.is_dir {
         Style::default().fg(Color::Blue)
     } else {
         Style::default()
     };
-    let shown = fit(&e.name, name_w, g);
+    let shown = fit(&e.name, ctx.name_w, g);
     let hits: Vec<usize> = if query.is_empty() {
         Vec::new()
     } else {
@@ -296,18 +418,29 @@ fn entry_line(
         ),
     ];
     spans.extend(highlight(
-        &pad(shown, name_w),
+        &pad(shown, ctx.name_w),
         &hits,
         style,
         style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(
         format!(" {}", right(&human_size(e.size), SIZE_W)),
-        Style::default().fg(Color::White),
+        value_style(ctx.sort == BrowseSort::Size),
     ));
     spans.push(Span::styled(
-        format!(" {}", right(&ago(now, e.mtime), MODIFIED_W)),
-        Style::default().fg(DIM),
+        format!(" {}", right(&ago(ctx.now, e.mtime), MODIFIED_W)),
+        value_style(ctx.sort == BrowseSort::Modified),
     ));
+    if let Some(total) = ctx.share {
+        let frac = if total == 0 {
+            0.0
+        } else {
+            e.size as f64 / total as f64
+        };
+        spans.push(Span::styled(
+            format!(" {}", eighths_bar(frac, 8, g)),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     TextLine::from(spans)
 }
