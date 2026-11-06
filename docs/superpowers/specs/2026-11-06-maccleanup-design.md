@@ -48,6 +48,9 @@ Green = safe, amber = caution (rebuildable or needs care), red = irreversible or
 ### Responsiveness **[User]**
 Every long operation (scan, sizing, delete, tool command) shows live activity: progress bar when the total is known, otherwise counters that keep rising (files seen, bytes found), with spinners. **[My call]**: the UI thread never blocks; scanning and cleanup run in background workers; partial results are browsable while scanning continues.
 
+### Scan speed **[User, added 2026-11-06]**
+All scans are multi-threaded and run at maximum speed: a worker pool sized above the core count (directory walking is I/O-bound), one job per directory, and no shared lock on the per-file hot path. This applies to every scanning feature, not only the explorer.
+
 ### Input **[User]**
 Vim-style navigation (`j/k/h/l`, `space` to mark, `d` to review and delete) plus mouse support. Key map shown in a footer and help screen. **[My call]** extra keys: `/` filter, `s` sort, `g` cycle graph, `[`/`]` resize graph, `?` help.
 
