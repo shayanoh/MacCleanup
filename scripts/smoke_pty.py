@@ -301,7 +301,11 @@ while time.time() < end:
     pump(0.1)
 if status is None:
     fail("process did not exit after q")
+pump(0.4)
 assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, f"bad exit status {status}"
+# After the terminal is restored the app prints what the session did.
+assert "MacCleanup summary" in raw_tail, f"no summary on quit: {raw_tail!r}"
+assert "deleted for good" in raw_tail and "space freed" in raw_tail, raw_tail
 assert "panicked" not in raw_tail and "panicked" not in screen.text(), "panic message in output"
 print("SMOKE OK")
 shutil.rmtree(home, ignore_errors=True)

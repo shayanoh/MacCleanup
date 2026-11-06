@@ -29,6 +29,15 @@ fn make_app(files: &[(&str, usize)], mode: GlyphMode) -> Env {
 }
 
 fn make_app_with(files: &[(&str, usize)], mode: GlyphMode, setup: impl FnOnce(&Path)) -> Env {
+    make_app_full(files, mode, false, setup)
+}
+
+fn make_app_full(
+    files: &[(&str, usize)],
+    mode: GlyphMode,
+    animations: bool,
+    setup: impl FnOnce(&Path),
+) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
     let home = base.join("home");
@@ -51,7 +60,7 @@ fn make_app_with(files: &[(&str, usize)], mode: GlyphMode, setup: impl FnOnce(&P
         holding,
         Accounting::new(free),
         Glyphs::new(mode),
-        false,
+        animations,
     );
     Env { _dir: dir, app }
 }
@@ -692,4 +701,164 @@ fn home_starts_with_menu_hints_and_a_focused_menu() {
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("j/k choose"), "{text}");
     assert!(text.contains("enter open"), "{text}");
+}
+
+#[test]
+fn dialogs_grow_in_when_animations_are_on() {
+    let mut e = make_app_full(FILES, GlyphMode::Nerd, true, |_| {});
+    e.app.update(Action::GoTo(Screen::Explorer));
+    for _ in 0..12 {
+        e.app.update(Action::Tick); // let the screen-switch wipe finish
+    }
+    let before = render(&mut e.app, 120, 30).matches('╭').count();
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+
+    let first = render(&mut e.app, 120, 30);
+    assert!(
+        !first.contains("Review before"),
+        "content waits for the window:\n{first}"
+    );
+    assert!(!first.contains("Total"), "{first}");
+    assert_eq!(
+        first.matches('╭').count(),
+        before + 1,
+        "a small frame is already visible"
+    );
+
+    for _ in 0..3 {
+        e.app.update(Action::Tick);
+    }
+    let mid = render(&mut e.app, 120, 30);
+    assert!(!mid.contains("Review before"), "still growing:\n{mid}");
+
+    for _ in 0..10 {
+        e.app.update(Action::Tick);
+    }
+    let done = render(&mut e.app, 120, 30);
+    assert!(done.contains("Review before moving"), "{done}");
+    assert!(done.contains("Total"), "{done}");
+}
+
+#[test]
+fn no_grow_animation_when_animations_are_off() {
+    let mut e = explorer(GlyphMode::Nerd);
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("Review before moving"), "{text}");
+}
+
+const CONFETTI: [&str; 6] = ["✦", "✧", "◆", "▴", "▪", "✶"];
+
+fn finished_with_freed_space(animations: bool, freed: bool) -> Env {
+    let mut e = make_app_full(FILES, GlyphMode::Nerd, animations, |_| {});
+    e.app.update(Action::GoTo(Screen::Explorer));
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::ConfirmIrreversible);
+    e.app.update(Action::Confirm);
+    for _ in 0..500 {
+        if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
+            break;
+        }
+        e.app.update(Action::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for _ in 0..20 {
+        e.app.update(Action::Tick); // the window finishes growing
+    }
+    e.app.free_now = e.app.accounting.free_at_start() + if freed { 7_000_000 } else { 0 };
+    e
+}
+
+#[test]
+fn congratulations_has_confetti_when_animated() {
+    let mut e = finished_with_freed_space(true, true);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("Congratulations"), "{text}");
+    assert!(
+        CONFETTI.iter().any(|c| text.contains(c)),
+        "no confetti:\n{text}"
+    );
+}
+
+#[test]
+fn no_confetti_without_animations_or_without_freed_space() {
+    let mut off = finished_with_freed_space(false, true);
+    let text = render(&mut off.app, 120, 30);
+    assert!(text.contains("Congratulations"));
+    assert!(!CONFETTI.iter().any(|c| text.contains(c)), "{text}");
+
+    let mut nothing = finished_with_freed_space(true, false);
+    let text = render(&mut nothing.app, 120, 30);
+    assert!(text.contains("Nothing freed yet"), "{text}");
+    assert!(!CONFETTI.iter().any(|c| text.contains(c)), "{text}");
+}
+
+#[test]
+fn confetti_never_hides_the_text() {
+    let mut e = finished_with_freed_space(true, true);
+    for _ in 0..40 {
+        e.app.update(Action::Tick);
+        e.app.free_now = e.app.accounting.free_at_start() + 7_000_000;
+        let text = render(&mut e.app, 120, 30);
+        assert!(text.contains("Congratulations"), "{text}");
+        assert!(text.contains("deleted for good"), "{text}");
+    }
+}
+
+#[test]
+fn confetti_is_ascii_in_ascii_mode() {
+    let mut e = make_app_full(FILES, GlyphMode::Ascii, true, |_| {});
+    e.app.update(Action::GoTo(Screen::Explorer));
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::ConfirmIrreversible);
+    e.app.update(Action::Confirm);
+    for _ in 0..500 {
+        if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
+            break;
+        }
+        e.app.update(Action::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for _ in 0..20 {
+        e.app.update(Action::Tick);
+    }
+    e.app.free_now = e.app.accounting.free_at_start() + 7_000_000;
+    for c in render_cells(&mut e.app, 120, 30) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
+}
+
+#[test]
+fn emptying_shows_a_deleting_dialog_with_a_progress_bar() {
+    let mut e = explorer(GlyphMode::Nerd);
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..500 {
+        if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
+            break;
+        }
+        e.app.update(Action::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e.app.update(Action::Cancel);
+    e.app.update(Action::GoTo(Screen::Holding));
+    e.app.update(Action::EmptyAll);
+    e.app.update(Action::Confirm);
+    // Rendered before any tick: the dialog is already up, not a frozen screen.
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("Deleting for good"), "{text}");
+    assert!(text.contains("0 / 1 items"), "{text}");
+    assert!(text.contains("0%"), "{text}");
+    for _ in 0..500 {
+        if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
+            break;
+        }
+        e.app.update(Action::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }

@@ -2,6 +2,7 @@
 //! live in `app.rs`. The only thing written back is `app.layout`, so mouse
 //! clicks can be mapped to rows.
 
+pub mod confetti;
 pub mod dialogs;
 pub mod explorer;
 pub mod graph;

@@ -8,7 +8,7 @@ use crate::accounting::Accounting;
 use crate::anim::Smooth;
 use crate::fmt::both_usage;
 use crate::glyphs::Glyphs;
-use crate::jobs::{DeleteEvent, DeleteJob, DeleteMode};
+use crate::jobs::{DeleteEvent, DeleteJob, DeleteMode, Phase};
 use crate::safety::{Policy, Safety};
 use crate::scan::{Breakdown, Node, Row, Scanner, file_breakdown, locate};
 use crate::softdelete::{HeldItem, Holding};
@@ -156,7 +156,10 @@ pub struct Review {
 pub struct DeleteProgress {
     pub done: usize,
     pub total: usize,
+    /// Bytes processed so far, and the expected grand total.
     pub usage: Usage,
+    pub of: Usage,
+    pub phase: Phase,
     pub current: PathBuf,
 }
 
@@ -219,6 +222,9 @@ pub struct App {
     /// Marked paths with their size and on-disk size (kept live while scanning).
     pub marks: BTreeMap<PathBuf, Usage>,
     pub dialog: Option<Dialog>,
+    /// The tick the current dialog appeared on (drives its grow-in animation).
+    pub dialog_since: u64,
+    dialog_kind: Option<std::mem::Discriminant<Dialog>>,
     pub should_quit: bool,
     /// Directories entered so far; the last one is the one being shown.
     pub stack: Vec<Arc<Node>>,
@@ -283,10 +289,12 @@ impl App {
         root: Arc<Node>,
         policy: Policy,
         holding: Holding,
-        accounting: Accounting,
+        mut accounting: Accounting,
         glyphs: Glyphs,
         animations: bool,
     ) -> App {
+        // Items left in ToBeDeleted by earlier sessions are pending too.
+        accounting.set_pending(holding.total().unwrap_or_default());
         let free_now = volume::free_space(&root.path).unwrap_or(0);
         let total_space = volume::total_space(&root.path).unwrap_or(0);
         let mut app = App {
@@ -302,6 +310,8 @@ impl App {
             offset: 0,
             marks: BTreeMap::new(),
             dialog: None,
+            dialog_since: 0,
+            dialog_kind: None,
             should_quit: false,
             stack: vec![root],
             held: Vec::new(),
@@ -416,6 +426,18 @@ impl App {
     }
 
     pub fn update(&mut self, action: Action) {
+        self.apply(action);
+        // A new kind of dialog starts its own grow-in animation.
+        let kind = self.dialog.as_ref().map(std::mem::discriminant);
+        if kind != self.dialog_kind {
+            if kind.is_some() {
+                self.dialog_since = self.tick;
+            }
+            self.dialog_kind = kind;
+        }
+    }
+
+    fn apply(&mut self, action: Action) {
         if !matches!(action, Action::Tick) {
             self.notice = None;
         }
@@ -792,10 +814,13 @@ impl App {
         self.job_mode = mode;
         self.job_free_before = self.free_now;
         self.job_failure = None;
+        let items_total: Usage = items.iter().map(|(_, u)| *u).sum();
         self.dialog = Some(Dialog::Deleting(DeleteProgress {
             done: 0,
             total: items.len() * phases,
             usage: Usage::default(),
+            of: (0..phases).fold(Usage::default(), |acc, _| acc + items_total),
+            phase: Phase::Moving,
             current: PathBuf::new(),
         }));
         self.job = Some(DeleteJob::start(
@@ -817,6 +842,8 @@ impl App {
                     done,
                     total,
                     usage,
+                    of,
+                    phase,
                     current,
                 } => {
                     if let Some(Dialog::Deleting(p)) = &mut self.dialog {
@@ -824,6 +851,8 @@ impl App {
                             done,
                             total,
                             usage,
+                            of,
+                            phase,
                             current,
                         };
                     }
@@ -873,7 +902,7 @@ impl App {
         self.refresh_rows();
         let reason = self.job_failure.take();
         self.dialog = Some(match mode {
-            DeleteMode::SoftThenEmpty => Dialog::Finish(FinishInfo {
+            DeleteMode::SoftThenEmpty | DeleteMode::EmptyHeld => Dialog::Finish(FinishInfo {
                 moved,
                 emptied,
                 free_before,
@@ -946,32 +975,30 @@ impl App {
         }));
     }
 
+    /// Permanently delete held items on a background thread, with progress.
     fn run_forever(&mut self, target: ForeverTarget) {
-        let free_before = self.free_now;
-        let result = match &target {
-            ForeverTarget::Item { id, .. } => self.holding.delete_forever(id),
-            ForeverTarget::All { .. } => self.holding.empty(),
+        let items: Vec<HeldItem> = match &target {
+            ForeverTarget::Item { id, .. } => {
+                self.held.iter().filter(|i| &i.id == id).cloned().collect()
+            }
+            ForeverTarget::All { .. } => self.held.clone(),
         };
-        match result {
-            Ok(usage) => {
-                self.accounting.record_emptied(usage);
-                self.refresh_free();
-                self.refresh_held();
-                self.dialog = Some(Dialog::Finish(FinishInfo {
-                    moved: Usage::default(),
-                    emptied: usage,
-                    free_before,
-                    free_after: self.free_now,
-                    failures: 0,
-                    first_failure: None,
-                    started_tick: self.tick,
-                }));
-            }
-            Err(e) => {
-                self.refresh_held();
-                self.notice = Some(e.to_string());
-            }
+        if items.is_empty() {
+            self.refresh_held();
+            return;
         }
+        self.job_mode = DeleteMode::EmptyHeld;
+        self.job_free_before = self.free_now;
+        self.job_failure = None;
+        self.dialog = Some(Dialog::Deleting(DeleteProgress {
+            done: 0,
+            total: items.len(),
+            usage: Usage::default(),
+            of: items.iter().map(HeldItem::usage).sum(),
+            phase: Phase::Deleting,
+            current: PathBuf::new(),
+        }));
+        self.job = Some(DeleteJob::empty_held(Arc::clone(&self.holding), items));
     }
 }
 
@@ -1375,6 +1402,7 @@ mod tests {
         assert!(matches!(app.dialog, Some(Dialog::ConfirmForever(_))));
         assert_eq!(app.held.len(), 1, "nothing deleted before confirmation");
         app.update(Action::Confirm);
+        settle(app);
         assert!(app.held.is_empty());
         assert_eq!(app.accounting.pending().size, 0);
         assert!(home.join("c/f").exists());
@@ -1392,6 +1420,7 @@ mod tests {
         assert_eq!(app.held.len(), 2);
         app.update(Action::EmptyAll);
         app.update(Action::Confirm);
+        settle(app);
         assert!(app.held.is_empty());
         assert_eq!(app.accounting.pending().size, 0);
     }
@@ -1817,5 +1846,142 @@ mod tests {
         app.update(Action::FocusToggle);
         app.update(Action::GoTo(Screen::Holding));
         assert_eq!(app.focus, Focus::Main);
+    }
+
+    #[test]
+    fn emptying_runs_in_the_background_with_a_progress_dialog() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        hold_two(app);
+        app.update(Action::GoTo(Screen::Holding));
+        app.update(Action::EmptyAll);
+        app.update(Action::Confirm);
+        match &app.dialog {
+            Some(Dialog::Deleting(p)) => {
+                assert_eq!(p.phase, crate::jobs::Phase::Deleting);
+                assert_eq!(p.total, 2);
+                assert_eq!(p.of.size, 12288 + 8192);
+            }
+            other => panic!("expected a progress dialog, got {}", other.is_some()),
+        }
+        assert_eq!(app.held.len(), 2, "still held until the job reports back");
+        settle(app);
+        assert!(app.held.is_empty());
+        match &app.dialog {
+            Some(Dialog::Finish(f)) => assert_eq!(f.emptied.size, 12288 + 8192),
+            other => panic!("expected finish, got {}", other.is_some()),
+        }
+        assert_eq!(app.accounting.pending().size, 0);
+    }
+
+    #[test]
+    fn deleting_one_item_for_good_runs_in_the_background_too() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        hold_two(app);
+        app.update(Action::GoTo(Screen::Holding));
+        let first = app.held[app.held_cursor].clone();
+        app.update(Action::DeleteSelectedForever);
+        app.update(Action::Confirm);
+        assert!(matches!(app.dialog, Some(Dialog::Deleting(_))));
+        settle(app);
+        assert_eq!(app.held.len(), 1);
+        assert!(app.held.iter().all(|i| i.id != first.id));
+        assert_eq!(app.accounting.pending().size, 20480 - first.size);
+    }
+
+    #[test]
+    fn quit_waits_for_an_empty_job_too() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        hold_two(app);
+        app.update(Action::GoTo(Screen::Holding));
+        app.update(Action::EmptyAll);
+        app.update(Action::Confirm);
+        app.update(Action::Quit);
+        assert!(!app.should_quit);
+        settle(app);
+        assert!(app.should_quit);
+        assert!(app.held.is_empty(), "the delete finished before quitting");
+    }
+
+    #[test]
+    fn review_delete_starts_in_the_moving_phase() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        select(app, "b.bin");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        app.update(Action::Confirm);
+        match &app.dialog {
+            Some(Dialog::Deleting(p)) => {
+                assert_eq!(p.phase, crate::jobs::Phase::Moving);
+                assert_eq!(p.of.size, 8192);
+            }
+            other => panic!("expected a progress dialog, got {}", other.is_some()),
+        }
+        settle(app);
+    }
+
+    #[test]
+    fn pending_starts_from_what_is_already_in_tobedeleted() {
+        use crate::accounting::Accounting;
+        use crate::glyphs::{GlyphMode, Glyphs};
+        use crate::safety::Policy;
+        use crate::scan::Scanner;
+        use crate::softdelete::Holding;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let hold = base.join("hold");
+        crate::testutil::write(&home.join("old.bin"), 5000);
+        let policy = Policy::new(&home, &hold);
+        // A previous session moved a file into ToBeDeleted.
+        let first = Holding::open(hold.clone()).unwrap();
+        first
+            .move_in(&policy, &home.join("old.bin"), Usage::new(5000, 8192))
+            .unwrap();
+        drop(first);
+        // A new session starts.
+        let scanner = Scanner::new(2);
+        let root = scanner.scan_root(&home);
+        let app = App::new(
+            scanner,
+            root,
+            policy,
+            Holding::open(hold).unwrap(),
+            Accounting::new(0),
+            Glyphs::new(GlyphMode::Nerd),
+            false,
+        );
+        assert_eq!(app.held.len(), 1);
+        assert_eq!(app.accounting.pending(), Usage::new(5000, 8192));
+        assert!(app.accounting.events().is_empty(), "not a session event");
+    }
+
+    #[test]
+    fn dialog_clock_restarts_for_each_new_dialog() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        for _ in 0..5 {
+            app.update(Action::Tick);
+        }
+        select(app, "b.bin");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        assert_eq!(app.dialog_since, app.tick, "review just opened");
+        for _ in 0..4 {
+            app.update(Action::Tick);
+        }
+        assert_ne!(app.dialog_since, app.tick);
+        let review_since = app.dialog_since;
+        app.update(Action::ConfirmIrreversible);
+        assert!(
+            app.dialog_since > review_since,
+            "a different dialog animates again"
+        );
+        let since = app.dialog_since;
+        app.update(Action::Tick);
+        assert_eq!(app.dialog_since, since, "ticks alone do not restart it");
     }
 }

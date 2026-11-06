@@ -81,7 +81,15 @@ fn run(cli: Cli) -> Result<()> {
         !cli.no_animation,
     );
     app.fda_missing = perms::full_disk_access_missing(&home);
-    run_tui(&mut app)
+    let result = run_tui(&mut app);
+
+    // The terminal is restored now: say what this session did.
+    let free_now = volume::free_space(&root).unwrap_or(app.free_now);
+    match app.accounting.summary(free_now) {
+        Some(summary) => println!("{summary}"),
+        None => println!("MacCleanup: nothing was deleted this session."),
+    }
+    result
 }
 
 /// Set up the terminal, run the app, and always put the terminal back.

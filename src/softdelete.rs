@@ -2,11 +2,13 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -69,6 +71,57 @@ impl HeldItem {
 pub struct Holding {
     dir: PathBuf,
     lock: Mutex<()>,
+}
+
+/// Live totals for a permanent delete in progress, readable from another
+/// thread while the delete runs.
+#[derive(Default)]
+pub struct DeleteCounters {
+    pub files: AtomicU64,
+    bytes: AtomicU64,
+    disk: AtomicU64,
+}
+
+impl DeleteCounters {
+    fn add(&self, md: &fs::Metadata) {
+        self.files.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(md.len(), Ordering::Relaxed);
+        self.disk.fetch_add(md.blocks() * 512, Ordering::Relaxed);
+    }
+
+    /// Bytes and on-disk bytes removed so far.
+    pub fn usage(&self) -> Usage {
+        Usage::new(
+            self.bytes.load(Ordering::Relaxed),
+            self.disk.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Remove a file or a whole folder tree, counting what goes. Folders are
+/// emptied in parallel. Symlinks are removed as links, never followed.
+fn remove_tree(path: &Path, counters: &DeleteCounters) -> io::Result<()> {
+    let md = fs::symlink_metadata(path)?;
+    if !md.is_dir() {
+        fs::remove_file(path)?;
+        counters.add(&md);
+        return Ok(());
+    }
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            subdirs.push(entry.path());
+        } else {
+            let md = entry.metadata()?;
+            fs::remove_file(entry.path())?;
+            counters.add(&md);
+        }
+    }
+    subdirs
+        .par_iter()
+        .try_for_each(|dir| remove_tree(dir, counters))?;
+    fs::remove_dir(path)
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -241,19 +294,34 @@ impl Holding {
 
     /// Permanently delete one held item. Returns what it held.
     pub fn delete_forever(&self, id: &str) -> Result<Usage, HoldError> {
+        self.delete_forever_with(id, &DeleteCounters::default())
+    }
+
+    /// Like [`delete_forever`](Self::delete_forever), but publishes live
+    /// progress through `counters`. The manifest lock is not held while the
+    /// files are removed, so other threads can keep listing the folder.
+    pub fn delete_forever_with(
+        &self,
+        id: &str,
+        counters: &DeleteCounters,
+    ) -> Result<Usage, HoldError> {
         let item_dir = self.item_dir(id)?;
-        let _g = self.guard();
-        let mut items = self.read_manifest()?;
-        let pos = items
-            .iter()
-            .position(|i| i.id == id)
-            .ok_or_else(|| HoldError::NotFound(id.to_string()))?;
-        match fs::remove_dir_all(&item_dir) {
+        let usage = {
+            let _g = self.guard();
+            self.read_manifest()?
+                .iter()
+                .find(|i| i.id == id)
+                .map(HeldItem::usage)
+                .ok_or_else(|| HoldError::NotFound(id.to_string()))?
+        };
+        match remove_tree(&item_dir, counters) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(HoldError::Io(e)),
         }
-        let usage = items.remove(pos).usage();
+        let _g = self.guard();
+        let mut items = self.read_manifest()?;
+        items.retain(|i| i.id != id);
         self.write_manifest(&items)?;
         Ok(usage)
     }
@@ -626,5 +694,97 @@ mod tests {
         let items = again.list().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!((items[0].size, items[0].disk), (9, 0));
+    }
+
+    fn tree(root: &Path, files: &[(&str, usize)]) {
+        for (rel, n) in files {
+            write(&root.join(rel), &"x".repeat(*n));
+        }
+    }
+
+    #[test]
+    fn remove_tree_removes_everything_and_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("d");
+        tree(&d, &[("a", 100), ("b/c", 200), ("b/e/f", 300)]);
+        fs::create_dir_all(d.join("empty")).unwrap();
+        let counters = DeleteCounters::default();
+        remove_tree(&d, &counters).unwrap();
+        assert!(!d.exists());
+        assert_eq!(counters.files.load(Ordering::Relaxed), 3);
+        assert_eq!(counters.usage().size, 600);
+        assert!(counters.usage().disk >= 600);
+    }
+
+    #[test]
+    fn remove_tree_does_not_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        tree(&outside, &[("keep", 10), ("sub/keep2", 10)]);
+        let d = dir.path().join("d");
+        fs::create_dir_all(&d).unwrap();
+        symlink(&outside, d.join("dirlink")).unwrap();
+        symlink(outside.join("keep"), d.join("filelink")).unwrap();
+        remove_tree(&d, &DeleteCounters::default()).unwrap();
+        assert!(!d.exists());
+        assert!(outside.join("keep").exists());
+        assert!(outside.join("sub/keep2").exists());
+    }
+
+    #[test]
+    fn remove_tree_handles_wide_and_deep_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("d");
+        for i in 0..40 {
+            for j in 0..25 {
+                write(&d.join(format!("w{i}/n/m/f{j}")), "x");
+            }
+        }
+        let counters = DeleteCounters::default();
+        remove_tree(&d, &counters).unwrap();
+        assert!(!d.exists());
+        assert_eq!(counters.files.load(Ordering::Relaxed), 1000);
+    }
+
+    #[test]
+    fn remove_tree_reports_errors_and_keeps_going_safely() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("d");
+        tree(&d, &[("locked/f", 5)]);
+        let locked = d.join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = Restore(locked.clone());
+        assert!(remove_tree(&d, &DeleteCounters::default()).is_err());
+        assert!(
+            locked.join("f").exists(),
+            "nothing deleted that could not be"
+        );
+    }
+
+    #[test]
+    fn delete_forever_with_counts_the_files_removed() {
+        let s = sandbox();
+        let folder = s.home.join("proj/build");
+        tree(&folder, &[("a", 10), ("b/c", 20), ("b/d", 30)]);
+        let item = s
+            .holding
+            .move_in(&s.policy, &folder, Usage::new(60, 4096 * 3))
+            .unwrap();
+        let counters = DeleteCounters::default();
+        let freed = s.holding.delete_forever_with(&item.id, &counters).unwrap();
+        assert_eq!(freed, Usage::new(60, 4096 * 3));
+        assert_eq!(counters.files.load(Ordering::Relaxed), 3);
+        assert_eq!(counters.usage().size, 60);
+        assert!(s.holding.list().unwrap().is_empty());
     }
 }

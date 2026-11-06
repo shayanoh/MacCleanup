@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
+use super::confetti;
 use super::{
     ACCENT, CAUTION, DANGER, DIM, SAFE, centered, fit, fit_start, pad, panel, right, safety_color,
     safety_dot, safety_word,
@@ -12,22 +13,57 @@ use crate::anim;
 use crate::app::{App, DeleteProgress, Dialog, FinishInfo, ForeverTarget, Review};
 use crate::fmt::{both_usage, eighths_bar, human_size};
 use crate::glyphs::Glyphs;
+use crate::jobs::Phase;
 use crate::usage::Usage;
+
+/// Ticks a window takes to grow to full size (about a third of a second).
+pub const GROW_TICKS: u64 = 7;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let g = &app.glyphs;
+    let scale = if app.animations {
+        anim::ease_out_cubic(app.tick.saturating_sub(app.dialog_since) as f64 / GROW_TICKS as f64)
+    } else {
+        1.0
+    };
     match &app.dialog {
         None => {}
-        Some(Dialog::Review(r)) => review(frame, area, g, r),
-        Some(Dialog::Irreversible(r)) => irreversible(frame, area, g, r),
-        Some(Dialog::ConfirmForever(t)) => confirm_forever(frame, area, g, t),
-        Some(Dialog::Deleting(p)) => deleting(frame, area, app, p),
-        Some(Dialog::Finish(f)) => finish(frame, area, app, f),
-        Some(Dialog::Notice(msg)) => notice(frame, area, g, msg),
+        Some(Dialog::Review(r)) => review(frame, area, g, r, scale),
+        Some(Dialog::Irreversible(r)) => irreversible(frame, area, g, r, scale),
+        Some(Dialog::ConfirmForever(t)) => confirm_forever(frame, area, g, t, scale),
+        Some(Dialog::Deleting(p)) => deleting(frame, area, app, p, scale),
+        Some(Dialog::Finish(f)) => finish(frame, area, app, f, scale),
+        Some(Dialog::Notice(msg)) => notice(frame, area, g, msg, scale),
     }
 }
 
-/// Clear the popup area and draw a titled border; returns the inner area.
+/// The window rectangle `scale` (0..=1) of the way through its grow-in
+/// animation: a small frame in the middle that grows to the final size.
+pub fn grown(area: Rect, w: u16, h: u16, scale: f64) -> Rect {
+    let full = centered(area, w, h);
+    let p = if scale.is_nan() {
+        1.0
+    } else {
+        scale.clamp(0.0, 1.0)
+    };
+    if p >= 1.0 || full.width == 0 || full.height == 0 {
+        return full;
+    }
+    let (min_w, min_h) = (3.min(full.width), 3.min(full.height));
+    let width = (min_w as f64 + (full.width - min_w) as f64 * p).round() as u16;
+    let height = (min_h as f64 + (full.height - min_h) as f64 * p).round() as u16;
+    Rect::new(
+        full.x + (full.width - width) / 2,
+        full.y + (full.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+/// Clear the window area and draw its border. Returns the inner area once
+/// the window is fully grown; while it is still growing only the empty
+/// frame is drawn and `None` is returned, so no content pops in early.
+#[allow(clippy::too_many_arguments)]
 fn popup(
     frame: &mut Frame,
     area: Rect,
@@ -36,13 +72,20 @@ fn popup(
     color: Color,
     w: u16,
     h: u16,
-) -> Rect {
-    let rect = centered(area, w, h);
+    scale: f64,
+) -> Option<Rect> {
+    let growing = scale < 1.0;
+    let rect = grown(area, w, h, scale);
     frame.render_widget(Clear, rect);
-    let block = panel(g, format!(" {title} ")).border_style(Style::default().fg(color));
+    let title = if growing {
+        String::new()
+    } else {
+        format!(" {title} ")
+    };
+    let block = panel(g, title).border_style(Style::default().fg(color));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    inner
+    (!growing).then_some(inner)
 }
 
 fn key_line<'a>(g: &Glyphs, keys: &[(&str, &str)]) -> Line<'a> {
@@ -60,11 +103,11 @@ fn key_line<'a>(g: &Glyphs, keys: &[(&str, &str)]) -> Line<'a> {
     Line::from(spans)
 }
 
-fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
+fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
     let width = area.width.saturating_sub(4).min(96);
     let wanted = r.items.len() as u16 + 11;
     let height = wanted.min(area.height.saturating_sub(2)).max(11);
-    let inner = popup(
+    let Some(inner) = popup(
         frame,
         area,
         g,
@@ -72,7 +115,10 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
         ACCENT,
         width,
         height,
-    );
+        scale,
+    ) else {
+        return;
+    };
     let room = (inner.height as usize).saturating_sub(8);
     let name_w = (inner.width as usize).saturating_sub(34);
     let mut lines: Vec<Line> = Vec::new();
@@ -154,8 +200,8 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn irreversible(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
-    let inner = popup(
+fn irreversible(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scale: f64) {
+    let Some(inner) = popup(
         frame,
         area,
         g,
@@ -163,7 +209,10 @@ fn irreversible(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
         DANGER,
         area.width.saturating_sub(4).min(76),
         9,
-    );
+        scale,
+    ) else {
+        return;
+    };
     let lines = vec![
         Line::from(Span::styled(
             format!(
@@ -187,8 +236,8 @@ fn irreversible(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn confirm_forever(frame: &mut Frame, area: Rect, g: &Glyphs, t: &ForeverTarget) {
-    let inner = popup(
+fn confirm_forever(frame: &mut Frame, area: Rect, g: &Glyphs, t: &ForeverTarget, scale: f64) {
+    let Some(inner) = popup(
         frame,
         area,
         g,
@@ -196,7 +245,10 @@ fn confirm_forever(frame: &mut Frame, area: Rect, g: &Glyphs, t: &ForeverTarget)
         DANGER,
         area.width.saturating_sub(4).min(76),
         9,
-    );
+        scale,
+    ) else {
+        return;
+    };
     let what = match t {
         ForeverTarget::Item { name, usage, .. } => {
             format!("{} ({})", fit(name, 40, g), both_usage(*usage))
@@ -224,39 +276,50 @@ fn confirm_forever(frame: &mut Frame, area: Rect, g: &Glyphs, t: &ForeverTarget)
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress) {
+fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress, scale: f64) {
     let g = &app.glyphs;
-    let inner = popup(
+    let Some(inner) = popup(
         frame,
         area,
         g,
         "Working",
         ACCENT,
         area.width.saturating_sub(4).min(76),
-        8,
-    );
-    let idx = anim::spinner_frame(app.tick, g.spinner().len());
-    let frac = if p.total == 0 {
-        1.0
-    } else {
-        p.done as f64 / p.total as f64
+        9,
+        scale,
+    ) else {
+        return;
     };
-    let bar_w = (inner.width as usize).saturating_sub(2);
+    let idx = anim::spinner_frame(app.tick, g.spinner().len());
+    // Fraction by bytes, so one huge folder still moves the bar; by item
+    // count when no sizes are known.
+    let frac = if p.of.size > 0 {
+        (p.usage.size as f64 / p.of.size as f64).clamp(0.0, 1.0)
+    } else if p.total > 0 {
+        (p.done as f64 / p.total as f64).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let what = match p.phase {
+        Phase::Moving => "Moving files to ToBeDeleted",
+        Phase::Deleting => "Deleting for good",
+    };
+    let bar_w = (inner.width as usize).saturating_sub(7);
     let lines = vec![
         Line::from(vec![
             Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
-            Span::raw(" Moving files, please wait"),
+            Span::raw(format!(" {what}, please wait")),
         ]),
         Line::raw(""),
-        Line::from(Span::styled(
-            eighths_bar(frac, bar_w, g),
-            Style::default().fg(SAFE),
-        )),
+        Line::from(vec![
+            Span::styled(eighths_bar(frac, bar_w, g), Style::default().fg(SAFE)),
+            Span::raw(format!(" {:>3}%", (frac * 100.0).floor() as u32)),
+        ]),
+        Line::from(format!("{} / {} items", p.done, p.total)),
         Line::from(format!(
-            "{} / {}   {}",
-            p.done,
-            p.total,
-            both_usage(p.usage)
+            "{} of {}",
+            human_size(p.usage.size),
+            both_usage(p.of)
         )),
         Line::from(Span::styled(
             fit_start(&p.current.to_string_lossy(), inner.width as usize, g),
@@ -266,7 +329,7 @@ fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo) {
+fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) {
     let g = &app.glyphs;
     let freed = app.accounting.freed(app.free_now);
     let shown = if app.animations {
@@ -335,7 +398,7 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo) {
     lines.push(Line::raw(""));
     lines.push(key_line(g, &[("Enter", "Done")]));
     let height = lines.len() as u16 + 2;
-    let inner = popup(
+    let Some(inner) = popup(
         frame,
         area,
         g,
@@ -343,12 +406,32 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo) {
         SAFE,
         area.width.saturating_sub(4).min(86),
         height,
-    );
+        scale,
+    ) else {
+        return;
+    };
+    // Confetti falls behind the text (text cells overwrite it).
+    if freed > 0 && app.animations {
+        let since = app
+            .tick
+            .saturating_sub(app.dialog_since)
+            .saturating_sub(GROW_TICKS);
+        let buf = frame.buffer_mut();
+        for piece in confetti::pieces(
+            since,
+            inner.width,
+            inner.height,
+            g.mode == crate::glyphs::GlyphMode::Ascii,
+        ) {
+            let cell = &mut buf[(inner.x + piece.x, inner.y + piece.y)];
+            cell.set_symbol(piece.glyph).set_fg(piece.color);
+        }
+    }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn notice(frame: &mut Frame, area: Rect, g: &Glyphs, msg: &str) {
-    let inner = popup(
+fn notice(frame: &mut Frame, area: Rect, g: &Glyphs, msg: &str, scale: f64) {
+    let Some(inner) = popup(
         frame,
         area,
         g,
@@ -356,11 +439,62 @@ fn notice(frame: &mut Frame, area: Rect, g: &Glyphs, msg: &str) {
         ACCENT,
         area.width.saturating_sub(4).min(76),
         8,
-    );
+        scale,
+    ) else {
+        return;
+    };
     let lines = vec![
         Line::from(super::clean(msg, g)),
         Line::raw(""),
         key_line(g, &[("Enter", "OK")]),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AREA: Rect = Rect::new(0, 0, 120, 30);
+
+    #[test]
+    fn full_scale_is_the_final_window() {
+        assert_eq!(grown(AREA, 80, 12, 1.0), centered(AREA, 80, 12));
+    }
+
+    #[test]
+    fn zero_scale_is_a_small_frame_in_the_middle() {
+        let r = grown(AREA, 80, 12, 0.0);
+        assert_eq!((r.width, r.height), (3, 3));
+        let full = centered(AREA, 80, 12);
+        let (cx, cy) = (full.x + full.width / 2, full.y + full.height / 2);
+        assert!(r.x <= cx && cx <= r.x + r.width);
+        assert!(r.y <= cy && cy <= r.y + r.height);
+    }
+
+    #[test]
+    fn the_window_grows_monotonically_and_stays_inside_the_final_one() {
+        let full = centered(AREA, 80, 12);
+        let mut last = (0, 0);
+        for i in 0..=20 {
+            let r = grown(AREA, 80, 12, i as f64 / 20.0);
+            assert!(r.width >= last.0 && r.height >= last.1, "step {i}");
+            assert!(r.x >= full.x && r.y >= full.y);
+            assert!(r.x + r.width <= full.x + full.width);
+            assert!(r.y + r.height <= full.y + full.height);
+            last = (r.width, r.height);
+        }
+    }
+
+    #[test]
+    fn small_windows_and_bad_scales_do_not_misbehave() {
+        // Never smaller than the final window allows, even for tiny dialogs.
+        let tiny = grown(AREA, 2, 2, 0.0);
+        assert!(tiny.width <= 2 && tiny.height <= 2);
+        for scale in [f64::NAN, -1.0, 7.0] {
+            let r = grown(AREA, 80, 12, scale);
+            assert!(r.width <= 80 && r.height <= 12 && r.width >= 3);
+        }
+        assert_eq!(grown(Rect::new(0, 0, 0, 0), 80, 12, 0.5).area(), 0);
+    }
 }
