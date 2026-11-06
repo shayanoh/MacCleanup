@@ -41,15 +41,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 
     // Pending (soft-deleted, not freed yet) sits at the bottom.
-    let h = inner.height.min(2);
+    let h = inner.height.min(3);
     let bottom = Rect::new(inner.x, inner.y + inner.height - h, inner.width, h);
-    let pending = vec![
+    let pending = app.accounting.pending();
+    let lines = vec![
         Line::from(Span::styled(" pending", Style::default().fg(DIM))),
-        Line::from(format!(
-            " {} {}",
-            g.pending(),
-            human_size(app.accounting.pending())
+        Line::from(format!(" {} {}", g.pending(), human_size(pending.size))),
+        Line::from(Span::styled(
+            format!("   {} disk", human_size(pending.disk)),
+            Style::default().fg(DIM),
         )),
     ];
-    frame.render_widget(Paragraph::new(pending), bottom);
+    frame.render_widget(Paragraph::new(lines), bottom);
 }

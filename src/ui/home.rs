@@ -7,7 +7,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use super::{ACCENT, CAUTION, DANGER, DIM, SAFE, fit_pad, panel, right};
 use crate::anim;
 use crate::app::App;
-use crate::fmt::{eighths_bar, human_size};
+use crate::fmt::{both_usage, eighths_bar, human_size};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let g = &app.glyphs;
@@ -59,7 +59,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             "Used {}   {} pending {}",
             human_size(app.total_space.saturating_sub(free)),
             g.pending(),
-            human_size(app.accounting.pending())
+            both_usage(app.accounting.pending())
         )),
         Line::raw(""),
     ];
@@ -102,17 +102,17 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     )));
 
     let mut top = app.stack[0].children();
-    top.sort_by_key(|n| std::cmp::Reverse(n.size()));
+    top.sort_by_key(|n| std::cmp::Reverse(n.disk()));
     if top.is_empty() {
         lines.push(Line::from(Span::styled(
             "(nothing scanned yet)",
             Style::default().fg(DIM),
         )));
     }
-    let biggest = top.first().map_or(1, |n| n.size()).max(1);
+    let biggest = top.first().map_or(1, |n| n.disk()).max(1);
     let room = (content.height as usize).saturating_sub(lines.len());
     for node in top.iter().take(5.min(room)) {
-        let name_w = 22.min((content.width as usize).saturating_sub(30)).max(6);
+        let name_w = (content.width as usize).saturating_sub(36).clamp(6, 22);
         let name = node.name.to_string_lossy();
         lines.push(Line::from(vec![
             Span::styled(format!("{} ", g.folder()), Style::default().fg(ACCENT)),
@@ -120,11 +120,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 format!(
                     " {} ",
-                    eighths_bar(node.size() as f64 / biggest as f64, 10, g)
+                    eighths_bar(node.disk() as f64 / biggest as f64, 10, g)
                 ),
                 Style::default().fg(CAUTION),
             ),
             Span::raw(right(&human_size(node.size()), 9)),
+            Span::styled(
+                format!(" {}", right(&human_size(node.disk()), 9)),
+                Style::default().fg(DIM),
+            ),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), content);

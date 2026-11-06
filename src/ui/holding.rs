@@ -8,7 +8,9 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use super::{ACCENT, DIM, SELECTED_BG, fit, fit_start, pad, panel, right, text_width};
 use crate::app::App;
-use crate::fmt::human_size;
+use crate::fmt::{both_usage, human_size};
+use crate::softdelete::HeldItem;
+use crate::usage::Usage;
 
 fn age(deleted_at: u64) -> String {
     let now = SystemTime::now()
@@ -35,13 +37,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     app.layout.list_rows = inner.height - 3;
     app.ensure_visible();
 
-    let total: u64 = app.held.iter().map(|i| i.size).sum();
+    let total: Usage = app.held.iter().map(HeldItem::usage).sum();
     let summary = format!(
         "{} {} items {} {} {} {}",
         g.pending(),
         app.held.len(),
         g.dot(),
-        human_size(total),
+        both_usage(total),
         g.dot(),
         app.holding.dir().to_string_lossy()
     );
@@ -66,7 +68,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         let age_w = 9;
         let prefix_w = 2 + text_width(g.folder()) + 1;
         let path_w = (inner.width as usize)
-            .saturating_sub(prefix_w + size_w + age_w + 2)
+            .saturating_sub(prefix_w + size_w * 2 + age_w + 3)
             .max(6);
         let start = app.held_offset.min(app.held.len());
         let end = (start + app.layout.list_rows as usize).min(app.held.len());
@@ -82,6 +84,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
                     Span::styled(format!("{} ", g.folder()), Style::default().fg(ACCENT)),
                     Span::raw(pad(fit_start(&original, path_w, &g), path_w)),
                     Span::raw(format!(" {}", right(&human_size(item.size), size_w))),
+                    Span::styled(
+                        format!(" {}", right(&human_size(item.disk), size_w)),
+                        Style::default().fg(DIM),
+                    ),
                     Span::styled(
                         format!(" {}", pad(age(item.deleted_at), age_w)),
                         Style::default().fg(DIM),

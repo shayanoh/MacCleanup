@@ -10,7 +10,7 @@ use super::{
 };
 use crate::anim;
 use crate::app::{App, GraphMode, SortBy};
-use crate::fmt::{eighths_bar, human_size};
+use crate::fmt::{both_usage, eighths_bar, human_size};
 use crate::scan::Row;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -153,7 +153,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let marked = format!(
         "marked: {} items, {} (not deleted yet)",
         app.marks.len(),
-        human_size(app.marked_total())
+        both_usage(app.marked())
     );
     let style = if app.marks.is_empty() {
         Style::default().fg(DIM)

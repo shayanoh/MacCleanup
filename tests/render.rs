@@ -512,3 +512,101 @@ fn home_scan_line_shows_on_disk_size_too() {
     assert!(text.contains(&human_size(stats.disk)), "{text}");
     assert!(text.contains("on disk"), "{text}");
 }
+
+#[test]
+fn review_dialog_shows_on_disk_total() {
+    let mut e = explorer(GlyphMode::Nerd);
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+    let text = render(&mut e.app, 120, 30);
+    // small.txt: 1.5 KB logical, 4.1 KB on disk.
+    assert!(text.contains("1.5 KB"), "{text}");
+    assert!(text.contains("4.1 KB"), "{text}");
+    assert!(text.contains("on disk"), "{text}");
+}
+
+#[test]
+fn marked_footer_shows_on_disk_size() {
+    let mut e = explorer(GlyphMode::Nerd);
+    mark(&mut e.app, "small.txt");
+    let text = render(&mut e.app, 140, 30);
+    assert!(
+        text.contains("marked: 1 items, 1.5 KB (4.1 KB on disk)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn sidebar_pending_shows_on_disk_size() {
+    let mut e = explorer(GlyphMode::Nerd);
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..500 {
+        if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
+            break;
+        }
+        e.app.update(Action::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e.app.update(Action::Cancel);
+    let text = render(&mut e.app, 120, 30);
+    assert!(text.contains("pending"), "{text}");
+    assert!(text.contains("4.1 KB disk"), "{text}");
+}
+
+#[test]
+fn home_pending_and_folders_show_on_disk_size() {
+    let mut e = make_app(FILES, GlyphMode::Nerd);
+    let text = render(&mut e.app, 140, 30);
+    assert!(text.contains("pending 0 B (0 B on disk)"), "{text}");
+    // Biggest folders: logical and on-disk columns for big/ (5.0 MB).
+    let line = text.lines().find(|l| l.contains("big")).unwrap_or("");
+    assert!(
+        line.matches("MB").count() >= 2,
+        "size and disk columns: {line}"
+    );
+}
+
+#[test]
+fn holding_screen_shows_on_disk_size() {
+    let mut e = explorer(GlyphMode::Nerd);
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::Confirm);
+    for _ in 0..500 {
+        if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
+            break;
+        }
+        e.app.update(Action::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e.app.update(Action::Cancel);
+    e.app.update(Action::GoTo(Screen::Holding));
+    let text = render(&mut e.app, 140, 30);
+    assert!(text.contains("1.5 KB (4.1 KB on disk)"), "summary:\n{text}");
+    let row = text.lines().find(|l| l.contains("small.txt")).unwrap();
+    assert!(row.contains("1.5 KB") && row.contains("4.1 KB"), "{row}");
+}
+
+#[test]
+fn finish_dialog_shows_on_disk_amounts() {
+    let mut e = explorer(GlyphMode::Nerd);
+    mark(&mut e.app, "small.txt");
+    e.app.update(Action::OpenReview);
+    e.app.update(Action::ConfirmIrreversible);
+    e.app.update(Action::Confirm);
+    for _ in 0..500 {
+        if !matches!(e.app.dialog, Some(Dialog::Deleting(_))) {
+            break;
+        }
+        e.app.update(Action::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = render(&mut e.app, 140, 30);
+    assert!(text.contains("moved 1.5 KB (4.1 KB on disk)"), "{text}");
+    assert!(
+        text.contains("deleted for good 1.5 KB (4.1 KB on disk)"),
+        "{text}"
+    );
+}

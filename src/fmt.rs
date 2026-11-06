@@ -1,4 +1,5 @@
 use crate::glyphs::Glyphs;
+use crate::usage::Usage;
 
 const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
 
@@ -42,6 +43,15 @@ pub fn eighths_bar(frac: f64, width: usize, g: &Glyphs) -> String {
     out
 }
 
+/// "1.5 KB (4.1 KB on disk)": the logical size with what it takes on disk.
+pub fn both(size: u64, disk: u64) -> String {
+    format!("{} ({} on disk)", human_size(size), human_size(disk))
+}
+
+pub fn both_usage(u: Usage) -> String {
+    both(u.size, u.disk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +86,11 @@ mod tests {
         let empty = g.eighths()[0];
         assert!(eighths_bar(1.0, 6, &g).chars().all(|c| c == full));
         assert!(eighths_bar(0.0, 6, &g).chars().all(|c| c == empty));
+    }
+
+    #[test]
+    fn both_shows_size_and_on_disk() {
+        assert_eq!(both(1500, 4096), "1.5 KB (4.1 KB on disk)");
+        assert_eq!(both(0, 0), "0 B (0 B on disk)");
     }
 }

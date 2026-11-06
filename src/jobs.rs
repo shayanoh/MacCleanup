@@ -13,6 +13,7 @@ use std::thread;
 
 use crate::safety::Policy;
 use crate::softdelete::Holding;
+use crate::usage::Usage;
 
 #[derive(Clone, Debug)]
 pub enum DeleteEvent {
@@ -20,7 +21,7 @@ pub enum DeleteEvent {
     Progress {
         done: usize,
         total: usize,
-        bytes: u64,
+        usage: Usage,
         current: PathBuf,
     },
     Failed {
@@ -28,8 +29,8 @@ pub enum DeleteEvent {
         error: String,
     },
     Finished {
-        moved_bytes: u64,
-        emptied_bytes: u64,
+        moved: Usage,
+        emptied: Usage,
         failures: usize,
     },
 }
@@ -43,7 +44,7 @@ impl DeleteJob {
     pub fn start(
         holding: Arc<Holding>,
         policy: Arc<Policy>,
-        items: Vec<(PathBuf, u64)>,
+        items: Vec<(PathBuf, Usage)>,
         mode: DeleteMode,
     ) -> DeleteJob {
         let (tx, rx) = mpsc::channel();
@@ -60,7 +61,7 @@ impl DeleteJob {
 fn run(
     holding: &Holding,
     policy: &Policy,
-    items: Vec<(PathBuf, u64)>,
+    items: Vec<(PathBuf, Usage)>,
     mode: DeleteMode,
     tx: &mpsc::Sender<DeleteEvent>,
 ) {
@@ -70,13 +71,14 @@ fn run(
         1
     };
     let total = items.len() * phases;
-    let (mut done, mut moved, mut emptied, mut failures) = (0usize, 0u64, 0u64, 0usize);
+    let (mut done, mut failures) = (0usize, 0usize);
+    let (mut moved, mut emptied) = (Usage::default(), Usage::default());
     let mut held: Vec<(String, PathBuf)> = Vec::new();
 
-    for (path, size) in items {
-        match holding.move_in(policy, &path, size) {
+    for (path, usage) in items {
+        match holding.move_in(policy, &path, usage) {
             Ok(item) => {
-                moved += size;
+                moved += usage;
                 held.push((item.id, path.clone()));
             }
             Err(e) => {
@@ -91,7 +93,7 @@ fn run(
         let _ = tx.send(DeleteEvent::Progress {
             done,
             total,
-            bytes: moved,
+            usage: moved,
             current: path,
         });
     }
@@ -99,7 +101,7 @@ fn run(
     if mode == DeleteMode::SoftThenEmpty {
         for (id, path) in held {
             match holding.delete_forever(&id) {
-                Ok(bytes) => emptied += bytes,
+                Ok(usage) => emptied += usage,
                 Err(e) => {
                     failures += 1;
                     let _ = tx.send(DeleteEvent::Failed {
@@ -112,15 +114,15 @@ fn run(
             let _ = tx.send(DeleteEvent::Progress {
                 done,
                 total,
-                bytes: moved + emptied,
+                usage: moved + emptied,
                 current: path,
             });
         }
     }
 
     let _ = tx.send(DeleteEvent::Finished {
-        moved_bytes: moved,
-        emptied_bytes: emptied,
+        moved,
+        emptied,
         failures,
     });
 }
@@ -129,6 +131,7 @@ fn run(
 mod tests {
     use super::*;
     use crate::safety::Policy;
+    use crate::usage::Usage;
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -175,12 +178,30 @@ mod tests {
         }
     }
 
+    fn two_files(s: &Sandbox) -> Vec<(PathBuf, Usage)> {
+        write(&s.home.join("p/a"), 100);
+        write(&s.home.join("p/b"), 200);
+        vec![
+            (s.home.join("p/a"), Usage::new(100, 4096)),
+            (s.home.join("p/b"), Usage::new(200, 4096)),
+        ]
+    }
+
+    fn finished(events: &[DeleteEvent]) -> (Usage, Usage, usize) {
+        match events.last() {
+            Some(DeleteEvent::Finished {
+                moved,
+                emptied,
+                failures,
+            }) => (*moved, *emptied, *failures),
+            other => panic!("last event not Finished: {}", other.is_some()),
+        }
+    }
+
     #[test]
     fn soft_only_job_moves_items_and_reports() {
         let s = sandbox();
-        write(&s.home.join("p/a"), 100);
-        write(&s.home.join("p/b"), 200);
-        let items = vec![(s.home.join("p/a"), 100), (s.home.join("p/b"), 200)];
+        let items = two_files(&s);
         let job = DeleteJob::start(
             Arc::clone(&s.holding),
             Arc::clone(&s.policy),
@@ -188,16 +209,10 @@ mod tests {
             DeleteMode::SoftOnly,
         );
         let events = run_to_end(&job);
-        match events.last() {
-            Some(DeleteEvent::Finished {
-                moved_bytes,
-                emptied_bytes,
-                failures,
-            }) => {
-                assert_eq!((*moved_bytes, *emptied_bytes, *failures), (300, 0, 0));
-            }
-            other => panic!("last event not Finished: {}", other.is_some()),
-        }
+        let (moved, emptied, failures) = finished(&events);
+        assert_eq!(moved, Usage::new(300, 8192));
+        assert_eq!(emptied, Usage::new(0, 0));
+        assert_eq!(failures, 0);
         let dones: Vec<usize> = events
             .iter()
             .filter_map(|e| match e {
@@ -211,11 +226,31 @@ mod tests {
     }
 
     #[test]
+    fn progress_reports_on_disk_size_too() {
+        let s = sandbox();
+        let items = two_files(&s);
+        let job = DeleteJob::start(
+            Arc::clone(&s.holding),
+            Arc::clone(&s.policy),
+            items,
+            DeleteMode::SoftOnly,
+        );
+        let events = run_to_end(&job);
+        let last = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                DeleteEvent::Progress { usage, .. } => Some(*usage),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(last, Usage::new(300, 8192));
+    }
+
+    #[test]
     fn soft_then_empty_job_removes_everything() {
         let s = sandbox();
-        write(&s.home.join("p/a"), 100);
-        write(&s.home.join("p/b"), 200);
-        let items = vec![(s.home.join("p/a"), 100), (s.home.join("p/b"), 200)];
+        let items = two_files(&s);
         let job = DeleteJob::start(
             Arc::clone(&s.holding),
             Arc::clone(&s.policy),
@@ -223,16 +258,10 @@ mod tests {
             DeleteMode::SoftThenEmpty,
         );
         let events = run_to_end(&job);
-        match events.last() {
-            Some(DeleteEvent::Finished {
-                moved_bytes,
-                emptied_bytes,
-                failures,
-            }) => {
-                assert_eq!((*moved_bytes, *emptied_bytes, *failures), (300, 300, 0));
-            }
-            other => panic!("last event not Finished: {}", other.is_some()),
-        }
+        let (moved, emptied, failures) = finished(&events);
+        assert_eq!(moved, Usage::new(300, 8192));
+        assert_eq!(emptied, Usage::new(300, 8192));
+        assert_eq!(failures, 0);
         assert!(s.holding.list().unwrap().is_empty());
         let totals: Vec<usize> = events
             .iter()
@@ -249,7 +278,10 @@ mod tests {
         let s = sandbox();
         fs::create_dir_all(s.home.join("Documents")).unwrap();
         write(&s.home.join("p/a"), 100);
-        let items = vec![(s.home.join("Documents"), 0), (s.home.join("p/a"), 100)];
+        let items = vec![
+            (s.home.join("Documents"), Usage::new(0, 0)),
+            (s.home.join("p/a"), Usage::new(100, 4096)),
+        ];
         let job = DeleteJob::start(
             Arc::clone(&s.holding),
             Arc::clone(&s.policy),
@@ -257,19 +289,13 @@ mod tests {
             DeleteMode::SoftOnly,
         );
         let events = run_to_end(&job);
-        let failed: Vec<&DeleteEvent> = events
+        let failed = events
             .iter()
             .filter(|e| matches!(e, DeleteEvent::Failed { .. }))
-            .collect();
-        assert_eq!(failed.len(), 1);
-        match events.last() {
-            Some(DeleteEvent::Finished {
-                moved_bytes,
-                failures,
-                ..
-            }) => assert_eq!((*moved_bytes, *failures), (100, 1)),
-            other => panic!("last event not Finished: {}", other.is_some()),
-        }
+            .count();
+        assert_eq!(failed, 1);
+        let (moved, _, failures) = finished(&events);
+        assert_eq!((moved, failures), (Usage::new(100, 4096), 1));
         assert!(s.home.join("Documents").exists());
         assert!(!s.home.join("p/a").exists());
     }

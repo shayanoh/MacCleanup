@@ -6,12 +6,13 @@ use ratatui::layout::Rect;
 
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
-use crate::fmt::human_size;
+use crate::fmt::both_usage;
 use crate::glyphs::Glyphs;
 use crate::jobs::{DeleteEvent, DeleteJob, DeleteMode};
 use crate::safety::{Policy, Safety};
 use crate::scan::{Node, Row, Scanner};
 use crate::softdelete::{HeldItem, Holding};
+use crate::usage::Usage;
 use crate::volume;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,28 +130,28 @@ pub enum Action {
 #[derive(Clone, Debug)]
 pub struct ReviewItem {
     pub path: PathBuf,
-    pub size: u64,
+    pub usage: Usage,
     pub safety: Safety,
 }
 
 #[derive(Clone, Debug)]
 pub struct Review {
     pub items: Vec<ReviewItem>,
-    pub total: u64,
+    pub total: Usage,
 }
 
 #[derive(Clone, Debug)]
 pub struct DeleteProgress {
     pub done: usize,
     pub total: usize,
-    pub bytes: u64,
+    pub usage: Usage,
     pub current: PathBuf,
 }
 
 #[derive(Clone, Debug)]
 pub struct FinishInfo {
-    pub moved_bytes: u64,
-    pub emptied_bytes: u64,
+    pub moved: Usage,
+    pub emptied: Usage,
     pub free_before: u64,
     pub free_after: u64,
     pub failures: usize,
@@ -163,8 +164,15 @@ pub struct FinishInfo {
 /// What a "delete for good" confirmation applies to.
 #[derive(Clone, Debug)]
 pub enum ForeverTarget {
-    Item { id: String, name: String, size: u64 },
-    All { count: usize, total: u64 },
+    Item {
+        id: String,
+        name: String,
+        usage: Usage,
+    },
+    All {
+        count: usize,
+        usage: Usage,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -186,8 +194,8 @@ pub struct App {
     pub rows: Vec<Row>,
     pub cursor: usize,
     pub offset: usize,
-    /// Marked paths with their size when marked (kept live while scanning).
-    pub marks: BTreeMap<PathBuf, u64>,
+    /// Marked paths with their size and on-disk size (kept live while scanning).
+    pub marks: BTreeMap<PathBuf, Usage>,
     pub dialog: Option<Dialog>,
     pub should_quit: bool,
     /// Directories entered so far; the last one is the one being shown.
@@ -207,7 +215,8 @@ pub struct App {
     pub glyphs: Glyphs,
     pub transition_start: u64,
     pub fda_missing: bool,
-    /// Set by `ui::draw`: the terminal is below the minimum size, so input\n    /// is limited to quitting (the user cannot see what a key would do).
+    /// Set by `ui::draw`: the terminal is below the minimum size, so input
+    /// is limited to quitting (the user cannot see what a key would do).
     pub too_small: bool,
     pub scanner: Scanner,
     pub policy: Arc<Policy>,
@@ -327,8 +336,9 @@ impl App {
         }
     }
 
-    pub fn marked_total(&self) -> u64 {
-        self.marks.values().sum()
+    /// Total of everything marked, logical and on disk.
+    pub fn marked(&self) -> Usage {
+        self.marks.values().copied().sum()
     }
 
     fn visible_rows(&self) -> usize {
@@ -356,8 +366,8 @@ impl App {
         sort_rows(&mut rows, self.sort);
         self.rows_synced_done = node.is_done();
         for r in &rows {
-            if let Some(size) = self.marks.get_mut(&r.path) {
-                *size = r.size;
+            if let Some(usage) = self.marks.get_mut(&r.path) {
+                *usage = Usage::new(r.size, r.disk);
             }
         }
         self.rows = rows;
@@ -556,7 +566,7 @@ impl App {
         let Some(row) = self.selected_row() else {
             return;
         };
-        let (path, size) = (row.path.clone(), row.size);
+        let (path, usage) = (row.path.clone(), Usage::new(row.size, row.disk));
         let name = row.name.to_string_lossy().into_owned();
         if self.marks.remove(&path).is_some() {
             return;
@@ -570,7 +580,7 @@ impl App {
             return;
         }
         self.marks.retain(|m, _| !m.starts_with(&path));
-        self.marks.insert(path, size);
+        self.marks.insert(path, usage);
     }
 
     fn open_review(&mut self) {
@@ -584,14 +594,19 @@ impl App {
         let mut items: Vec<ReviewItem> = self
             .marks
             .iter()
-            .map(|(path, size)| ReviewItem {
+            .map(|(path, usage)| ReviewItem {
                 path: path.clone(),
-                size: *size,
+                usage: *usage,
                 safety: self.policy.classify_real(path),
             })
             .collect();
-        items.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
-        let total = items.iter().map(|i| i.size).sum();
+        items.sort_by(|a, b| {
+            b.usage
+                .disk
+                .cmp(&a.usage.disk)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        let total = items.iter().map(|i| i.usage).sum();
         self.dialog = Some(Dialog::Review(Review { items, total }));
     }
 
@@ -643,10 +658,10 @@ impl App {
 
     /// Start the delete on a background thread and show its progress.
     fn run_delete(&mut self, review: Review, mode: DeleteMode) {
-        let items: Vec<(PathBuf, u64)> = review
+        let items: Vec<(PathBuf, Usage)> = review
             .items
             .iter()
-            .map(|i| (i.path.clone(), i.size))
+            .map(|i| (i.path.clone(), i.usage))
             .collect();
         let phases = if mode == DeleteMode::SoftThenEmpty {
             2
@@ -659,7 +674,7 @@ impl App {
         self.dialog = Some(Dialog::Deleting(DeleteProgress {
             done: 0,
             total: items.len() * phases,
-            bytes: 0,
+            usage: Usage::default(),
             current: PathBuf::new(),
         }));
         self.job = Some(DeleteJob::start(
@@ -680,14 +695,14 @@ impl App {
                 DeleteEvent::Progress {
                     done,
                     total,
-                    bytes,
+                    usage,
                     current,
                 } => {
                     if let Some(Dialog::Deleting(p)) = &mut self.dialog {
                         *p = DeleteProgress {
                             done,
                             total,
-                            bytes,
+                            usage,
                             current,
                         };
                     }
@@ -698,10 +713,10 @@ impl App {
                     }
                 }
                 DeleteEvent::Finished {
-                    moved_bytes,
-                    emptied_bytes,
+                    moved,
+                    emptied,
                     failures,
-                } => finished = Some((moved_bytes, emptied_bytes, failures)),
+                } => finished = Some((moved, emptied, failures)),
             }
         }
         if let Some((moved, emptied, failures)) = finished {
@@ -718,15 +733,15 @@ impl App {
     pub(crate) fn after_delete(
         &mut self,
         mode: DeleteMode,
-        moved: u64,
-        emptied: u64,
+        moved: Usage,
+        emptied: Usage,
         failures: usize,
         free_before: u64,
     ) {
-        if moved > 0 {
+        if moved != Usage::default() {
             self.accounting.record_soft_delete(moved);
         }
-        if emptied > 0 {
+        if emptied != Usage::default() {
             self.accounting.record_emptied(emptied);
         }
         // Marks of items that no longer exist were moved; failed ones stay.
@@ -738,8 +753,8 @@ impl App {
         let reason = self.job_failure.take();
         self.dialog = Some(match mode {
             DeleteMode::SoftThenEmpty => Dialog::Finish(FinishInfo {
-                moved_bytes: moved,
-                emptied_bytes: emptied,
+                moved,
+                emptied,
                 free_before,
                 free_after: self.free_now,
                 failures,
@@ -749,7 +764,7 @@ impl App {
             DeleteMode::SoftOnly => {
                 let mut msg = format!(
                     "Moved {} to ToBeDeleted (pending, not freed yet)",
-                    human_size(moved)
+                    both_usage(moved)
                 );
                 if failures > 0 {
                     msg.push_str(&format!(". {failures} item(s) could not be moved"));
@@ -771,7 +786,7 @@ impl App {
         };
         match self.holding.restore(&item.id) {
             Ok(_) => {
-                self.accounting.record_restore(item.size);
+                self.accounting.record_restore(item.usage());
                 self.notice = Some(format!("Restored {}", item.held_name));
             }
             Err(e) => self.notice = Some(e.to_string()),
@@ -789,7 +804,7 @@ impl App {
                 self.dialog = Some(Dialog::ConfirmForever(ForeverTarget::Item {
                     id: item.id.clone(),
                     name: item.held_name.clone(),
-                    size: item.size,
+                    usage: item.usage(),
                 }));
             }
             None => self.notice = Some("ToBeDeleted is empty".to_string()),
@@ -806,7 +821,7 @@ impl App {
         }
         self.dialog = Some(Dialog::ConfirmForever(ForeverTarget::All {
             count: self.held.len(),
-            total: self.held.iter().map(|i| i.size).sum(),
+            usage: self.held.iter().map(HeldItem::usage).sum(),
         }));
     }
 
@@ -817,13 +832,13 @@ impl App {
             ForeverTarget::All { .. } => self.holding.empty(),
         };
         match result {
-            Ok(bytes) => {
-                self.accounting.record_emptied(bytes);
+            Ok(usage) => {
+                self.accounting.record_emptied(usage);
                 self.refresh_free();
                 self.refresh_held();
                 self.dialog = Some(Dialog::Finish(FinishInfo {
-                    moved_bytes: 0,
-                    emptied_bytes: bytes,
+                    moved: Usage::default(),
+                    emptied: usage,
                     free_before,
                     free_after: self.free_now,
                     failures: 0,
@@ -852,6 +867,7 @@ fn step(pos: usize, delta: i64, len: usize) -> usize {
 mod tests {
     use super::*;
     use crate::testutil::{env, names, select, settle};
+    use crate::usage::Usage;
     use ratatui::layout::Rect;
     use std::fs;
 
@@ -904,13 +920,13 @@ mod tests {
         let mut e = env(FILES);
         let app = &mut e.app;
         app.update(Action::ToggleMark);
-        assert_eq!(app.marked_total(), 12288);
+        assert_eq!(app.marked().size, 12288);
         app.update(Action::Down);
         app.update(Action::ToggleMark);
-        assert_eq!(app.marked_total(), 20480);
+        assert_eq!(app.marked().size, 20480);
         assert_eq!(app.marks.len(), 2);
         app.update(Action::ToggleMark);
-        assert_eq!(app.marked_total(), 12288);
+        assert_eq!(app.marked().size, 12288);
         assert_eq!(app.marks.len(), 1);
     }
 
@@ -933,7 +949,7 @@ mod tests {
         app.update(Action::ToggleMark);
         assert_eq!(app.marks.len(), 1);
         assert!(app.marks.contains_key(&home.join("a")));
-        assert_eq!(app.marked_total(), 12288);
+        assert_eq!(app.marked().size, 12288);
     }
 
     #[test]
@@ -961,8 +977,8 @@ mod tests {
         app.update(Action::OpenReview);
         match &app.dialog {
             Some(Dialog::Review(r)) => {
-                assert_eq!(r.total, 20480);
-                let sizes: Vec<u64> = r.items.iter().map(|i| i.size).collect();
+                assert_eq!(r.total.size, 20480);
+                let sizes: Vec<u64> = r.items.iter().map(|i| i.usage.size).collect();
                 assert_eq!(sizes, [12288, 8192]);
             }
             other => panic!("expected review, got {:?}", other.is_some()),
@@ -985,7 +1001,7 @@ mod tests {
         assert!(!home.join("b.bin").exists());
         assert!(home.join("c/f").exists());
         assert_eq!(app.held.len(), 2);
-        assert_eq!(app.accounting.pending(), 20480);
+        assert_eq!(app.accounting.pending().size, 20480);
         assert!(app.marks.is_empty());
         assert!(matches!(app.dialog, Some(Dialog::Notice(_))));
         assert_eq!(names(app), ["c"]);
@@ -1006,7 +1022,7 @@ mod tests {
         settle(app);
         assert!(!home.join("b.bin").exists());
         assert!(app.held.is_empty());
-        assert_eq!(app.accounting.pending(), 0);
+        assert_eq!(app.accounting.pending().size, 0);
         assert!(matches!(app.dialog, Some(Dialog::Finish(_))));
     }
 
@@ -1229,7 +1245,7 @@ mod tests {
         app.update(Action::RestoreSelected);
         assert!(first.original.exists());
         assert_eq!(app.held.len(), 1);
-        assert_eq!(app.accounting.pending(), 20480 - first.size);
+        assert_eq!(app.accounting.pending().size, 20480 - first.size);
 
         // Deleting forever asks for confirmation first.
         let payload_exists = app.held.len() == 1;
@@ -1239,7 +1255,7 @@ mod tests {
         assert_eq!(app.held.len(), 1, "nothing deleted before confirmation");
         app.update(Action::Confirm);
         assert!(app.held.is_empty());
-        assert_eq!(app.accounting.pending(), 0);
+        assert_eq!(app.accounting.pending().size, 0);
         assert!(home.join("c/f").exists());
     }
 
@@ -1256,7 +1272,7 @@ mod tests {
         app.update(Action::EmptyAll);
         app.update(Action::Confirm);
         assert!(app.held.is_empty());
-        assert_eq!(app.accounting.pending(), 0);
+        assert_eq!(app.accounting.pending().size, 0);
     }
 
     #[test]
@@ -1306,7 +1322,7 @@ mod tests {
         settle(app);
         assert!(matches!(app.dialog, Some(Dialog::Notice(_))));
         assert!(!home.join("b.bin").exists());
-        assert_eq!(app.accounting.pending(), 8192);
+        assert_eq!(app.accounting.pending().size, 8192);
         assert_eq!(app.held.len(), 1);
     }
 
@@ -1336,8 +1352,8 @@ mod tests {
         settle(app);
         match &app.dialog {
             Some(Dialog::Finish(f)) => {
-                assert_eq!(f.moved_bytes, 8192);
-                assert_eq!(f.emptied_bytes, 8192);
+                assert_eq!(f.moved.size, 8192);
+                assert_eq!(f.emptied.size, 8192);
                 assert_eq!(f.failures, 0);
             }
             other => panic!("expected finish, got {}", other.is_some()),
@@ -1389,5 +1405,59 @@ mod tests {
     fn too_small_flag_defaults_to_false() {
         let e = env(FILES);
         assert!(!e.app.too_small);
+    }
+
+    #[test]
+    fn marks_and_review_carry_on_disk_size() {
+        let mut e = env(&[("a/f", 5000), ("b/f", 100)]);
+        let app = &mut e.app;
+        select(app, "a");
+        let row = app.selected_row().unwrap().clone();
+        assert!(row.disk >= row.size, "allocation rounds up");
+        app.update(Action::ToggleMark);
+        assert_eq!(app.marked(), Usage::new(row.size, row.disk));
+        app.update(Action::OpenReview);
+        match &app.dialog {
+            Some(Dialog::Review(r)) => {
+                assert_eq!(r.total, Usage::new(row.size, row.disk));
+                assert_eq!(r.items[0].usage, Usage::new(row.size, row.disk));
+            }
+            other => panic!("expected review, got {}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn pending_and_held_items_track_on_disk_size() {
+        let mut e = env(&[("a/f", 5000), ("b/f", 100)]);
+        let app = &mut e.app;
+        select(app, "a");
+        let row = app.selected_row().unwrap().clone();
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        app.update(Action::Confirm);
+        settle(app);
+        assert_eq!(app.accounting.pending(), Usage::new(row.size, row.disk));
+        assert_eq!(app.held[0].usage(), Usage::new(row.size, row.disk));
+        assert!(app.held[0].disk >= app.held[0].size);
+    }
+
+    #[test]
+    fn finish_info_has_on_disk_amounts() {
+        let mut e = env(&[("a/f", 5000), ("b/f", 100)]);
+        let app = &mut e.app;
+        select(app, "a");
+        let row = app.selected_row().unwrap().clone();
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        app.update(Action::ConfirmIrreversible);
+        app.update(Action::Confirm);
+        settle(app);
+        match &app.dialog {
+            Some(Dialog::Finish(f)) => {
+                assert_eq!(f.moved, Usage::new(row.size, row.disk));
+                assert_eq!(f.emptied, Usage::new(row.size, row.disk));
+            }
+            other => panic!("expected finish, got {}", other.is_some()),
+        }
     }
 }

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::safety::{Policy, Safety};
+use crate::usage::Usage;
 
 #[derive(Debug, Error)]
 pub enum HoldError {
@@ -51,8 +52,17 @@ pub struct HeldItem {
     /// Display name only (lossy); the real file is always `payload`.
     pub held_name: String,
     pub size: u64,
+    /// Bytes allocated on disk (0 in manifests written before this was tracked).
+    #[serde(default)]
+    pub disk: u64,
     /// Seconds since the Unix epoch.
     pub deleted_at: u64,
+}
+
+impl HeldItem {
+    pub fn usage(&self) -> Usage {
+        Usage::new(self.size, self.disk)
+    }
 }
 
 /// The soft-delete holding folder (default `~/ToBeDeleted`).
@@ -129,7 +139,12 @@ impl Holding {
 
     /// Move `path` into the holding folder. Refuses protected paths, the
     /// holding folder itself, and anything on another volume.
-    pub fn move_in(&self, policy: &Policy, path: &Path, size: u64) -> Result<HeldItem, HoldError> {
+    pub fn move_in(
+        &self,
+        policy: &Policy,
+        path: &Path,
+        usage: Usage,
+    ) -> Result<HeldItem, HoldError> {
         if policy.classify_real(path) == Safety::Protected {
             return Err(HoldError::Protected(path.to_path_buf()));
         }
@@ -159,7 +174,8 @@ impl Holding {
             id,
             original: path.to_path_buf(),
             held_name: name.to_string_lossy().into_owned(),
-            size,
+            size: usage.size,
+            disk: usage.disk,
             deleted_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
@@ -195,8 +211,8 @@ impl Holding {
         self.read_manifest()
     }
 
-    pub fn total_size(&self) -> io::Result<u64> {
-        Ok(self.list()?.iter().map(|i| i.size).sum())
+    pub fn total(&self) -> io::Result<Usage> {
+        Ok(self.list()?.iter().map(HeldItem::usage).sum())
     }
 
     /// Put an item back where it came from.
@@ -223,8 +239,8 @@ impl Holding {
         Ok(original)
     }
 
-    /// Permanently delete one held item. Returns the bytes it held.
-    pub fn delete_forever(&self, id: &str) -> Result<u64, HoldError> {
+    /// Permanently delete one held item. Returns what it held.
+    pub fn delete_forever(&self, id: &str) -> Result<Usage, HoldError> {
         let item_dir = self.item_dir(id)?;
         let _g = self.guard();
         let mut items = self.read_manifest()?;
@@ -237,17 +253,17 @@ impl Holding {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(HoldError::Io(e)),
         }
-        let size = items.remove(pos).size;
+        let usage = items.remove(pos).usage();
         self.write_manifest(&items)?;
-        Ok(size)
+        Ok(usage)
     }
 
-    /// Permanently delete everything held. Returns the bytes removed.
-    pub fn empty(&self) -> Result<u64, HoldError> {
+    /// Permanently delete everything held. Returns what was removed.
+    pub fn empty(&self) -> Result<Usage, HoldError> {
         let ids: Vec<String> = self.list()?.into_iter().map(|i| i.id).collect();
-        let mut total = 0u64;
+        let mut total = Usage::default();
         for id in ids {
-            total = total.saturating_add(self.delete_forever(&id)?);
+            total += self.delete_forever(&id)?;
         }
         Ok(total)
     }
@@ -257,6 +273,7 @@ impl Holding {
 mod tests {
     use super::*;
     use crate::safety::Policy;
+    use crate::usage::Usage;
     use std::fs;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
@@ -293,13 +310,16 @@ mod tests {
         let s = sandbox();
         let file = s.home.join("proj/a.txt");
         write(&file, "hello");
-        let item = s.holding.move_in(&s.policy, &file, 5).unwrap();
+        let item = s
+            .holding
+            .move_in(&s.policy, &file, Usage::new(5, 5))
+            .unwrap();
         assert!(!file.exists());
         let items = s.holding.list().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].original, file);
         assert_eq!(items[0].id, item.id);
-        assert_eq!(s.holding.total_size().unwrap(), 5);
+        assert_eq!(s.holding.total().unwrap(), Usage::new(5, 5));
     }
 
     #[test]
@@ -307,7 +327,10 @@ mod tests {
         let s = sandbox();
         let docs = s.home.join("Documents");
         fs::create_dir_all(&docs).unwrap();
-        let err = s.holding.move_in(&s.policy, &docs, 0).unwrap_err();
+        let err = s
+            .holding
+            .move_in(&s.policy, &docs, Usage::new(0, 0))
+            .unwrap_err();
         assert!(matches!(err, HoldError::Protected(_)), "{err:?}");
         assert!(docs.exists());
         assert!(s.holding.list().unwrap().is_empty());
@@ -317,7 +340,10 @@ mod tests {
     fn cannot_move_holding_into_itself() {
         let s = sandbox();
         let dir = s.holding.dir().to_path_buf();
-        let err = s.holding.move_in(&s.policy, &dir, 0).unwrap_err();
+        let err = s
+            .holding
+            .move_in(&s.policy, &dir, Usage::new(0, 0))
+            .unwrap_err();
         assert!(matches!(err, HoldError::Protected(_)), "{err:?}");
         assert!(dir.exists());
     }
@@ -328,7 +354,7 @@ mod tests {
         fs::create_dir_all(s.home.join("proj")).unwrap();
         let err = s
             .holding
-            .move_in(&s.policy, &s.home.join("proj/nope"), 0)
+            .move_in(&s.policy, &s.home.join("proj/nope"), Usage::new(0, 0))
             .unwrap_err();
         assert!(matches!(err, HoldError::Io(_)), "{err:?}");
     }
@@ -340,7 +366,9 @@ mod tests {
         write(&real, "data");
         let link = s.home.join("proj/l");
         symlink(&real, &link).unwrap();
-        s.holding.move_in(&s.policy, &link, 4).unwrap();
+        s.holding
+            .move_in(&s.policy, &link, Usage::new(4, 4))
+            .unwrap();
         assert!(fs::symlink_metadata(&link).is_err(), "link should be gone");
         assert_eq!(fs::read_to_string(&real).unwrap(), "data");
     }
@@ -350,7 +378,10 @@ mod tests {
         let s = sandbox();
         let file = s.home.join("proj/a.txt");
         write(&file, "hello");
-        let item = s.holding.move_in(&s.policy, &file, 5).unwrap();
+        let item = s
+            .holding
+            .move_in(&s.policy, &file, Usage::new(5, 5))
+            .unwrap();
         let back = s.holding.restore(&item.id).unwrap();
         assert_eq!(back, file);
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello");
@@ -362,7 +393,10 @@ mod tests {
         let s = sandbox();
         let dir = s.home.join("proj/build");
         write(&dir.join("x/y.txt"), "deep");
-        let item = s.holding.move_in(&s.policy, &dir, 4).unwrap();
+        let item = s
+            .holding
+            .move_in(&s.policy, &dir, Usage::new(4, 4))
+            .unwrap();
         assert!(!dir.exists());
         s.holding.restore(&item.id).unwrap();
         assert_eq!(fs::read_to_string(dir.join("x/y.txt")).unwrap(), "deep");
@@ -373,7 +407,10 @@ mod tests {
         let s = sandbox();
         let file = s.home.join("proj/a.txt");
         write(&file, "old");
-        let item = s.holding.move_in(&s.policy, &file, 3).unwrap();
+        let item = s
+            .holding
+            .move_in(&s.policy, &file, Usage::new(3, 3))
+            .unwrap();
         write(&file, "new");
         let err = s.holding.restore(&item.id).unwrap_err();
         assert!(matches!(err, HoldError::Conflict(_)), "{err:?}");
@@ -386,7 +423,10 @@ mod tests {
         let s = sandbox();
         let file = s.home.join("proj/sub/a.txt");
         write(&file, "hello");
-        let item = s.holding.move_in(&s.policy, &file, 5).unwrap();
+        let item = s
+            .holding
+            .move_in(&s.policy, &file, Usage::new(5, 5))
+            .unwrap();
         fs::remove_dir_all(s.home.join("proj")).unwrap();
         s.holding.restore(&item.id).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello");
@@ -399,8 +439,8 @@ mod tests {
         let y = s.home.join("y/a.txt");
         write(&x, "from x");
         write(&y, "from y");
-        let ix = s.holding.move_in(&s.policy, &x, 6).unwrap();
-        let iy = s.holding.move_in(&s.policy, &y, 6).unwrap();
+        let ix = s.holding.move_in(&s.policy, &x, Usage::new(6, 6)).unwrap();
+        let iy = s.holding.move_in(&s.policy, &y, Usage::new(6, 6)).unwrap();
         assert_ne!(ix.id, iy.id);
         s.holding.restore(&iy.id).unwrap();
         s.holding.restore(&ix.id).unwrap();
@@ -417,14 +457,14 @@ mod tests {
         write(&a, "aaaa");
         write(&b, "bb");
         write(&keep, "untouched");
-        let ia = s.holding.move_in(&s.policy, &a, 4).unwrap();
-        s.holding.move_in(&s.policy, &b, 2).unwrap();
+        let ia = s.holding.move_in(&s.policy, &a, Usage::new(4, 4)).unwrap();
+        s.holding.move_in(&s.policy, &b, Usage::new(2, 2)).unwrap();
 
-        assert_eq!(s.holding.delete_forever(&ia.id).unwrap(), 4);
+        assert_eq!(s.holding.delete_forever(&ia.id).unwrap(), Usage::new(4, 4));
         assert_eq!(s.holding.list().unwrap().len(), 1);
-        assert_eq!(s.holding.empty().unwrap(), 2);
+        assert_eq!(s.holding.empty().unwrap(), Usage::new(2, 2));
         assert!(s.holding.list().unwrap().is_empty());
-        assert_eq!(s.holding.total_size().unwrap(), 0);
+        assert_eq!(s.holding.total().unwrap(), Usage::new(0, 0));
         assert_eq!(fs::read_to_string(&keep).unwrap(), "untouched");
         let leftovers = fs::read_dir(s.holding.dir().join("items")).unwrap().count();
         assert_eq!(leftovers, 0);
@@ -456,7 +496,9 @@ mod tests {
         let s = sandbox();
         let file = s.home.join("proj/a.txt");
         write(&file, "hello");
-        s.holding.move_in(&s.policy, &file, 5).unwrap();
+        s.holding
+            .move_in(&s.policy, &file, Usage::new(5, 5))
+            .unwrap();
         let again = Holding::open(s.holding.dir().to_path_buf()).unwrap();
         let items = again.list().unwrap();
         assert_eq!(items.len(), 1);
@@ -474,7 +516,10 @@ mod tests {
             eprintln!("skipping: filesystem rejects non-UTF-8 names");
             return;
         }
-        let item = s.holding.move_in(&s.policy, &file, 1).unwrap();
+        let item = s
+            .holding
+            .move_in(&s.policy, &file, Usage::new(1, 1))
+            .unwrap();
         let again = Holding::open(s.holding.dir().to_path_buf()).unwrap();
         assert_eq!(again.list().unwrap()[0].original, file);
         again.restore(&item.id).unwrap();
@@ -487,7 +532,10 @@ mod tests {
         let cfg = s.home.join(".config");
         write(&cfg.join("gcloud/creds"), "secret");
         write(&cfg.join("other/file"), "x");
-        let err = s.holding.move_in(&s.policy, &cfg, 7).unwrap_err();
+        let err = s
+            .holding
+            .move_in(&s.policy, &cfg, Usage::new(7, 7))
+            .unwrap_err();
         match err {
             HoldError::Protected(p) => assert_eq!(p, cfg.join("gcloud")),
             other => panic!("expected Protected, got {other:?}"),
@@ -515,7 +563,7 @@ mod tests {
         let _restore = Restore(locked.clone());
         let err = s
             .holding
-            .move_in(&s.policy, &locked.join("f"), 1)
+            .move_in(&s.policy, &locked.join("f"), Usage::new(1, 1))
             .unwrap_err();
         assert!(matches!(err, HoldError::Io(_)), "{err:?}");
         assert!(s.holding.list().unwrap().is_empty());
@@ -532,13 +580,51 @@ mod tests {
         let s = sandbox();
         let file = s.home.join("p/a.txt");
         write(&file, "hello");
-        let item = s.holding.move_in(&s.policy, &file, 5).unwrap();
+        let item = s
+            .holding
+            .move_in(&s.policy, &file, Usage::new(5, 5))
+            .unwrap();
         let payload = s.holding.dir().join("items").join(&item.id).join("payload");
         assert!(payload.exists());
         // Simulate the interrupted state: entry present, payload missing.
         fs::remove_file(&payload).unwrap();
         assert_eq!(s.holding.list().unwrap().len(), 1);
-        assert_eq!(s.holding.delete_forever(&item.id).unwrap(), 5);
+        assert_eq!(
+            s.holding.delete_forever(&item.id).unwrap(),
+            Usage::new(5, 5)
+        );
         assert!(s.holding.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn on_disk_size_is_remembered_separately() {
+        let s = sandbox();
+        let file = s.home.join("p/a.txt");
+        write(&file, "hello");
+        let item = s
+            .holding
+            .move_in(&s.policy, &file, Usage::new(5, 4096))
+            .unwrap();
+        assert_eq!((item.size, item.disk), (5, 4096));
+        assert_eq!(item.usage(), Usage::new(5, 4096));
+        assert_eq!(s.holding.total().unwrap(), Usage::new(5, 4096));
+        let again = Holding::open(s.holding.dir().to_path_buf()).unwrap();
+        assert_eq!(again.list().unwrap()[0].disk, 4096);
+        assert_eq!(
+            s.holding.delete_forever(&item.id).unwrap(),
+            Usage::new(5, 4096)
+        );
+    }
+
+    #[test]
+    fn old_manifest_without_disk_still_loads() {
+        let s = sandbox();
+        let dir = s.holding.dir().to_path_buf();
+        let old = r#"[{"id":"1-1","original":[47,120],"held_name":"x","size":9,"deleted_at":1}]"#;
+        fs::write(dir.join("manifest.json"), old).unwrap();
+        let again = Holding::open(dir).unwrap();
+        let items = again.list().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].size, items[0].disk), (9, 0));
     }
 }

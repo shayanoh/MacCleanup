@@ -5,12 +5,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use super::{
-    ACCENT, CAUTION, DANGER, DIM, SAFE, centered, fit, panel, right, safety_color, safety_dot,
-    safety_word,
+    ACCENT, CAUTION, DANGER, DIM, SAFE, centered, fit, fit_start, pad, panel, right, safety_color,
+    safety_dot, safety_word,
 };
 use crate::anim;
 use crate::app::{App, DeleteProgress, Dialog, FinishInfo, ForeverTarget, Review};
-use crate::fmt::{eighths_bar, human_size};
+use crate::fmt::{both_usage, eighths_bar, human_size};
 use crate::glyphs::Glyphs;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
@@ -60,9 +60,9 @@ fn key_line<'a>(g: &Glyphs, keys: &[(&str, &str)]) -> Line<'a> {
 }
 
 fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
-    let width = area.width.saturating_sub(4).min(90);
-    let wanted = r.items.len() as u16 + 9;
-    let height = wanted.min(area.height.saturating_sub(2)).max(9);
+    let width = area.width.saturating_sub(4).min(96);
+    let wanted = r.items.len() as u16 + 10;
+    let height = wanted.min(area.height.saturating_sub(2)).max(10);
     let inner = popup(
         frame,
         area,
@@ -72,11 +72,20 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
         width,
         height,
     );
-    let room = (inner.height as usize).saturating_sub(6);
+    let room = (inner.height as usize).saturating_sub(7);
+    let name_w = (inner.width as usize).saturating_sub(34);
     let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {} {} {}",
+            pad("Item".to_string(), name_w),
+            right("Size", 9),
+            right("On disk", 9)
+        ),
+        Style::default().fg(DIM),
+    )));
     let shown = r.items.len().min(room.max(1));
     for item in r.items.iter().take(shown) {
-        let name_w = (inner.width as usize).saturating_sub(24);
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{} ", safety_dot(g, item.safety)),
@@ -84,14 +93,12 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
             ),
             Span::raw(format!(
                 "{} ",
-                super::pad(
-                    super::fit_start(&item.path.to_string_lossy(), name_w, g),
-                    name_w
-                )
+                pad(fit_start(&item.path.to_string_lossy(), name_w, g), name_w)
             )),
-            Span::raw(right(&human_size(item.size), 9)),
+            Span::raw(right(&human_size(item.usage.size), 9)),
+            Span::raw(format!(" {}", right(&human_size(item.usage.disk), 9))),
             Span::styled(
-                format!("  {}", safety_word(item.safety)),
+                format!(" {}", safety_word(item.safety)),
                 Style::default().fg(safety_color(item.safety)),
             ),
         ]));
@@ -105,12 +112,14 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::styled(
-            format!("Total {}", human_size(r.total)),
+            format!("Total {}", both_usage(r.total)),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" will be moved. It is not freed until you empty ToBeDeleted."),
+        Span::raw(" will be moved."),
     ]));
-    lines.push(Line::raw(""));
+    lines.push(Line::from(
+        "It is not freed until you empty ToBeDeleted.".to_string(),
+    ));
     lines.push(key_line(
         g,
         &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],
@@ -135,7 +144,7 @@ fn irreversible(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
         g,
         &format!("{} Delete permanently", g.warn()),
         DANGER,
-        area.width.saturating_sub(4).min(70),
+        area.width.saturating_sub(4).min(76),
         9,
     );
     let lines = vec![
@@ -143,7 +152,7 @@ fn irreversible(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
             format!(
                 "This permanently deletes {} item(s), {}.",
                 r.items.len(),
-                human_size(r.total)
+                both_usage(r.total)
             ),
             Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
         )),
@@ -168,15 +177,15 @@ fn confirm_forever(frame: &mut Frame, area: Rect, g: &Glyphs, t: &ForeverTarget)
         g,
         &format!("{} Delete for good", g.warn()),
         DANGER,
-        area.width.saturating_sub(4).min(70),
+        area.width.saturating_sub(4).min(76),
         9,
     );
     let what = match t {
-        ForeverTarget::Item { name, size, .. } => {
-            format!("{} ({})", fit(name, 40, g), human_size(*size))
+        ForeverTarget::Item { name, usage, .. } => {
+            format!("{} ({})", fit(name, 40, g), both_usage(*usage))
         }
-        ForeverTarget::All { count, total } => {
-            format!("all {count} items ({}) in ToBeDeleted", human_size(*total))
+        ForeverTarget::All { count, usage } => {
+            format!("all {count} items ({}) in ToBeDeleted", both_usage(*usage))
         }
     };
     let lines = vec![
@@ -206,7 +215,7 @@ fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress) {
         g,
         "Working",
         ACCENT,
-        area.width.saturating_sub(4).min(70),
+        area.width.saturating_sub(4).min(76),
         8,
     );
     let idx = anim::spinner_frame(app.tick, g.spinner().len());
@@ -230,10 +239,10 @@ fn deleting(frame: &mut Frame, area: Rect, app: &App, p: &DeleteProgress) {
             "{} / {}   {}",
             p.done,
             p.total,
-            human_size(p.bytes)
+            both_usage(p.usage)
         )),
         Line::from(Span::styled(
-            fit(&p.current.to_string_lossy(), inner.width as usize, g),
+            fit_start(&p.current.to_string_lossy(), inner.width as usize, g),
             Style::default().fg(DIM),
         )),
     ];
@@ -275,9 +284,12 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(format!(
-        "This cleanup: moved {}, deleted for good {}",
-        human_size(f.moved_bytes),
-        human_size(f.emptied_bytes)
+        "This cleanup: moved {}",
+        both_usage(f.moved)
+    )));
+    lines.push(Line::from(format!(
+        "              deleted for good {}",
+        both_usage(f.emptied)
     )));
     if f.failures > 0 {
         lines.push(Line::from(Span::styled(
@@ -295,11 +307,11 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo) {
     lines.push(Line::from(format!(
         "Free space now {}   pending {}",
         human_size(app.free_now),
-        human_size(app.accounting.pending())
+        both_usage(app.accounting.pending())
     )));
     for e in &events[recent..] {
         lines.push(Line::from(Span::styled(
-            format!("{} {} {}", g.dot(), e.label, human_size(e.bytes)),
+            format!("{} {} {}", g.dot(), e.label, both_usage(e.usage)),
             Style::default().fg(DIM),
         )));
     }
@@ -312,7 +324,7 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo) {
         g,
         "Done",
         SAFE,
-        area.width.saturating_sub(4).min(76),
+        area.width.saturating_sub(4).min(86),
         height,
     );
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
@@ -325,8 +337,8 @@ fn notice(frame: &mut Frame, area: Rect, g: &Glyphs, msg: &str) {
         g,
         "Note",
         ACCENT,
-        area.width.saturating_sub(4).min(70),
-        7,
+        area.width.saturating_sub(4).min(76),
+        8,
     );
     let lines = vec![
         Line::from(super::clean(msg, g)),

@@ -14,4 +14,5 @@ pub mod softdelete;
 pub(crate) mod testutil;
 pub mod treemap;
 pub mod ui;
+pub mod usage;
 pub mod volume;

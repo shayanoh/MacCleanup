@@ -31,7 +31,7 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 - Deletion is a final step: list every file with its size on the review screen, confirm, then delete in the background with a progress bar. Never delete without that review.
 - Soft delete is the default everywhere; permanent delete only through "move, then empty now" (`x` in the review dialog) or the ToBeDeleted screen, both behind an explicit `y` (Enter never confirms an irreversible action).
 - Never escalate privileges or ask for a password. For actions needing admin rights, show the exact command with a copy-to-clipboard button plus "Cancel" and "I ran the command" buttons; after the user confirms, rescan and continue. (Not built yet.)
-- Free space is the volume's free space before vs after; soft-deleted data is "pending", never "freed".
+- Show every size as both logical size and on-disk size (`fmt::both`, `usage::Usage { size, disk }`); sorting, graphs and share bars default to on-disk size. Free space is the volume's free space before vs after; soft-deleted data is "pending", never "freed".
 - Caches for docker and pnpm should be cleaned through their own commands where possible, not by removing files directly. Multiple npm/pnpm/node installs may exist (fnm and others); don't assume one.
 - Every scan is multithreaded for maximum speed: pool of `Scanner::default_threads()` (2x cores), a job per directory, no lock on the per-file hot path.
 - All file names shown on screen go through `ui::clean`/`fit`/`fit_start` (control characters and, in ASCII mode, non-ASCII become `?`); paths keep their tail, names keep their head.
