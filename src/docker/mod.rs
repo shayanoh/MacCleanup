@@ -2,6 +2,7 @@
 //! build cache), read as exact numbers from the Docker Engine API and
 //! analysed here, never trusting Docker's own shared/unique figures.
 
+pub mod analysis;
 pub mod api;
 pub mod model;
 
