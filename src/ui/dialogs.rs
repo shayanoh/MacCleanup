@@ -12,6 +12,7 @@ use crate::anim;
 use crate::app::{App, DeleteProgress, Dialog, FinishInfo, ForeverTarget, Review};
 use crate::fmt::{both_usage, eighths_bar, human_size};
 use crate::glyphs::Glyphs;
+use crate::usage::Usage;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let g = &app.glyphs;
@@ -61,8 +62,8 @@ fn key_line<'a>(g: &Glyphs, keys: &[(&str, &str)]) -> Line<'a> {
 
 fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
     let width = area.width.saturating_sub(4).min(96);
-    let wanted = r.items.len() as u16 + 10;
-    let height = wanted.min(area.height.saturating_sub(2)).max(10);
+    let wanted = r.items.len() as u16 + 11;
+    let height = wanted.min(area.height.saturating_sub(2)).max(11);
     let inner = popup(
         frame,
         area,
@@ -72,7 +73,7 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
         width,
         height,
     );
-    let room = (inner.height as usize).saturating_sub(7);
+    let room = (inner.height as usize).saturating_sub(8);
     let name_w = (inner.width as usize).saturating_sub(34);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
@@ -120,6 +121,22 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review) {
     lines.push(Line::from(
         "It is not freed until you empty ToBeDeleted.".to_string(),
     ));
+    lines.push(Line::from(Span::styled(
+        if r.shared == Usage::default() {
+            "Deleting for good frees all of it.".to_string()
+        } else {
+            format!(
+                "Deleting for good frees about {}; {} is shared with other places and stays.",
+                both_usage(r.unique),
+                both_usage(r.shared)
+            )
+        },
+        Style::default().fg(if r.shared == Usage::default() {
+            SAFE
+        } else {
+            CAUTION
+        }),
+    )));
     lines.push(key_line(
         g,
         &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],

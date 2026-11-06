@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
+use crate::usage::Usage;
+
 /// Publish partial totals after this many files so counters keep moving
 /// even while scanning one huge folder.
 const FLUSH_EVERY: u64 = 4096;
@@ -158,10 +160,63 @@ impl Row {
     }
 }
 
+/// All the links to one hard-linked file that the scanner has seen.
+struct LinkGroup {
+    /// Total link count reported by the filesystem (may include links
+    /// outside the scanned tree).
+    nlink: u64,
+    size: u64,
+    disk: u64,
+    /// The folder whose totals include this file (the first one scanned).
+    counted_by: Option<PathBuf>,
+    /// Every link path seen.
+    paths: Vec<PathBuf>,
+}
+
+/// How a folder's on-disk space splits between files only it holds and
+/// files that also have a hard link somewhere else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Breakdown {
+    /// Every link to these files is inside the folder: deleting it frees them.
+    pub unique: Usage,
+    /// These files also have a link outside the folder: deleting it frees
+    /// nothing for them.
+    pub shared: Usage,
+}
+
+/// Find the scanned folder node for `dir`, walking down from `root`.
+pub fn locate(root: &Arc<Node>, dir: &Path) -> Option<Arc<Node>> {
+    let rel = dir.strip_prefix(&root.path).ok()?;
+    let mut cur = Arc::clone(root);
+    for component in rel.components() {
+        let next = cur.subdir(&cur.path.join(component))?;
+        cur = next;
+    }
+    Some(cur)
+}
+
+/// Unique/shared for a single file: a hard-linked file frees nothing when
+/// one link is removed.
+pub fn file_breakdown(path: &Path) -> std::io::Result<Breakdown> {
+    let md = fs::symlink_metadata(path)?;
+    let usage = Usage::new(md.len(), md.blocks() * 512);
+    Ok(if md.is_file() && md.nlink() > 1 {
+        Breakdown {
+            unique: Usage::default(),
+            shared: usage,
+        }
+    } else {
+        Breakdown {
+            unique: usage,
+            shared: Usage::default(),
+        }
+    })
+}
+
 struct Shared {
-    /// Hard-linked files already counted: (device, inode) -> the folder that
-    /// counted it, so a subtree rescan can forget exactly its own entries.
-    seen: Mutex<HashMap<(u64, u64), PathBuf>>,
+    /// Every hard-linked file seen, by (device, inode). Kept so the explorer
+    /// can tell space unique to a folder from space shared with other places.
+    links: Mutex<HashMap<(u64, u64), LinkGroup>>,
     denied: Mutex<Vec<PathBuf>>,
     threads: Mutex<HashSet<ThreadId>>,
     files_seen: AtomicU64,
@@ -192,7 +247,7 @@ impl Scanner {
         Scanner {
             pool,
             shared: Arc::new(Shared {
-                seen: Mutex::new(HashMap::new()),
+                links: Mutex::new(HashMap::new()),
                 denied: Mutex::new(Vec::new()),
                 threads: Mutex::new(HashSet::new()),
                 files_seen: AtomicU64::new(0),
@@ -273,13 +328,89 @@ impl Scanner {
         rows
     }
 
+    /// Drop the hard-link entries inside a rescanned folder. A file that this
+    /// folder was credited with but that also has a link elsewhere is handed
+    /// to the folder holding that other link, so it is neither lost from the
+    /// totals nor counted twice.
+    fn forget_links_under(&self, node: &Arc<Node>, parent: &Arc<Node>) {
+        let mut handoffs: Vec<(PathBuf, u64, u64)> = Vec::new();
+        lock(&self.shared.links).retain(|_, group| {
+            let credited_inside = group
+                .counted_by
+                .as_deref()
+                .is_some_and(|dir| dir.starts_with(&node.path));
+            group.paths.retain(|p| !p.starts_with(&node.path));
+            if credited_inside {
+                group.counted_by = None;
+                if let Some(dir) = group.paths.first().and_then(|p| p.parent()) {
+                    group.counted_by = Some(dir.to_path_buf());
+                    handoffs.push((dir.to_path_buf(), group.size, group.disk));
+                }
+            }
+            !group.paths.is_empty()
+        });
+        if handoffs.is_empty() {
+            return;
+        }
+        let mut top = Arc::clone(parent);
+        while let Some(up) = top.parent.upgrade() {
+            top = up;
+        }
+        for (dir, size, disk) in handoffs {
+            if let Some(owner) = locate(&top, &dir) {
+                add_up(&owner, size, disk, 1);
+                self.shared.files_seen.fetch_add(1, Ordering::Relaxed);
+                self.shared.bytes_seen.fetch_add(size, Ordering::Relaxed);
+                self.shared.disk_seen.fetch_add(disk, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Split a folder's space into what only it holds (deleting it frees
+    /// this) and what is shared with hard links elsewhere (this stays).
+    /// Independent of which folder the scanner happened to credit first.
+    pub fn breakdown(&self, node: &Arc<Node>) -> Breakdown {
+        let total = Usage::new(node.size(), node.disk());
+        let mut credited_here = Usage::default();
+        let mut unique_links = Usage::default();
+        let mut shared = Usage::default();
+        for group in lock(&self.shared.links).values() {
+            let inside = group
+                .paths
+                .iter()
+                .filter(|p| p.starts_with(&node.path))
+                .count() as u64;
+            if inside == 0 {
+                continue;
+            }
+            let usage = Usage::new(group.size, group.disk);
+            if group
+                .counted_by
+                .as_deref()
+                .is_some_and(|dir| dir.starts_with(&node.path))
+            {
+                credited_here += usage;
+            }
+            if inside >= group.nlink {
+                unique_links += usage;
+            } else {
+                shared += usage;
+            }
+        }
+        // Plain files plus hard-linked files whose every link is inside.
+        Breakdown {
+            unique: total.saturating_sub(credited_here) + unique_links,
+            shared,
+        }
+    }
+
     /// Start over: scan `path` again from scratch with fresh counters.
     /// Returns `None` while a scan is still running.
     pub fn rescan_all(&self, path: &Path) -> Option<Arc<Node>> {
         if !self.is_idle() {
             return None;
         }
-        lock(&self.shared.seen).clear();
+        lock(&self.shared.links).clear();
         lock(&self.shared.denied).clear();
         for counter in [
             &self.shared.files_seen,
@@ -314,7 +445,7 @@ impl Scanner {
                 Some(v.saturating_sub(by))
             });
         }
-        lock(&self.shared.seen).retain(|_, owner| !owner.starts_with(&node.path));
+        self.forget_links_under(node, &parent);
         lock(&self.shared.denied).retain(|p| !p.starts_with(&node.path));
 
         // Swap in a fresh node and mark every ancestor unfinished until the
@@ -437,12 +568,21 @@ fn scan_dir(shared: &Arc<Shared>, node: &Arc<Node>) {
             rayon::spawn(move || walk(sh, child));
         } else {
             if md.nlink() > 1 && md.is_file() {
-                let key = (md.dev(), md.ino());
-                let mut seen = lock(&shared.seen);
-                if seen.contains_key(&key) {
+                let mut links = lock(&shared.links);
+                let group = links
+                    .entry((md.dev(), md.ino()))
+                    .or_insert_with(|| LinkGroup {
+                        nlink: md.nlink(),
+                        size: md.len(),
+                        disk: md.blocks() * 512,
+                        counted_by: None,
+                        paths: Vec::new(),
+                    });
+                group.paths.push(entry.path());
+                if group.counted_by.is_some() {
                     continue; // hard link already counted
                 }
-                seen.insert(key, node.path.clone());
+                group.counted_by = Some(node.path.clone());
             }
             size += md.len();
             disk += md.blocks() * 512;
@@ -458,6 +598,7 @@ fn scan_dir(shared: &Arc<Shared>, node: &Arc<Node>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::Usage;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -806,5 +947,118 @@ mod tests {
         wait(&s);
         assert!(s.denied().is_empty(), "{:?}", s.denied());
         assert_eq!(root.size(), 20);
+    }
+
+    fn link(root: &Path, from: &str, to: &str) {
+        fs::create_dir_all(root.join(to).parent().unwrap()).unwrap();
+        fs::hard_link(root.join(from), root.join(to)).unwrap();
+    }
+
+    #[test]
+    fn breakdown_of_a_plain_folder_is_all_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("a/f1"), 5000);
+        write(&dir.path().join("a/f2"), 6000);
+        let (s, root) = scan(dir.path(), 2);
+        let a = root.subdir(&dir.path().join("a")).unwrap();
+        let b = s.breakdown(&a);
+        assert_eq!(b.shared, Usage::default());
+        assert_eq!(b.unique, Usage::new(a.size(), a.disk()));
+    }
+
+    #[test]
+    fn breakdown_splits_shared_hard_links_whichever_thread_won() {
+        // store/pkg is hard-linked into proj/nm/pkg; proj/nm/own is a plain file.
+        // Which folder the scanner credits with pkg is a race; the breakdown
+        // must not depend on it.
+        for _ in 0..6 {
+            let dir = tempfile::tempdir().unwrap();
+            let r = dir.path();
+            write(&r.join("store/pkg"), 8192);
+            write(&r.join("proj/nm/own"), 4096);
+            link(r, "store/pkg", "proj/nm/pkg");
+            let (s, root) = scan(r, 4);
+            let proj = root.subdir(&r.join("proj")).unwrap();
+            let store = root.subdir(&r.join("store")).unwrap();
+
+            let bp = s.breakdown(&proj);
+            assert_eq!((bp.unique.size, bp.shared.size), (4096, 8192), "proj");
+            let bs = s.breakdown(&store);
+            assert_eq!((bs.unique.size, bs.shared.size), (0, 8192), "store");
+            // Everything is inside the root, so nothing is shared there.
+            let br = s.breakdown(&root);
+            assert_eq!((br.unique.size, br.shared.size), (8192 + 4096, 0), "root");
+        }
+    }
+
+    #[test]
+    fn breakdown_counts_links_outside_the_scan_root_as_shared() {
+        let outer = tempfile::tempdir().unwrap();
+        let o = outer.path();
+        write(&o.join("store/pkg"), 8192);
+        write(&o.join("proj/own"), 4096);
+        link(o, "store/pkg", "proj/pkg");
+        // Scan only proj: the store link is never seen, but nlink says it exists.
+        let (s, root) = scan(&o.join("proj"), 2);
+        let b = s.breakdown(&root);
+        assert_eq!((b.unique.size, b.shared.size), (4096, 8192));
+    }
+
+    #[test]
+    fn breakdown_hard_links_inside_one_folder_are_unique_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("a/x"), 8192);
+        link(r, "a/x", "a/y");
+        let (s, root) = scan(r, 2);
+        let a = root.subdir(&r.join("a")).unwrap();
+        let b = s.breakdown(&a);
+        assert_eq!((b.unique.size, b.shared.size), (8192, 0));
+    }
+
+    #[test]
+    fn file_breakdown_tells_linked_files_from_plain_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(&r.join("plain"), 100);
+        write(&r.join("one"), 200);
+        link(r, "one", "two");
+        let plain = file_breakdown(&r.join("plain")).unwrap();
+        assert_eq!((plain.unique.size, plain.shared.size), (100, 0));
+        let linked = file_breakdown(&r.join("one")).unwrap();
+        assert_eq!((linked.unique.size, linked.shared.size), (0, 200));
+        assert!(file_breakdown(&r.join("missing")).is_err());
+    }
+
+    #[test]
+    fn rescan_dir_hands_a_shared_file_to_the_other_folder() {
+        // Delete the link inside the rescanned folder. If that folder was the
+        // one credited with the file, the credit must move to the other
+        // folder, or the root total would silently lose a file that is still
+        // on disk. Either folder may have been credited, so try both.
+        for victim in ["a", "b"] {
+            let dir = tempfile::tempdir().unwrap();
+            let r = dir.path();
+            write(&r.join("a/f"), 8192);
+            link(r, "a/f", "b/f");
+            let (s, root) = scan(r, 2);
+            assert_eq!(root.size(), 8192);
+
+            let node = root.subdir(&r.join(victim)).unwrap();
+            fs::remove_file(r.join(victim).join("f")).unwrap();
+            s.rescan_dir(&node).unwrap();
+            wait(&s);
+
+            assert_eq!(
+                root.size(),
+                8192,
+                "victim {victim}: the file is still on disk"
+            );
+            assert_eq!(root.files(), 1);
+            let a = root.subdir(&r.join("a")).unwrap();
+            let b = root.subdir(&r.join("b")).unwrap();
+            assert_eq!(a.size() + b.size(), 8192, "counted exactly once");
+            assert_eq!(s.stats().files, 1);
+        }
     }
 }

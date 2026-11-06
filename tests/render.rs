@@ -25,6 +25,10 @@ fn write(path: &Path, bytes: usize) {
 }
 
 fn make_app(files: &[(&str, usize)], mode: GlyphMode) -> Env {
+    make_app_with(files, mode, |_| {})
+}
+
+fn make_app_with(files: &[(&str, usize)], mode: GlyphMode, setup: impl FnOnce(&Path)) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
     let home = base.join("home");
@@ -32,6 +36,7 @@ fn make_app(files: &[(&str, usize)], mode: GlyphMode) -> Env {
     for (rel, size) in files {
         write(&home.join(rel), *size);
     }
+    setup(&home);
     let hold = base.join("hold");
     let scanner = Scanner::new(2);
     let root = scanner.scan_root(&home);
@@ -619,4 +624,63 @@ fn explorer_and_home_footers_mention_rescan() {
     e.app.update(Action::GoTo(Screen::Home));
     let text = render(&mut e.app, 120, 30);
     assert!(text.contains("r/R rescan"), "{text}");
+}
+
+fn shared_app(mode: GlyphMode) -> Env {
+    let mut e = make_app_with(&[("store/pkg", 8192), ("proj/own", 4096)], mode, |home| {
+        fs::hard_link(home.join("store/pkg"), home.join("proj/pkg")).unwrap()
+    });
+    e.app.update(Action::GoTo(Screen::Explorer));
+    e
+}
+
+fn select_row(app: &mut App, name: &str) {
+    app.cursor = app
+        .rows
+        .iter()
+        .position(|r| r.name.to_string_lossy() == name)
+        .unwrap();
+    app.refresh_detail();
+}
+
+#[test]
+fn explorer_detail_shows_unique_and_shared_space() {
+    let mut e = shared_app(GlyphMode::Nerd);
+    select_row(&mut e.app, "proj");
+    let text = render(&mut e.app, 130, 30);
+    let unique = text.lines().find(|l| l.contains("unique")).unwrap_or("");
+    let shared = text.lines().find(|l| l.contains("shared")).unwrap_or("");
+    assert!(unique.contains("4.1 KB"), "unique line: {unique}\n{text}");
+    assert!(shared.contains("8.2 KB"), "shared line: {shared}\n{text}");
+    assert!(text.contains("deleting frees"), "{text}");
+}
+
+#[test]
+fn explorer_detail_for_a_plain_folder_has_nothing_shared() {
+    let mut e = make_app(FILES, GlyphMode::Nerd);
+    e.app.update(Action::GoTo(Screen::Explorer));
+    select_row(&mut e.app, "mid");
+    let text = render(&mut e.app, 130, 30);
+    let shared = text.lines().find(|l| l.contains("shared")).unwrap_or("");
+    assert!(shared.contains("0 B (0 B on disk)"), "{shared}");
+}
+
+#[test]
+fn review_dialog_explains_what_is_shared_and_stays() {
+    let mut e = shared_app(GlyphMode::Nerd);
+    select_row(&mut e.app, "proj");
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    let text = render(&mut e.app, 130, 32);
+    assert!(text.contains("frees about"), "{text}");
+    assert!(text.contains("shared") && text.contains("stays"), "{text}");
+}
+
+#[test]
+fn shared_detail_is_ascii_in_ascii_mode() {
+    let mut e = shared_app(GlyphMode::Ascii);
+    select_row(&mut e.app, "proj");
+    for c in render_cells(&mut e.app, 130, 30) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
 }

@@ -29,6 +29,12 @@ pub fn write(path: &Path, bytes: usize) {
 /// completion, and an `App` rooted at it. The holding folder lives outside
 /// the home folder so it never shows up as a row.
 pub fn env(files: &[(&str, usize)]) -> Env {
+    env_with(files, |_| {})
+}
+
+/// Like [`env`], but runs `setup(home)` (for example to create hard links)
+/// after the files are written and before the scan starts.
+pub fn env_with(files: &[(&str, usize)], setup: impl FnOnce(&Path)) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
     let home = base.join("home");
@@ -36,6 +42,7 @@ pub fn env(files: &[(&str, usize)]) -> Env {
     for (rel, size) in files {
         write(&home.join(rel), *size);
     }
+    setup(&home);
     let holding_dir = base.join("hold");
     let scanner = Scanner::new(2);
     let root = scanner.scan_root(&home);
@@ -74,6 +81,7 @@ pub fn select(app: &mut App, name: &str) {
         .iter()
         .position(|r| r.name.to_string_lossy() == name)
         .unwrap_or_else(|| panic!("no row named {name}"));
+    app.refresh_detail();
 }
 
 /// Tick until a running delete job has finished (the dialog leaves `Deleting`).

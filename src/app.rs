@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ratatui::layout::Rect;
@@ -10,7 +10,7 @@ use crate::fmt::both_usage;
 use crate::glyphs::Glyphs;
 use crate::jobs::{DeleteEvent, DeleteJob, DeleteMode};
 use crate::safety::{Policy, Safety};
-use crate::scan::{Node, Row, Scanner};
+use crate::scan::{Breakdown, Node, Row, Scanner, file_breakdown, locate};
 use crate::softdelete::{HeldItem, Holding};
 use crate::usage::Usage;
 use crate::volume;
@@ -145,6 +145,11 @@ pub struct ReviewItem {
 pub struct Review {
     pub items: Vec<ReviewItem>,
     pub total: Usage,
+    /// Of the total, what deleting actually frees (every hard link is in the
+    /// marked items)...
+    pub unique: Usage,
+    /// ...and what also has a hard link elsewhere and so stays on disk.
+    pub shared: Usage,
 }
 
 #[derive(Clone, Debug)]
@@ -192,6 +197,15 @@ pub enum Dialog {
     Notice(String),
 }
 
+/// Unique vs shared space for the selected row.
+#[derive(Clone, Debug)]
+pub struct Detail {
+    pub path: PathBuf,
+    pub breakdown: Breakdown,
+    /// False while the folder is still being scanned (numbers still growing).
+    pub complete: bool,
+}
+
 pub struct App {
     pub screen: Screen,
     pub focus: Focus,
@@ -199,6 +213,7 @@ pub struct App {
     pub graph_pct: u16,
     pub sort: SortBy,
     pub rows: Vec<Row>,
+    pub detail: Option<Detail>,
     pub cursor: usize,
     pub offset: usize,
     /// Marked paths with their size and on-disk size (kept live while scanning).
@@ -281,6 +296,7 @@ impl App {
             graph_pct: 35,
             sort: SortBy::Disk,
             rows: Vec::new(),
+            detail: None,
             cursor: 0,
             offset: 0,
             marks: BTreeMap::new(),
@@ -383,6 +399,7 @@ impl App {
             .unwrap_or(self.cursor)
             .min(self.rows.len().saturating_sub(1));
         self.ensure_visible();
+        self.refresh_detail();
     }
 
     pub fn refresh_held(&mut self) {
@@ -512,6 +529,7 @@ impl App {
             Screen::Explorer => self.refresh_rows(),
             Screen::Home => {}
         }
+        self.refresh_detail();
     }
 
     fn move_by(&mut self, delta: i64) {
@@ -527,6 +545,7 @@ impl App {
             (_, Screen::Explorer) => {
                 self.cursor = step(self.cursor, delta, self.rows.len());
                 self.ensure_visible();
+                self.refresh_detail();
             }
             (_, Screen::Holding) => {
                 self.held_cursor = step(self.held_cursor, delta, self.held.len());
@@ -650,7 +669,60 @@ impl App {
                 .then_with(|| a.path.cmp(&b.path))
         });
         let total = items.iter().map(|i| i.usage).sum();
-        self.dialog = Some(Dialog::Review(Review { items, total }));
+        let (mut unique, mut shared) = (Usage::default(), Usage::default());
+        for item in &items {
+            let split = self.breakdown_of(&item.path, item.usage);
+            unique += split.unique;
+            shared += split.shared;
+        }
+        self.dialog = Some(Dialog::Review(Review {
+            items,
+            total,
+            unique,
+            shared,
+        }));
+    }
+
+    /// Unique vs shared space for the selected row (explorer only).
+    pub fn refresh_detail(&mut self) {
+        self.detail = if self.screen == Screen::Explorer {
+            self.selected_row().and_then(|row| self.detail_for(row))
+        } else {
+            None
+        };
+    }
+
+    fn detail_for(&self, row: &Row) -> Option<Detail> {
+        if row.is_dir {
+            let node = row.node.as_ref()?;
+            Some(Detail {
+                path: row.path.clone(),
+                breakdown: self.scanner.breakdown(node),
+                complete: node.is_done(),
+            })
+        } else {
+            Some(Detail {
+                path: row.path.clone(),
+                breakdown: file_breakdown(&row.path).ok()?,
+                complete: true,
+            })
+        }
+    }
+
+    /// Unique/shared for a marked path; unknown paths count as all unique.
+    fn breakdown_of(&self, path: &Path, usage: Usage) -> Breakdown {
+        let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+        if is_dir {
+            if let Some(node) = locate(&self.stack[0], path) {
+                return self.scanner.breakdown(&node);
+            }
+        } else if let Ok(split) = file_breakdown(path) {
+            return split;
+        }
+        Breakdown {
+            unique: usage,
+            shared: Usage::default(),
+        }
     }
 
     fn click(&mut self, x: u16, y: u16) {
@@ -684,6 +756,7 @@ impl App {
                         } else {
                             self.cursor = idx;
                         }
+                        self.refresh_detail();
                     }
                 }
                 Screen::Holding => {
@@ -1589,5 +1662,98 @@ mod tests {
         crate::testutil::wait_scan(app);
         assert!(app.marks.contains_key(&home.join("b.bin")));
         assert_eq!(app.selected_row().unwrap().name, "b.bin");
+    }
+
+    fn shared_env() -> crate::testutil::Env {
+        // store/pkg (8192) is hard-linked into proj/pkg; proj/own is plain (4096).
+        crate::testutil::env_with(&[("store/pkg", 8192), ("proj/own", 4096)], |home| {
+            fs::hard_link(home.join("store/pkg"), home.join("proj/pkg")).unwrap()
+        })
+    }
+
+    #[test]
+    fn detail_splits_unique_and_shared_for_the_selected_folder() {
+        let mut e = shared_env();
+        let app = &mut e.app;
+        select(app, "proj");
+        let d = app.detail.as_ref().expect("a detail for the selected row");
+        assert!(d.path.ends_with("proj"));
+        assert!(d.complete);
+        assert_eq!(
+            (d.breakdown.unique.size, d.breakdown.shared.size),
+            (4096, 8192)
+        );
+        select(app, "store");
+        let d = app.detail.as_ref().unwrap();
+        assert_eq!(
+            (d.breakdown.unique.size, d.breakdown.shared.size),
+            (0, 8192)
+        );
+    }
+
+    #[test]
+    fn detail_follows_the_cursor_and_clears_off_screen() {
+        let mut e = shared_env();
+        let app = &mut e.app;
+        let first = app.detail.as_ref().map(|d| d.path.clone());
+        assert!(first.is_some(), "explorer opens with a detail");
+        app.update(Action::Down);
+        let second = app.detail.as_ref().map(|d| d.path.clone());
+        assert_ne!(first, second);
+        app.update(Action::GoTo(Screen::Home));
+        // Detail is only meaningful in the explorer, but never stale-wrong.
+        assert!(app.detail.is_none() || app.screen == Screen::Home);
+    }
+
+    #[test]
+    fn detail_for_a_hard_linked_file_is_all_shared() {
+        let mut e = shared_env();
+        let app = &mut e.app;
+        app.update(Action::GoTo(Screen::Explorer));
+        select(app, "proj");
+        app.update(Action::Into);
+        select(app, "pkg");
+        let d = app.detail.as_ref().unwrap();
+        assert_eq!(
+            (d.breakdown.unique.size, d.breakdown.shared.size),
+            (0, 8192)
+        );
+        select(app, "own");
+        let d = app.detail.as_ref().unwrap();
+        assert_eq!(
+            (d.breakdown.unique.size, d.breakdown.shared.size),
+            (4096, 0)
+        );
+    }
+
+    #[test]
+    fn review_splits_what_deleting_frees_from_what_is_shared() {
+        let mut e = shared_env();
+        let app = &mut e.app;
+        select(app, "proj");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        match &app.dialog {
+            Some(Dialog::Review(r)) => {
+                assert_eq!((r.unique.size, r.shared.size), (4096, 8192));
+            }
+            other => panic!("expected review, got {}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn review_of_a_plain_folder_has_nothing_shared() {
+        let mut e = env(FILES);
+        let app = &mut e.app;
+        select(app, "a");
+        app.update(Action::ToggleMark);
+        app.update(Action::OpenReview);
+        match &app.dialog {
+            Some(Dialog::Review(r)) => {
+                assert_eq!(r.shared, Usage::default());
+                assert_eq!(r.unique.size, 12288);
+            }
+            other => panic!("expected review, got {}", other.is_some()),
+        }
     }
 }

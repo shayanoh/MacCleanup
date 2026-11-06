@@ -42,11 +42,11 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = panel(&g, title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.height < 4 || inner.width < 24 {
+    if inner.height < 6 || inner.width < 24 {
         return;
     }
     app.layout.list_top = inner.y + 2;
-    app.layout.list_rows = inner.height - 3;
+    app.layout.list_rows = inner.height - 5;
     app.ensure_visible();
 
     // Status line: live scan activity.
@@ -149,6 +149,14 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     frame.render_widget(Paragraph::new(lines), list_area);
 
+    // Unique vs shared space for the selected row.
+    let detail_y = inner.y + inner.height - 3;
+    let detail_lines = detail_lines(app, inner.width as usize);
+    frame.render_widget(
+        Paragraph::new(detail_lines),
+        Rect::new(inner.x, detail_y, inner.width, 2),
+    );
+
     // Marked summary.
     let marked = format!(
         "marked: {} items, {} (not deleted yet)",
@@ -243,4 +251,39 @@ fn value_style(sorted: bool) -> Style {
     } else {
         Style::default().fg(DIM)
     }
+}
+
+/// Two lines under the list: what deleting the selected row frees, and what
+/// it shares with hard links elsewhere (which stays on disk).
+fn detail_lines<'a>(app: &App, width: usize) -> Vec<Line<'a>> {
+    let g = &app.glyphs;
+    let Some(d) = &app.detail else {
+        return vec![
+            Line::from(Span::styled("nothing selected", Style::default().fg(DIM))),
+            Line::raw(""),
+        ];
+    };
+    let scanning = if d.complete {
+        String::new()
+    } else {
+        format!(" (still scanning{})", g.ellipsis())
+    };
+    let unique = format!(
+        "unique  {}  deleting frees this{scanning}",
+        both_usage(d.breakdown.unique)
+    );
+    let shared = format!(
+        "shared  {}  also linked elsewhere, stays",
+        both_usage(d.breakdown.shared)
+    );
+    vec![
+        Line::from(Span::styled(
+            fit(&unique, width, g),
+            Style::default().fg(Color::Green),
+        )),
+        Line::from(Span::styled(
+            fit(&shared, width, g),
+            Style::default().fg(Color::Yellow),
+        )),
+    ]
 }
