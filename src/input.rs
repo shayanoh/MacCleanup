@@ -44,7 +44,11 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('/')
             if matches!(
                 app.screen,
-                Screen::Explorer | Screen::Targets | Screen::Docker | Screen::DockerFiles
+                Screen::Explorer
+                    | Screen::Targets
+                    | Screen::Runtimes
+                    | Screen::Docker
+                    | Screen::DockerFiles
             ) =>
         {
             Some(Action::FilterOpen)
@@ -62,7 +66,12 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('b') if app.screen == Screen::Docker => Some(Action::Browse),
         KeyCode::Char('J') if app.screen == Screen::Docker => Some(Action::DetailScroll(1)),
         KeyCode::Char('K') if app.screen == Screen::Docker => Some(Action::DetailScroll(-1)),
-        KeyCode::Char('m') if matches!(app.screen, Screen::Targets | Screen::Docker) => {
+        KeyCode::Char('m')
+            if matches!(
+                app.screen,
+                Screen::Targets | Screen::Runtimes | Screen::Docker
+            ) =>
+        {
             Some(Action::MarkRelated)
         }
         KeyCode::Char('m') if app.screen == Screen::Snapshots => {

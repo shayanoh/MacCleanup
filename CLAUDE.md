@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-MacCleanup is a Rust TUI (colorful, animated, mouse-supported) that finds and reports disk usage on macOS and cleans up extra files safely. Milestone 1 (scanner, explorer, safety layer, soft delete, graphs, accounting, finish screen), milestone 2 (the Caches & Projects screen) milestone 3 (the Docker screen) and milestone 4 (the Time Machine screen) are implemented. Leftovers, uninstaller, packages and runtimes and the other candidates are planned (design doc) and appear dimmed in the sidebar.
+MacCleanup is a Rust TUI (colorful, animated, mouse-supported) that finds and reports disk usage on macOS and cleans up extra files safely. Milestone 1 (scanner, explorer, safety layer, soft delete, graphs, accounting, finish screen), milestone 2 (the Caches & Projects screen) milestone 3 (the Docker screen) and milestone 4 (the Time Machine screen) are implemented; milestone 5 (Runtimes) is in progress: Node versions and their global packages work. Leftovers, uninstaller, packages and runtimes and the other candidates are planned (design doc) and appear dimmed in the sidebar.
 
 ## Commands
 
@@ -26,6 +26,7 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 - `catalog/` what can be cleaned: `artifacts.rs` (project build output found in the scan tree, only with its marker file beside it), `tools.rs` (`discover_tools`: tool caches, slow because it asks the installed tools, so it runs on a thread), `split.rs` (build folders split into intermediate folders and kept products), `resolve.rs` (every install of a program: `PATH`, fnm, nvm, volta), `command.rs` (`CommandSpec`, the `CommandRunner` trait, `SystemRunner`, test-only `FakeRunner`). `targets.rs` builds the Caches & Projects list (sections, groups, `TRow` = `scan::Row` plus meta); `bg.rs` is `Latest<T>`, background work where only the newest result counts.
 - `docker/` the Docker page: `model.rs` (plain data, `ItemId` = `image:`/`container:`/`volume:`/`cache:`/`vm:trim`), `api.rs` (parses Docker Engine API JSON; exact bytes), `cli.rs` (`DockerCli::connect/load/cli/api_get`: finds `docker`, pins the `desktop-linux` context, reads the API over its unix socket with `curl` through the `CommandRunner`; `vm_disk_allocated`), `analysis.rs` (the tree, shared/unique/frees from layer ids, `frees_of_set`, `removal_order`, `blockers`), `view.rs` (`DockerView::lines`: sections, folds, sort, filter), `remove.rs` (the removal command per item), `vmtools.rs` (our `maccleanup/vm-tools` helper image: Dockerfile on stdin, trim, `LIST_SCRIPT`, `browse_spec`), `browse.rs` (read-only file listing), `state.rs` (`DockerState`). The App side is `app/dockerpage.rs` (a child module of `app`, to reach private fields); drawing is `ui/docker.rs` and `ui/docker_files.rs`.
 - `snapshots.rs` Time Machine snapshots (`load`, `delete_spec`, `estimate_held`, `measure`, `Settle`); `app/snappage.rs` its App side (child module like `dockerpage`); drawing is `ui/snapshots.rs`.
+- `catalog/runtimes.rs` installed runtimes (`node_installs` fnm/nvm, `node_globals`, `pins_for` reads `.nvmrc`/`.node-version`/`package.json`; `discover_runtimes` builds `RuntimeEntry`s, with exact uninstall commands). The Runtimes page is the Caches & Projects list: `Screen::Runtimes` shows the sections whose `SectionKind::page()` is `Page::Runtimes`; `App::on_targets()` is true on both screens and `Targets::lines(filter, page)` picks the sections.
 - `filter.rs` fzf-style `Query` for the explorer's filter box (terms ANDed; fuzzy / `'exact` / `^prefix` / `suffix$` / `!exclude`; smart case; returns highlight positions).
 - `ui/` drawing only (`mod.rs` helpers, `sidebar`, `home`, `explorer` (also the shared column helpers `cols`/`header_line`/`number_spans`), `graph` (takes a `GraphData`), `targets`, `holding`, `dialogs`); `glyphs.rs` Nerd/ASCII symbols; `fmt.rs` sizes and bars; `cli.rs` flags; `main.rs` terminal setup and event loop.
 - Tests: unit tests sit beside the code; `tests/render.rs` (TestBackend rendering), `tests/cli_smoke.rs` (binary flags/exit codes); `testutil.rs` builds a sandbox `App` for unit tests.
@@ -74,6 +75,11 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 - `Docker.raw` and Docker Desktop's data folders are protected in `safety.rs`. Browsing is read-only (volume mounted `:ro`, `--network none`, images run only `sh` with `LIST_SCRIPT`); containers are not browsable. Everything we create is labelled `com.maccleanup=1`.
 - The details pane wraps every line to its width and scrolls (`Action::DetailScroll`, `DockerState::detail_scroll/detail_max`); the list truncates a long command but the details never do. Optional columns (Modified on Explorer-like screens; Last used and Created on Docker) give way before names do (`MIN_NAME_*`).
 
+### Runtimes page
+
+- Ids in `tool_marks`: `node:<fnm|nvm>:<version>`, `node-global:<manager>:<version>:<package>`. A marked version drops the marks of its packages (`drop_globals_of_marked_versions`), and a package of a marked version cannot be marked. Bulk marks on a Node versions group/section take only rows with `TRow::bulk` (old, not default, not asked for); every other install is marked row by row.
+- Version names reach a command only after `parse_version`; package names only after `safe_name`; nvm's function runs as `bash -c` with the version as `$1`, never spliced in. Dedupe of nested folders is per page (a version folder and the packages inside it both show). Design: `docs/superpowers/specs/2026-11-07-packages-runtimes-design.md`, plan: `docs/superpowers/plans/2026-11-07-packages-runtimes.md`.
+
 ### Responsiveness and background work
 
 - Long walks over many files (snapshot measuring, pnpm store sizing) run on `bg::walk_pool()`, never on rayon's global pool: `Scanner::fill_frees` runs there on the UI thread and queued behind a snapshot walk for 47 s (the screen froze; reproduced and tested by `bg::tests::a_busy_walk_pool_does_not_block_the_global_pool`).
@@ -103,7 +109,7 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 
 ## Design
 
-Time Machine snapshots page: `docs/superpowers/specs/2026-11-07-timemachine-design.md` (built; plan in `docs/superpowers/plans/2026-11-07-timemachine.md`). Planned next: the Packages & runtimes page (`docs/superpowers/specs/2026-11-07-packages-runtimes-design.md`).
+Time Machine snapshots page: `docs/superpowers/specs/2026-11-07-timemachine-design.md` (built; plan in `docs/superpowers/plans/2026-11-07-timemachine.md`). Packages & runtimes page (in progress): `docs/superpowers/specs/2026-11-07-packages-runtimes-design.md`.
 
 The approved design is `docs/superpowers/specs/2026-11-06-maccleanup-design.md`. Milestone 2 (Caches & Projects) has its own design, `docs/superpowers/specs/2026-11-06-caches-projects-design.md`, whose section 11 records what was built and what is deferred. The plans are in `docs/superpowers/plans/`. Follow them and update them when decisions change.
 

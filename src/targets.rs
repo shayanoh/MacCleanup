@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use crate::app::{SortBy, cmp_rows};
 use crate::bg::Work;
+use crate::catalog::resolve::Places;
+use crate::catalog::runtimes::discover_runtimes;
 use crate::catalog::split::{SplitKind, split};
 use crate::catalog::{ArtifactKind, CommandSpec, Mode, ToolEntry, detect_artifacts};
 use crate::filter::Query;
@@ -18,6 +20,32 @@ use crate::scan::{Node, Row, SpaceView, file_space, locate};
 pub enum SectionKind {
     Projects,
     Tools,
+    NodeVersions,
+    NodeGlobals,
+}
+
+/// The screen a section is listed on: Caches & Projects or Packages & runtimes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Page {
+    Caches,
+    Runtimes,
+}
+
+impl SectionKind {
+    pub fn page(self) -> Page {
+        match self {
+            SectionKind::Projects | SectionKind::Tools => Page::Caches,
+            SectionKind::NodeVersions | SectionKind::NodeGlobals => Page::Runtimes,
+        }
+    }
+
+    /// Sections in the order they are listed.
+    pub const ALL: [SectionKind; 4] = [
+        SectionKind::Projects,
+        SectionKind::Tools,
+        SectionKind::NodeVersions,
+        SectionKind::NodeGlobals,
+    ];
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +68,9 @@ pub struct TRow {
     /// A final product (a built program) that bulk marks leave alone: it is
     /// deleted only when the user marks that row itself.
     pub kept: bool,
+    /// A command row that a bulk mark of its group or section takes (an old
+    /// Node version nothing asks for); every other command row is marked alone.
+    pub bulk: bool,
 }
 
 impl TRow {
@@ -131,6 +162,7 @@ struct Cand {
     kind: RowKind,
     regen: String,
     note: Option<String>,
+    bulk: bool,
 }
 
 fn project_kind(k: ArtifactKind) -> &'static str {
@@ -194,6 +226,7 @@ fn expand_split(c: Cand) -> Vec<Cand> {
             member: c.member,
             kind: RowKind::Folder,
             note: c.note.clone(),
+            bulk: false,
         })
         .collect()
 }
@@ -287,10 +320,15 @@ impl Targets {
                 },
                 regen: e.regen.clone(),
                 note: e.note.clone(),
+                bulk: false,
             });
         }
         work.stage(1, 3, "finding project folders");
-        for c in detect_artifacts(root) {
+        let artifacts = detect_artifacts(root);
+        let mut project_roots: Vec<PathBuf> = artifacts.iter().map(|c| c.root.clone()).collect();
+        project_roots.sort();
+        project_roots.dedup();
+        for c in artifacts {
             cands.push(Cand {
                 // Named relative to the root project: "apps/web/node_modules".
                 name: c.path.strip_prefix(&c.root).map_or_else(
@@ -313,6 +351,34 @@ impl Targets {
                 kind: RowKind::Folder,
                 regen: c.kind.regen().to_string(),
                 note: None,
+                bulk: false,
+            });
+        }
+        // Installed runtimes and their packages (the Packages & runtimes page).
+        for r in discover_runtimes(home, &Places::from_env(), &project_roots) {
+            let e = r.entry;
+            let Some(node) = locate(root, &e.path) else {
+                continue;
+            };
+            cands.push(Cand {
+                path: e.path,
+                node: Some(node),
+                split: None,
+                kept: false,
+                priority: 0,
+                section: r.section,
+                label: e.tool.clone(),
+                group: e.tool,
+                subtitle: String::new(),
+                member: false,
+                name: e.label,
+                kind: match e.mode {
+                    Mode::Folder => RowKind::Folder,
+                    Mode::Command(spec) => RowKind::Command { id: e.id, spec },
+                },
+                regen: e.regen,
+                note: e.note,
+                bulk: r.bulk,
             });
         }
 
@@ -327,12 +393,20 @@ impl Targets {
                 .then(a.priority.cmp(&b.priority))
                 .then_with(|| a.path.cmp(&b.path))
         });
-        let mut kept: HashSet<PathBuf> = HashSet::new();
+        // The outer folder only wins within its own page, and a global package
+        // sits inside its Node version's folder on purpose.
+        let mut kept: HashSet<(Page, PathBuf)> = HashSet::new();
         cands.retain(|c| {
-            if c.path.ancestors().any(|a| kept.contains(a)) {
+            let page = c.section.page();
+            let nested_ok = c.section == SectionKind::NodeGlobals;
+            if !nested_ok
+                && c.path
+                    .ancestors()
+                    .any(|a| kept.contains(&(page, a.to_path_buf())))
+            {
                 return false;
             }
-            kept.insert(c.path.clone());
+            kept.insert((page, c.path.clone()));
             true
         });
 
@@ -385,6 +459,7 @@ impl Targets {
                 regen: c.regen,
                 note: c.note,
                 kept: c.kept,
+                bulk: c.bulk,
             };
             match groups
                 .iter_mut()
@@ -426,9 +501,11 @@ impl Targets {
             g.rows.sort_by(|a, b| cmp_rows(by, &a.row, &b.row));
         }
         self.groups.sort_by(|a, b| {
-            let section = |g: &Group| match g.section {
-                SectionKind::Projects => 0,
-                SectionKind::Tools => 1,
+            let section = |g: &Group| {
+                SectionKind::ALL
+                    .iter()
+                    .position(|s| *s == g.section)
+                    .unwrap_or(0)
             };
             section(a)
                 .cmp(&section(b))
@@ -462,10 +539,10 @@ impl Targets {
     ///
     /// Only the name is matched, not the group's path, so `dev` does not pick
     /// up every project below `~/dev`.
-    pub fn lines(&self, filter: &Query) -> Vec<Line> {
+    pub fn lines(&self, filter: &Query, page: Page) -> Vec<Line> {
         let filtering = !filter.is_empty();
         let mut out = Vec::new();
-        for section in [SectionKind::Projects, SectionKind::Tools] {
+        for section in SectionKind::ALL.into_iter().filter(|s| s.page() == page) {
             let mut body = Vec::new();
             for (gi, g) in self
                 .groups
@@ -1014,7 +1091,7 @@ mod tests {
         let mut t = build(&s, &[e]);
         for by in [SortBy::Name, SortBy::Size, SortBy::Disk, SortBy::Frees] {
             t.sort(by);
-            let lines = t.lines(&filter::parse(""));
+            let lines = t.lines(&filter::parse(""), Page::Caches);
             let sections: Vec<_> = lines
                 .iter()
                 .filter_map(|l| match l {
@@ -1037,7 +1114,7 @@ mod tests {
         let closed: HashSet<String> = [format!("{:?}:~/shop", SectionKind::Projects)].into();
         let t = Targets::build(&source(&s, &[], closed), &Work::new());
         let rows = |q: &str| {
-            t.lines(&filter::parse(q))
+            t.lines(&filter::parse(q), Page::Caches)
                 .iter()
                 .filter(|l| matches!(l, Line::Row { .. }))
                 .count()
@@ -1052,7 +1129,7 @@ mod tests {
 
     /// The rows `lines` shows for a filter, as `group title / row name`.
     fn shown(t: &Targets, q: &str) -> Vec<String> {
-        t.lines(&filter::parse(q))
+        t.lines(&filter::parse(q), Page::Caches)
             .iter()
             .filter_map(|l| match *l {
                 Line::Row { group, row } => Some(format!(
@@ -1189,7 +1266,7 @@ mod tests {
     fn the_matching_group_header_stays_visible_with_its_section() {
         let s = sandbox(project);
         let t = build(&s, &[]);
-        let lines = t.lines(&filter::parse("shop"));
+        let lines = t.lines(&filter::parse("shop"), Page::Caches);
         assert!(matches!(lines[0], Line::Section(SectionKind::Projects)));
         assert!(matches!(lines[1], Line::Group(_)));
         assert_eq!(lines.len(), 4, "section, group, two items: {lines:?}");
@@ -1206,7 +1283,7 @@ mod tests {
             Mode::Folder,
         );
         let t = build(&s, &[e]);
-        let lines = t.lines(&filter::parse("spotify"));
+        let lines = t.lines(&filter::parse("spotify"), Page::Caches);
         assert!(
             lines
                 .iter()
@@ -1217,7 +1294,7 @@ mod tests {
                 .iter()
                 .any(|l| matches!(l, Line::Section(SectionKind::Tools)))
         );
-        assert!(t.lines(&filter::parse("zzzz")).is_empty());
+        assert!(t.lines(&filter::parse("zzzz"), Page::Caches).is_empty());
     }
 
     #[test]

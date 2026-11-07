@@ -29,6 +29,8 @@ pub enum Screen {
     Home,
     Explorer,
     Targets,
+    /// Packages & runtimes: the same list as `Targets`, showing the other sections.
+    Runtimes,
     Docker,
     /// Local Time Machine snapshots.
     Snapshots,
@@ -81,7 +83,7 @@ pub struct SidebarEntry {
     pub screen: Option<Screen>,
 }
 
-pub const SIDEBAR: [SidebarEntry; 8] = [
+pub const SIDEBAR: [SidebarEntry; 9] = [
     SidebarEntry {
         label: "Home",
         screen: Some(Screen::Home),
@@ -109,6 +111,10 @@ pub const SIDEBAR: [SidebarEntry; 8] = [
     SidebarEntry {
         label: "Time Machine",
         screen: Some(Screen::Snapshots),
+    },
+    SidebarEntry {
+        label: "Runtimes",
+        screen: Some(Screen::Runtimes),
     },
     SidebarEntry {
         label: "ToBeDeleted",
@@ -821,7 +827,7 @@ impl App {
             }
             return;
         }
-        if self.screen == Screen::Targets {
+        if self.on_targets() {
             let keep = keep_selection.then(|| self.sel_of(self.tcursor)).flatten();
             self.rebuild_tlines(keep);
             if !keep_selection {
@@ -849,7 +855,11 @@ impl App {
     fn filter_open(&mut self) {
         if !matches!(
             self.screen,
-            Screen::Explorer | Screen::Targets | Screen::Docker | Screen::DockerFiles
+            Screen::Explorer
+                | Screen::Targets
+                | Screen::Runtimes
+                | Screen::Docker
+                | Screen::DockerFiles
         ) {
             return;
         }
@@ -1073,7 +1083,7 @@ impl App {
                     SortBy::Frees => SortBy::Modified,
                     SortBy::Modified => SortBy::Name,
                 };
-                if self.screen == Screen::Targets {
+                if self.on_targets() {
                     // Only the order changes: no need to build the list again.
                     let keep = self.sel_of(self.tcursor);
                     self.targets.sort(self.sort);
@@ -1259,7 +1269,7 @@ impl App {
             self.holders_key = None;
             self.request_holders();
         }
-        if self.screen == Screen::Targets {
+        if self.on_targets() {
             let idle = self.scanner.is_idle();
             if (!idle && self.tick.is_multiple_of(10)) || (idle && !self.targets_synced) {
                 self.rebuild_targets();
@@ -1318,13 +1328,27 @@ impl App {
     fn goto(&mut self, screen: Screen) {
         self.filter.editing = false;
         // The filter belongs to one list; it does not follow to another screen.
-        let own_filter =
-            |s: Screen| matches!(s, Screen::Targets | Screen::Docker | Screen::DockerFiles);
+        let own_filter = |s: Screen| {
+            matches!(
+                s,
+                Screen::Targets | Screen::Runtimes | Screen::Docker | Screen::DockerFiles
+            )
+        };
         if (own_filter(self.screen) || own_filter(screen)) && self.screen != screen {
             self.reset_filter();
         }
+        let switching = matches!(
+            (self.screen, screen),
+            (Screen::Targets, Screen::Runtimes) | (Screen::Runtimes, Screen::Targets)
+        );
         self.screen = screen;
         self.transition_start = self.tick;
+        if switching {
+            // The other page shows other lines of the same list.
+            self.tcursor = 0;
+            self.toffset = 0;
+            self.rebuild_tlines(None);
+        }
         match screen {
             Screen::Holding => self.refresh_held(),
             Screen::Explorer => self.refresh_rows(),
@@ -1332,6 +1356,7 @@ impl App {
                 self.start_discovery();
                 self.rebuild_targets();
             }
+            Screen::Runtimes => self.rebuild_targets(),
             Screen::Docker => self.reload_docker(),
             Screen::Snapshots => self.reload_snapshots(),
             Screen::DockerFiles | Screen::Home => {}
@@ -1348,6 +1373,7 @@ impl App {
                     Screen::Targets,
                     Screen::Docker,
                     Screen::Snapshots,
+                    Screen::Runtimes,
                     Screen::Holding,
                 ];
                 let here = if self.screen == Screen::DockerFiles {
@@ -1373,7 +1399,7 @@ impl App {
             (_, Screen::Docker) => self.docker_move(delta),
             (_, Screen::Snapshots) => self.snap_move(delta),
             (_, Screen::DockerFiles) => self.browse_move(delta),
-            (_, Screen::Targets) => {
+            (_, Screen::Targets | Screen::Runtimes) => {
                 self.tcursor = step(self.tcursor, delta, self.tlines.len());
                 self.ensure_visible();
                 self.request_holders();
@@ -1423,7 +1449,10 @@ impl App {
             return;
         }
         let whole =
-            all || matches!(self.screen, Screen::Home | Screen::Targets) || self.stack.len() == 1;
+            all || matches!(
+                self.screen,
+                Screen::Home | Screen::Targets | Screen::Runtimes
+            ) || self.stack.len() == 1;
         if whole {
             let root_path = self.stack[0].path.clone();
             let Some(root) = self.scanner.rescan_all(&root_path) else {
@@ -1459,7 +1488,7 @@ impl App {
             self.focus = Focus::Main;
             return;
         }
-        if self.screen == Screen::Targets {
+        if self.on_targets() {
             self.target_into();
             return;
         }
@@ -1490,7 +1519,7 @@ impl App {
     }
 
     fn leave(&mut self) {
-        if self.focus == Focus::Main && self.screen == Screen::Targets {
+        if self.focus == Focus::Main && self.on_targets() {
             self.target_out();
             return;
         }
@@ -1522,7 +1551,7 @@ impl App {
                 let name = row.name.to_string_lossy().into_owned();
                 self.mark_path(path, usage, &name);
             }
-            Screen::Targets => self.toggle_target_mark(),
+            Screen::Targets | Screen::Runtimes => self.toggle_target_mark(),
             Screen::Docker => self.toggle_docker_mark(),
             Screen::Snapshots => self.toggle_snapshot_mark(),
             _ => {}
@@ -1583,6 +1612,74 @@ impl App {
         }
     }
 
+    /// Is this the Caches & Projects list or the Packages & runtimes one?
+    pub fn on_targets(&self) -> bool {
+        matches!(self.screen, Screen::Targets | Screen::Runtimes)
+    }
+
+    /// Which sections of the list the current screen shows.
+    pub fn page(&self) -> crate::targets::Page {
+        if self.screen == Screen::Runtimes {
+            crate::targets::Page::Runtimes
+        } else {
+            crate::targets::Page::Caches
+        }
+    }
+
+    /// A Node version that is marked removes its global packages too, so
+    /// their own marks are dropped: nothing runs twice.
+    fn drop_globals_of_marked_versions(&mut self) {
+        let versions: Vec<String> = self
+            .tool_marks
+            .iter()
+            .filter_map(|id| {
+                id.strip_prefix("node:")
+                    .map(|r| format!("node-global:{r}:"))
+            })
+            .collect();
+        self.tool_marks
+            .retain(|id| !versions.iter().any(|p| id.starts_with(p.as_str())));
+    }
+
+    /// The marked Node version a global package would be removed with.
+    fn version_covering(&self, id: &str) -> Option<String> {
+        let rest = id.strip_prefix("node-global:")?;
+        let mut parts = rest.splitn(3, ':');
+        let (manager, version) = (parts.next()?, parts.next()?);
+        let key = format!("node:{manager}:{version}");
+        self.tool_marks.contains(&key).then_some(key)
+    }
+
+    /// Bulk-mark the command rows of the chosen groups that are flagged for
+    /// it (old Node versions nothing asks for); again unmarks them.
+    fn mark_bulk_commands(&mut self, keep: impl Fn(usize, &crate::targets::Group) -> bool) {
+        let ids: Vec<String> = self
+            .targets
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(i, g)| keep(*i, g))
+            .flat_map(|(_, g)| g.rows.iter())
+            .filter(|r| r.bulk)
+            .filter_map(|r| match &r.kind {
+                crate::targets::RowKind::Command { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        if ids.iter().all(|id| self.tool_marks.contains(id)) {
+            for id in &ids {
+                self.tool_marks.remove(id);
+            }
+        } else {
+            self.tool_marks.extend(ids);
+        }
+        self.drop_globals_of_marked_versions();
+        self.marks_changed();
+    }
+
     fn toggle_target_mark(&mut self) {
         match self.tlines.get(self.tcursor).copied() {
             Some(Line::Row { group, row }) => {
@@ -1603,7 +1700,13 @@ impl App {
                                     Some(format!("{name} is already covered by a marked folder"));
                                 return;
                             }
+                            if self.version_covering(id).is_some() {
+                                self.notice =
+                                    Some(format!("{name} is removed with its Node version"));
+                                return;
+                            }
                             self.tool_marks.insert(id.clone());
+                            self.drop_globals_of_marked_versions();
                         }
                         self.marks_changed();
                     }
@@ -1612,10 +1715,12 @@ impl App {
             Some(Line::Group(g)) => {
                 let items = self.folder_rows_of(|gi, _| gi == g);
                 self.mark_many(items);
+                self.mark_bulk_commands(|gi, _| gi == g);
             }
             Some(Line::Section(kind)) => {
                 let items = self.folder_rows_of(|_, grp| grp.section == kind);
                 self.mark_many(items);
+                self.mark_bulk_commands(|_, grp| grp.section == kind);
             }
             None => {}
         }
@@ -1714,7 +1819,9 @@ impl App {
                 .map(|g| g.section);
             match section {
                 Some(SectionKind::Projects) => projects.push(Arc::clone(n)),
-                Some(SectionKind::Tools) => tools.push(Arc::clone(n)),
+                Some(SectionKind::Tools | SectionKind::NodeVersions | SectionKind::NodeGlobals) => {
+                    tools.push(Arc::clone(n))
+                }
                 None => {}
             }
         }
@@ -1743,7 +1850,7 @@ impl App {
         }
         self.set_space.value.map(|j| match section {
             SectionKind::Projects => j.projects.frees_all(),
-            SectionKind::Tools => j.tools.frees_all(),
+            _ => j.tools.frees_all(),
         })
     }
 
@@ -1862,7 +1969,11 @@ impl App {
     fn open_review(&mut self) {
         if !matches!(
             self.screen,
-            Screen::Explorer | Screen::Targets | Screen::Docker | Screen::Snapshots
+            Screen::Explorer
+                | Screen::Targets
+                | Screen::Runtimes
+                | Screen::Docker
+                | Screen::Snapshots
         ) {
             return;
         }
@@ -2018,7 +2129,7 @@ impl App {
                         self.held_cursor = idx;
                     }
                 }
-                Screen::Targets => {
+                Screen::Targets | Screen::Runtimes => {
                     let idx = self.toffset + i;
                     if idx < self.tlines.len() {
                         if idx == self.tcursor {
@@ -2151,7 +2262,9 @@ impl App {
     }
 
     fn rebuild_tlines(&mut self, keep: Option<LineKey>) {
-        self.tlines = self.targets.lines(&filter::parse(&self.filter.query));
+        self.tlines = self
+            .targets
+            .lines(&filter::parse(&self.filter.query), self.page());
         let found = keep.and_then(|k| self.index_of(&k));
         self.tcursor = found
             .unwrap_or(self.tcursor)
@@ -2264,7 +2377,7 @@ impl App {
                 self.docker.cursor = group;
                 self.ensure_visible();
             }
-            Screen::Targets => {
+            Screen::Targets | Screen::Runtimes => {
                 // `usize::MAX` stands for the project's header line.
                 let wanted = if row == usize::MAX {
                     Line::Group(group)
@@ -3125,6 +3238,8 @@ mod tests {
         assert_eq!(app.screen, Screen::Docker);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Snapshots);
+        app.update(Action::Down);
+        assert_eq!(app.screen, Screen::Runtimes);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Holding);
         app.update(Action::Into);
@@ -4411,6 +4526,7 @@ mod tests {
             .map(|l| match *l {
                 Line::Section(SectionKind::Projects) => "PROJECTS".to_string(),
                 Line::Section(SectionKind::Tools) => "TOOLS".to_string(),
+                Line::Section(s) => format!("{s:?}"),
                 Line::Group(g) => app.targets.groups[g].title.clone(),
                 Line::Row { group, row } => app
                     .targets
@@ -5788,5 +5904,183 @@ mod tests {
             })
             .collect();
         assert_eq!(shown, ["api"]);
+    }
+}
+
+#[cfg(test)]
+mod runtime_page_tests {
+    use super::*;
+    use crate::targets::{Line, SectionKind};
+    use crate::testutil::{Env, env_with};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    /// Two fnm versions (v22.10.0 is the default) with one global package each.
+    fn fnm_env() -> Env {
+        env_with(
+            &[
+                (
+                    ".local/share/fnm/node-versions/v20.9.0/installation/bin/npm",
+                    10,
+                ),
+                (
+                    ".local/share/fnm/node-versions/v20.9.0/installation/bin/node",
+                    5000,
+                ),
+                (
+                    ".local/share/fnm/node-versions/v20.9.0/installation/lib/node_modules/left-pad/i.js",
+                    3000,
+                ),
+                (
+                    ".local/share/fnm/node-versions/v22.10.0/installation/bin/fnm",
+                    10,
+                ),
+                (
+                    ".local/share/fnm/node-versions/v22.10.0/installation/bin/npm",
+                    10,
+                ),
+                (
+                    ".local/share/fnm/node-versions/v22.10.0/installation/lib/node_modules/@x/tool/i.js",
+                    2000,
+                ),
+            ],
+            |home| {
+                let base = home.join(".local/share/fnm");
+                for (v, exe) in [
+                    ("v22.10.0", "bin/fnm"),
+                    ("v22.10.0", "bin/npm"),
+                    ("v20.9.0", "bin/npm"),
+                ] {
+                    let p = base
+                        .join("node-versions")
+                        .join(v)
+                        .join("installation")
+                        .join(exe);
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                std::fs::create_dir_all(base.join("aliases")).unwrap();
+                symlink(
+                    base.join("node-versions/v22.10.0/installation"),
+                    base.join("aliases/default"),
+                )
+                .unwrap();
+            },
+        )
+    }
+
+    fn open(e: &mut Env) {
+        e.app.update(Action::GoTo(Screen::Runtimes));
+        e.app.settle_targets();
+    }
+
+    fn cursor_on(app: &mut App, section: Option<SectionKind>, row_name: Option<&str>) {
+        let at = app
+            .tlines
+            .iter()
+            .position(|l| match (*l, section, row_name) {
+                (Line::Section(s), Some(want), None) => s == want,
+                (Line::Row { group, row }, None, Some(name)) => {
+                    app.targets.row(group, row).row.name.to_string_lossy() == name
+                }
+                _ => false,
+            })
+            .expect("line not found");
+        app.tcursor = at;
+    }
+
+    #[test]
+    fn the_runtimes_page_lists_node_versions_and_their_packages_and_caches_does_not() {
+        let mut e = fnm_env();
+        open(&mut e);
+        let sections: Vec<SectionKind> = e
+            .app
+            .tlines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Section(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sections,
+            [SectionKind::NodeVersions, SectionKind::NodeGlobals]
+        );
+        e.app.update(Action::GoTo(Screen::Targets));
+        e.app.settle_targets();
+        assert!(!e.app.tlines.iter().any(|l| matches!(
+            l,
+            Line::Section(SectionKind::NodeVersions | SectionKind::NodeGlobals)
+        )));
+    }
+
+    #[test]
+    fn marking_the_section_takes_only_old_versions_never_the_default() {
+        let mut e = fnm_env();
+        open(&mut e);
+        cursor_on(&mut e.app, Some(SectionKind::NodeVersions), None);
+        e.app.update(Action::ToggleMark);
+        assert_eq!(
+            e.app.tool_marks.iter().cloned().collect::<Vec<_>>(),
+            ["node:fnm:v20.9.0"]
+        );
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.tool_marks.is_empty(), "again unmarks");
+    }
+
+    #[test]
+    fn a_marked_version_takes_its_packages_with_it() {
+        let mut e = fnm_env();
+        open(&mut e);
+        cursor_on(&mut e.app, None, Some("left-pad"));
+        e.app.update(Action::ToggleMark);
+        assert!(
+            e.app
+                .tool_marks
+                .contains("node-global:fnm:v20.9.0:left-pad")
+        );
+        cursor_on(&mut e.app, None, Some("v20.9.0"));
+        e.app.update(Action::ToggleMark);
+        assert_eq!(
+            e.app.tool_marks.iter().cloned().collect::<Vec<_>>(),
+            ["node:fnm:v20.9.0"],
+            "the package mark is dropped"
+        );
+        cursor_on(&mut e.app, None, Some("left-pad"));
+        e.app.update(Action::ToggleMark);
+        assert!(
+            !e.app
+                .tool_marks
+                .contains("node-global:fnm:v20.9.0:left-pad")
+        );
+        assert!(
+            e.app
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("Node version")
+        );
+    }
+
+    #[test]
+    fn the_review_lists_the_exact_commands() {
+        let mut e = fnm_env();
+        open(&mut e);
+        cursor_on(&mut e.app, None, Some("@x/tool"));
+        e.app.update(Action::ToggleMark);
+        cursor_on(&mut e.app, None, Some("v20.9.0"));
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::OpenReview);
+        let Some(Dialog::Review(r)) = &e.app.dialog else {
+            panic!("no review");
+        };
+        let lines: Vec<String> = r.commands.iter().map(|c| c.line.clone()).collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines.contains(&"fnm uninstall v20.9.0".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"npm uninstall -g @x/tool".to_string()),
+            "{lines:?}"
+        );
     }
 }

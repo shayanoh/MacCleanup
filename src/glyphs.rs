@@ -96,9 +96,9 @@ impl Glyphs {
     }
     /// Sidebar icon for entry `i`.
     pub fn nav(&self, i: usize) -> &'static str {
-        const NERD: [&str; 8] = [
+        const NERD: [&str; 9] = [
             "\u{f015}", "\u{f07c}", "\u{f12d}", "\u{f187}", "\u{f1c0}", "\u{f308}", "\u{f1da}",
-            "\u{f1f8}",
+            "\u{f1b2}", "\u{f1f8}",
         ];
         match self.mode {
             GlyphMode::Nerd => NERD.get(i).copied().unwrap_or("\u{f111}"),

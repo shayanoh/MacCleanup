@@ -341,6 +341,8 @@ fn section_line(app: &App, kind: SectionKind, width: usize) -> TextLine<'static>
     let (title, bg) = match kind {
         SectionKind::Projects => (" PROJECTS", Color::Blue),
         SectionKind::Tools => (" TOOLS & CACHES", Color::Magenta),
+        SectionKind::NodeVersions => (" NODE VERSIONS", Color::Green),
+        SectionKind::NodeGlobals => (" NODE GLOBAL PACKAGES", Color::Cyan),
     };
     let (mut disk, mut marked) = (0u64, 0usize);
     for grp in app.targets.groups.iter().filter(|x| x.section == kind) {

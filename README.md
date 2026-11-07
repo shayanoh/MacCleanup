@@ -57,9 +57,16 @@ Press `6` (needs Docker Desktop). One list, drawn like Caches & Projects, of eve
 - **Deleting:** the heading bar at the top of the list is the select-all row (space on it marks or unmarks every snapshot), space marks one, `a` marks all, `d` reviews, and one `y` runs `tmutil deletelocalsnapshots <date>` per snapshot, oldest first. No password is needed. It cannot be undone.
 - **Free space after a delete:** APFS gives the space back gradually, so for a while the app reads free space several times a second: the bottom line on every page (`free X (start Y)`) and the result screen follow it until it has stopped moving for 30 seconds.
 
+### Runtimes (in progress)
+
+- **What it does:** the Runtimes page (menu entry 8) lists the Node versions installed by fnm and nvm with their size, and under them the global npm packages of each version. The same list, colors, filter, graph and keys as Caches & Projects.
+- **Flags:** a version is marked "the default version", "older than the default" and "asked for by N project(s)" (read from `.nvmrc`, `.node-version`, `package.json` `engines.node` / `volta.node` of the projects the scan found). A pinned or default version can still be removed; the review is the place to decide.
+- **Removal:** `fnm uninstall <version>` or `nvm uninstall <version>`, and `npm uninstall -g <name>` run by that version's own npm. A version's global packages go with it, so marking a version drops their marks. `space` on a section or group marks only old, unpinned, non-default versions. Everything runs through the one review, irreversible, `y` only.
+- **Not built yet:** corepack package managers, uv Pythons and tools, Rust toolchains, cargo binaries, the Android SDK and iOS simulators (see `docs/superpowers/plans/2026-11-07-packages-runtimes.md`). Homebrew is left for its own page.
+
 ## Planned
 
-Next are app leftovers and the app uninstaller, then the other candidates: a packages and runtimes screen (old Node versions, global packages, cargo and Homebrew), simulators and runtimes, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed (their menu numbers already work and say they are coming).
+Next are app leftovers and the app uninstaller, then the other candidates: the rest of the runtimes screen (see above) and a Homebrew page, simulators and runtimes, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed (their menu numbers already work and say they are coming).
 
 ## Build and run
 
@@ -97,7 +104,7 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `r` / `R` | Rescan the folder you are viewing / rescan everything (refused while a scan is running; on the ToBeDeleted screen `r` is restore) |
 | `s` | Cycle sort in header order: name, size, on-disk size (the default), frees, modified. The sorted column is white with an arrow in the header |
 | `Tab` | Switch focus between the menu and the list (the menu has focus at startup: `j`/`k` choose a screen, `Enter` opens it) |
-| `1` to `7` | Open the page at that position in the menu (the number is shown beside each entry; planned pages say they are coming) |
+| `1` to `9` | Open the page at that position in the menu (the number is shown beside each entry; planned pages say they are coming) |
 | `h` / `l` (Caches & Projects) | Fold / open the group; `l` or `Enter` on a row shows it in the Explorer |
 | `m` (Caches & Projects) | Mark the selected folder and every folder that shares its data; press again to unmark them |
 | `m` (Docker) | Mark the stopped containers the selected image or volume needs removed first; press again to unmark them |

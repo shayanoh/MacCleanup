@@ -10,5 +10,6 @@ pub use command::{
     CommandResult, CommandRunner, CommandSpec, RunControl, SystemRunner, is_lock_wait,
 };
 pub mod resolve;
+pub mod runtimes;
 pub use tools::{Mode, ToolEntry, discover_tools};
 pub mod split;

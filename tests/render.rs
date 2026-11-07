@@ -1774,7 +1774,8 @@ fn the_menu_shows_each_pages_number_and_planned_pages_keep_theirs() {
         (5, "Caches & Projects"),
         (6, "Docker"),
         (7, "Time Machine"),
-        (8, "ToBeDeleted"),
+        (8, "Runtimes"),
+        (9, "ToBeDeleted"),
     ] {
         let line = text
             .lines()

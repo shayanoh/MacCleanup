@@ -153,7 +153,7 @@ const FIXED: &[Fixed] = &[
 
 /// Pin a command to one install: absolute program, run in the home folder,
 /// no corepack downloads or prompts, matching Node first on `PATH`.
-fn pinned(home: &Path, exe: &Path, args: &[&str]) -> CommandSpec {
+pub(crate) fn pinned(home: &Path, exe: &Path, args: &[&str]) -> CommandSpec {
     let mut spec = CommandSpec::new(&exe.to_string_lossy(), args)
         .with_cwd(home)
         .with_env("COREPACK_ENABLE_NETWORK", "0")
