@@ -292,7 +292,7 @@ mod tests {
             mk(hl.join(f).parent().unwrap());
             fs::write(hl.join(f), b"x").unwrap();
         }
-        let n = labels(&parts_of(&a, &[a.clone()], &e.home, &e.lib));
+        let n = labels(&parts_of(&a, std::slice::from_ref(&a), &e.home, &e.lib));
         for want in [
             "Foo.app",
             "com.foo.app",
@@ -322,7 +322,7 @@ mod tests {
         mk(&gc.join("ABCDEFGHIJ.group.com.foo.app"));
         mk(&gc.join("UBF8T346G9.com.other"));
         let a = app(&e.home.join("Applications/Foo.app"), "com.foo.app", "Foo");
-        let parts = parts_of(&a, &[a.clone()], &e.home, &e.lib);
+        let parts = parts_of(&a, std::slice::from_ref(&a), &e.home, &e.lib);
         let got = labels(&parts);
         assert!(got.contains(&"UBF8T346G9.com.foo.app".to_string()));
         assert!(got.contains(&"ABCDEFGHIJ.group.com.foo.app".to_string()));
@@ -350,7 +350,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let parts = parts_of(&a, &[a.clone()], &e.home, &e.lib);
+        let parts = parts_of(&a, std::slice::from_ref(&a), &e.home, &e.lib);
         assert!(
             parts
                 .iter()
@@ -375,7 +375,7 @@ mod tests {
             "com.autodesk.maya",
             "Maya",
         );
-        let alone = parts_of(&a, &[a.clone()], &e.home, &e.lib);
+        let alone = parts_of(&a, std::slice::from_ref(&a), &e.home, &e.lib);
         let v = alone.iter().find(|p| p.label == "Vendor folder").unwrap();
         assert!(!v.shared_vendor);
         let both = parts_of(&a, &[a.clone(), other], &e.home, &e.lib);
@@ -398,7 +398,7 @@ mod tests {
         ] {
             let a = app(&e.home.join(format!("Applications/{n}.app")), id, n);
             assert!(
-                !parts_of(&a, &[a.clone()], &e.home, &e.lib)
+                !parts_of(&a, std::slice::from_ref(&a), &e.home, &e.lib)
                     .iter()
                     .any(|p| p.label == "Vendor folder")
             );
@@ -435,7 +435,7 @@ mod tests {
         mk(&e.lib.join("LaunchDaemons"));
         fs::write(e.lib.join("LaunchDaemons/com.foo.app.helper.plist"), b"x").unwrap();
         let a = app(&e.home.join("Applications/Foo.app"), "com.foo.app", "Foo");
-        let parts = parts_of(&a, &[a.clone()], &e.home, &e.lib);
+        let parts = parts_of(&a, std::slice::from_ref(&a), &e.home, &e.lib);
         let p = parts.iter().find(|p| p.label == "LaunchDaemons").unwrap();
         assert!(p.outside_home);
     }
