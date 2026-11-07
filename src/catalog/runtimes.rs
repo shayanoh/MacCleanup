@@ -273,9 +273,6 @@ pub fn pins_for(version: &str, projects: &[PathBuf]) -> Vec<PathBuf> {
 pub struct RuntimeEntry {
     pub section: SectionKind,
     pub entry: ToolEntry,
-    /// Taken by a bulk mark of its section (an old, unpinned, non-default
-    /// install); everything else is marked row by row.
-    pub bulk: bool,
     /// Shown in the review next to its command: what removing it may disturb.
     pub warn: Option<String>,
     /// Why it cannot be marked right now (a running simulator).
@@ -436,7 +433,6 @@ pub(crate) fn discover_runtimes_in(
         let group = format!("Node ({})", i.manager.name());
         out.push(RuntimeEntry {
             section: SectionKind::NodeVersions,
-            bulk: old && !i.is_default && !in_shell && pins.is_empty(),
             warn: (!warns.is_empty()).then(|| warns.join("; ")),
             refuse: None,
             entry: ToolEntry {
@@ -462,7 +458,6 @@ pub(crate) fn discover_runtimes_in(
             };
             out.push(RuntimeEntry {
                 section: SectionKind::NodeGlobals,
-                bulk: false,
                 warn: None,
                 refuse: None,
                 entry: ToolEntry {
@@ -529,7 +524,6 @@ struct Item<'a> {
 fn push(out: &mut Vec<RuntimeEntry>, i: Item) {
     out.push(RuntimeEntry {
         section: i.section,
-        bulk: false,
         warn: None,
         refuse: None,
         entry: ToolEntry {
@@ -801,7 +795,6 @@ pub fn discover_simulators(home: &Path, runner: &dyn CommandRunner) -> Vec<Runti
             let usable = d.get("isAvailable").and_then(|v| v.as_bool()) != Some(false);
             out.push(RuntimeEntry {
                 section: SectionKind::Simulators,
-                bulk: false,
                 warn: None,
                 refuse: booted.then(|| {
                     format!("{name} is running: shut it down first (xcrun simctl shutdown {udid})")
@@ -981,7 +974,6 @@ pub(crate) fn pnpm_globals(
                 let first = names[0].clone();
                 out.push(RuntimeEntry {
                     section: SectionKind::PnpmGlobals,
-                    bulk: false,
                     warn: None,
                     refuse: None,
                     entry: ToolEntry {
@@ -1521,8 +1513,6 @@ mod tests {
         assert!(w("v22.10.0").unwrap().contains("default Node"));
         assert!(w("v22.1.0").unwrap().contains("1 project(s) ask for it"));
         assert!(w("v20.9.0").unwrap().contains("shell this program runs in"));
-        let bulk = |v: &str| got.iter().find(|r| r.entry.label == v).unwrap().bulk;
-        assert!(!bulk("v22.10.0") && !bulk("v22.1.0") && !bulk("v20.9.0"));
         let note = got
             .iter()
             .find(|r| r.entry.label == "v22.1.0")

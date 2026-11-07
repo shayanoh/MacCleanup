@@ -1686,7 +1686,7 @@ fn a_narrowed_scan_root_and_missing_full_disk_access_are_announced() {
 }
 
 #[test]
-fn y_is_refused_while_a_marked_command_is_hidden_by_a_short_terminal() {
+fn commands_scroll_at_the_end_of_the_list_and_y_waits_until_they_were_seen() {
     use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
     let mut e = targets_screen(GlyphMode::Nerd);
     let home = e.app.policy.home().to_path_buf();
@@ -1717,24 +1717,63 @@ fn y_is_refused_while_a_marked_command_is_hidden_by_a_short_terminal() {
     }
     assert_eq!(e.app.tool_marks.len(), 8);
     open_review(&mut e.app);
-    // A short terminal cannot show eight commands.
+    // A short terminal cannot show eight commands at once: the list scrolls
+    // and says the commands are at its end.
     let text = render(&mut e.app, 100, 20);
-    assert!(text.contains("more command"), "{text}");
+    assert!(!text.contains("clean7"), "{text}");
+    assert!(text.contains("the commands are at the end"), "{text}");
+    assert!(text.contains("Scroll to the commands first"), "{text}");
+    // y does nothing until every command has been on screen.
     e.app.update(Action::Confirm);
     assert!(
         matches!(e.app.dialog, Some(Dialog::Review(_))),
         "must stay open"
     );
     assert_eq!(e.app.tool_marks.len(), 8, "nothing ran");
-    // A tall terminal shows them all and the key works again.
-    let text = render(&mut e.app, 140, 60);
+    // Scrolling down shows the last command, and then y runs them.
+    e.app.update(Action::Bottom);
+    let text = render(&mut e.app, 100, 20);
     assert!(text.contains("clean7"), "{text}");
+    assert!(!text.contains("Scroll to the commands first"), "{text}");
     e.app.update(Action::Confirm);
     assert!(
         matches!(e.app.dialog, Some(Dialog::Deleting(_))),
         "{:?}",
         e.app.dialog
     );
+}
+
+#[test]
+fn when_every_command_fits_y_works_without_scrolling() {
+    use maccleanup::catalog::{CommandSpec, Mode, ToolEntry};
+    let mut e = targets_screen(GlyphMode::Nerd);
+    let home = e.app.policy.home().to_path_buf();
+    let rel = "Library/Caches/Cmd0";
+    fs::create_dir_all(home.join(rel)).unwrap();
+    fs::write(home.join(rel).join("f"), vec![b'x'; 1000]).unwrap();
+    e.app.tool_entries = vec![ToolEntry {
+        id: "cmd0".to_string(),
+        tool: "Tool".to_string(),
+        label: "Cmd0".to_string(),
+        path: home.join(rel),
+        regen: "again".to_string(),
+        mode: Mode::Command(CommandSpec::new("/opt/x/bin/tool", &["clean0"])),
+        note: None,
+    }];
+    e.app.update(Action::RescanAll);
+    wait_tools(&mut e.app);
+    e.app.rebuild_targets();
+    e.app.settle_targets();
+    cursor_on_row(&mut e.app, "Cmd0");
+    e.app.update(Action::ToggleMark);
+    open_review(&mut e.app);
+    let text = render(&mut e.app, 140, 60);
+    assert!(
+        text.contains("clean0") && !text.contains("scroll down"),
+        "{text}"
+    );
+    e.app.update(Action::Confirm);
+    assert!(matches!(e.app.dialog, Some(Dialog::Deleting(_))));
 }
 
 #[test]

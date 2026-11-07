@@ -214,13 +214,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.graph_hits.clear();
     app.graph_tips.clear();
     app.layout.review_rows = match &app.dialog {
-        Some(crate::app::Dialog::Review(r)) => dialogs::review_layout(area, r).shown_items.max(1),
+        Some(crate::app::Dialog::Review(r)) => dialogs::review_layout(area, r).body_rows,
         _ => 0,
     };
-    app.layout.review_clipped = matches!(
-        &app.dialog,
-        Some(crate::app::Dialog::Review(r)) if dialogs::review_layout(area, r).clipped
-    );
 
     sidebar::render(frame, side, app);
     match app.screen {

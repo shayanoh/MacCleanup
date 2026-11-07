@@ -28,7 +28,15 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     match &app.dialog {
         None => {}
         Some(Dialog::QuitWarning(w)) => quit_warning(frame, area, g, w, scale),
-        Some(Dialog::Review(r)) => review(frame, area, g, r, app.review_scroll, scale),
+        Some(Dialog::Review(r)) => review(
+            frame,
+            area,
+            g,
+            r,
+            app.review_scroll,
+            app.review_seen_end,
+            scale,
+        ),
         Some(Dialog::Irreversible(r)) => irreversible(frame, area, g, r, scale),
         Some(Dialog::ConfirmForever(t)) => confirm_forever(frame, area, g, t, scale),
         Some(Dialog::Deleting(p)) => deleting(frame, area, app, p, scale),
@@ -158,68 +166,37 @@ fn quit_warning(frame: &mut Frame, area: Rect, g: &Glyphs, w: &QuitWarning, scal
 /// Lines of the review that are neither folders nor commands.
 const REVIEW_FIXED: usize = 12;
 
-/// How the review fits a terminal: the commands come first, because every
-/// command that will run must be visible. Folders give way before commands
-/// do; commands drop their "via" line before they are cut; and when even
-/// that is not enough the review says so (and `y` is refused).
+/// How the review fits a terminal: the folders and then the commands are one
+/// list that scrolls, so nothing is ever cut; the lines around it stay put.
 #[derive(Clone, Copy, Debug)]
 pub struct ReviewLayout {
     pub width: u16,
     pub height: u16,
-    /// Commands take one line each (the "via <program>" line is dropped).
-    pub compact: bool,
-    pub shown_items: usize,
-    pub shown_commands: usize,
-    /// Some command cannot be shown at this size.
-    pub clipped: bool,
+    /// How many lines of the list are visible at once.
+    pub body_rows: usize,
 }
 
 pub fn review_layout(area: Rect, r: &Review) -> ReviewLayout {
     let width = area.width.saturating_sub(4).min(96);
-    let n = r.commands.len();
-    // A forceable command gets one more line saying what `f` does.
-    let forceable = r.commands.iter().filter(|c| c.can_force).count();
-    // A command with a warning gets one more line saying what it may disturb.
-    let warned = r.commands.iter().filter(|c| c.warn.is_some()).count();
-    let full = if n == 0 {
-        0
-    } else {
-        n * 2 + 2 + forceable + warned
-    };
-    let compact_lines = if n == 0 { 0 } else { n + 2 };
     let max_h = area.height.saturating_sub(2) as usize;
-    let height = (r.items.len() + full + 14).min(max_h).max(13);
-    let inner = height.min(max_h).saturating_sub(2);
-    let (compact, cmd_lines, clipped) = if REVIEW_FIXED + full <= inner {
-        (false, full, false)
-    } else if REVIEW_FIXED + compact_lines <= inner {
-        (true, compact_lines, false)
-    } else {
-        (true, compact_lines, n > 0)
-    };
-    let shown_commands = if clipped {
-        inner.saturating_sub(REVIEW_FIXED + 3)
-    } else {
-        n
-    };
-    let used = if clipped {
-        shown_commands + 3
-    } else {
-        cmd_lines
-    };
-    let room = inner.saturating_sub(REVIEW_FIXED + used);
-    let shown_items = r.items.len().min(if n == 0 { room.max(1) } else { room });
+    let height = (r.body_len() + REVIEW_FIXED + 2).min(max_h).max(13);
+    let inner = height.saturating_sub(2);
     ReviewLayout {
         width,
         height: height as u16,
-        compact,
-        shown_items,
-        shown_commands,
-        clipped,
+        body_rows: inner.saturating_sub(REVIEW_FIXED).max(1),
     }
 }
 
-fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, scale: f64) {
+fn review(
+    frame: &mut Frame,
+    area: Rect,
+    g: &Glyphs,
+    r: &Review,
+    scroll: usize,
+    seen_end: bool,
+    scale: f64,
+) {
     let lay = review_layout(area, r);
     let (width, height) = (lay.width, lay.height);
     let Some(inner) = popup(
@@ -249,11 +226,10 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
         ),
         Style::default().fg(DIM),
     )));
-    let shown = lay.shown_items;
-    // The list is a window onto the items; it never starts past the last full page.
-    let start = scroll.min(r.items.len().saturating_sub(shown));
-    for item in r.items.iter().skip(start).take(shown) {
-        lines.push(Line::from(vec![
+    // The list: every folder, then the commands. One list, so it scrolls as one.
+    let mut body: Vec<Line> = Vec::new();
+    for item in &r.items {
+        body.push(Line::from(vec![
             Span::styled(
                 format!("{} ", safety_dot(g, item.safety)),
                 Style::default().fg(safety_color(item.safety)),
@@ -270,41 +246,20 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
             ),
         ]));
     }
-    if r.items.len() > shown {
-        lines.push(Line::from(Span::styled(
-            fit(
-                &format!(
-                    "{}-{} of {}   j/k, arrows, PgUp/PgDn, Ctrl-F/B or the wheel scroll",
-                    start + 1,
-                    (start + shown).min(r.items.len()),
-                    r.items.len()
-                ),
-                inner.width as usize,
-                g,
-            ),
-            Style::default().fg(DIM),
-        )));
-    }
     if !r.commands.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
+        body.push(Line::raw(""));
+        body.push(Line::from(Span::styled(
             format!(
                 "{} Tool cleanup commands (run after the moves, cannot be undone)",
                 g.warn()
             ),
             Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
         )));
-        for c in r.commands.iter().take(lay.shown_commands) {
+        for c in &r.commands {
             // The whole command: what it will do must be readable before it
             // is confirmed. Which tool, how much and where from go below.
-            // In the short layout a warning shows as a marker instead of a line.
-            let marker = if c.warn.is_some() && lay.compact {
-                Span::styled(format!("  {} ", g.warn()), Style::default().fg(CAUTION))
-            } else {
-                Span::styled(format!("  {} ", g.dot()), Style::default().fg(DANGER))
-            };
-            lines.push(Line::from(vec![
-                marker,
+            body.push(Line::from(vec![
+                Span::styled(format!("  {} ", g.dot()), Style::default().fg(DANGER)),
                 Span::styled(
                     fit(&c.line, (inner.width as usize).saturating_sub(4), g),
                     // A forced command is drawn in red: it skips a safety check.
@@ -315,55 +270,86 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
                     },
                 ),
             ]));
-            if !lay.compact {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "    {}  up to {}  via {}",
-                        c.tool,
-                        human_size(c.up_to),
-                        fit_start(
-                            &c.spec.program,
-                            (inner.width as usize).saturating_sub(40),
-                            g
-                        )
+            body.push(Line::from(Span::styled(
+                format!(
+                    "    {}  up to {}  via {}",
+                    c.tool,
+                    human_size(c.up_to),
+                    fit_start(
+                        &c.spec.program,
+                        (inner.width as usize).saturating_sub(40),
+                        g
+                    )
+                ),
+                Style::default().fg(DIM),
+            )));
+            if let Some(w) = &c.warn {
+                body.push(Line::from(Span::styled(
+                    fit(
+                        &format!("    {} {w}", g.warn()),
+                        (inner.width as usize).saturating_sub(2),
+                        g,
                     ),
-                    Style::default().fg(DIM),
+                    Style::default().fg(CAUTION),
                 )));
-                if let Some(w) = &c.warn {
-                    lines.push(Line::from(Span::styled(
-                        fit(
-                            &format!("    {} {w}", g.warn()),
-                            (inner.width as usize).saturating_sub(2),
-                            g,
-                        ),
-                        Style::default().fg(CAUTION),
-                    )));
-                }
-                if c.can_force {
-                    lines.push(Line::from(if c.force {
-                        Span::styled(
-                            "    FORCED: skips the in-use check; a process using it now may be disturbed",
-                            Style::default().fg(DANGER),
-                        )
-                    } else {
-                        Span::styled(
-                            "    waits up to 5 minutes if another process uses it; f forces it",
-                            Style::default().fg(DIM),
-                        )
-                    }));
-                }
+            }
+            if c.can_force {
+                body.push(Line::from(if c.force {
+                    Span::styled(
+                        "    FORCED: skips the in-use check; a process using it now may be disturbed",
+                        Style::default().fg(DANGER),
+                    )
+                } else {
+                    Span::styled(
+                        "    waits up to 5 minutes if another process uses it; f forces it",
+                        Style::default().fg(DIM),
+                    )
+                }));
             }
         }
-        if lay.clipped {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{} and {} more command(s): make the terminal taller to see them (y is off)",
-                    g.ellipsis(),
-                    r.commands.len() - lay.shown_commands
-                ),
-                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
-            )));
-        }
+    }
+    debug_assert_eq!(
+        body.len(),
+        r.body_len(),
+        "Review::body_len and the lines agree"
+    );
+    // The list is a window onto the lines; it never starts past the last full page.
+    let rows = lay.body_rows;
+    let start = scroll.min(body.len().saturating_sub(rows));
+    let scrollable = body.len() > rows;
+    lines.extend(body.into_iter().skip(start).take(rows));
+    if scrollable {
+        let end = (start + rows).min(r.body_len());
+        let hint = if r.commands.is_empty() {
+            format!(
+                "{}-{} of {}   j/k, arrows, PgUp/PgDn, Ctrl-F/B or the wheel scroll",
+                start + 1,
+                end,
+                r.body_len()
+            )
+        } else if seen_end {
+            format!(
+                "lines {}-{} of {}   j/k, PgUp/PgDn, Home/End or the wheel scroll",
+                start + 1,
+                end,
+                r.body_len()
+            )
+        } else {
+            format!(
+                "lines {}-{} of {}   the commands are at the end: scroll down (j, PgDn, End)",
+                start + 1,
+                end,
+                r.body_len()
+            )
+        };
+        lines.push(Line::from(Span::styled(
+            fit(&hint, inner.width as usize, g),
+            if r.commands.is_empty() || seen_end {
+                Style::default().fg(DIM)
+            } else {
+                Style::default().fg(CAUTION)
+            },
+        )));
     }
     lines.push(Line::raw(""));
     if r.items.is_empty() {
@@ -442,8 +428,12 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
             g,
             &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],
         ));
-    } else if lay.clipped {
-        lines.push(key_line(g, &[("Esc", "Cancel")]));
+    } else if scrollable && !seen_end {
+        // y stays off until every command has been scrolled into view.
+        lines.push(key_line(
+            g,
+            &[("End", "Scroll to the commands first"), ("Esc", "Cancel")],
+        ));
     } else {
         // Commands cannot be undone, so Enter does nothing here.
         let run = if r.items.is_empty() {
@@ -968,31 +958,33 @@ mod review_layout_tests {
     }
 
     #[test]
-    fn plenty_of_room_shows_everything_in_full() {
-        let l = review_layout(Rect::new(0, 0, 140, 50), &review(3, 2));
-        assert!(!l.clipped && !l.compact);
-        assert_eq!((l.shown_items, l.shown_commands), (3, 2));
+    fn plenty_of_room_shows_the_whole_list() {
+        let r = review(3, 2);
+        let l = review_layout(Rect::new(0, 0, 140, 50), &r);
+        assert!(l.body_rows >= r.body_len(), "{l:?}");
+        assert_eq!(r.body_len(), 3 + 2 + 2 * 2);
     }
 
     #[test]
-    fn many_commands_on_a_short_terminal_drop_the_via_lines_first() {
-        let l = review_layout(Rect::new(0, 0, 140, 30), &review(2, 10));
-        assert!(l.compact, "{l:?}");
-        assert!(!l.clipped, "{l:?}");
-        assert_eq!(l.shown_commands, 10);
+    fn many_commands_on_a_short_terminal_scroll_instead_of_being_cut() {
+        let r = review(2, 10);
+        let l = review_layout(Rect::new(0, 0, 140, 20), &r);
+        assert!(l.body_rows >= 1 && l.body_rows < r.body_len(), "{l:?}");
+        assert!(usize::from(l.height) <= 18);
     }
 
     #[test]
-    fn when_the_commands_cannot_fit_the_review_says_so() {
-        let l = review_layout(Rect::new(0, 0, 140, 20), &review(2, 10));
-        assert!(l.clipped, "{l:?}");
-        assert!(l.shown_commands < 10);
+    fn warnings_and_force_hints_add_lines_to_the_list() {
+        let mut r = review(0, 2);
+        let plain = r.body_len();
+        r.commands[0].warn = Some("careful".to_string());
+        r.commands[1].can_force = true;
+        assert_eq!(r.body_len(), plain + 2);
     }
 
     #[test]
-    fn folders_alone_never_count_as_clipped() {
+    fn folders_alone_scroll_too() {
         let l = review_layout(Rect::new(0, 0, 140, 16), &review(200, 0));
-        assert!(!l.clipped);
-        assert!(l.shown_items >= 1);
+        assert!(l.body_rows >= 1);
     }
 }

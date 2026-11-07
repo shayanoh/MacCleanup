@@ -97,9 +97,6 @@ pub struct TRow {
     /// A final product (a built program) that bulk marks leave alone: it is
     /// deleted only when the user marks that row itself.
     pub kept: bool,
-    /// A command row that a bulk mark of its group or section takes (an old
-    /// Node version nothing asks for); every other command row is marked alone.
-    pub bulk: bool,
 }
 
 impl TRow {
@@ -191,7 +188,6 @@ struct Cand {
     kind: RowKind,
     regen: String,
     note: Option<String>,
-    bulk: bool,
 }
 
 fn project_kind(k: ArtifactKind) -> &'static str {
@@ -255,7 +251,6 @@ fn expand_split(c: Cand) -> Vec<Cand> {
             member: c.member,
             kind: RowKind::Folder,
             note: c.note.clone(),
-            bulk: false,
         })
         .collect()
 }
@@ -357,7 +352,6 @@ impl Targets {
                 },
                 regen: e.regen.clone(),
                 note: e.note.clone(),
-                bulk: false,
             });
         }
         work.stage(1, 3, "finding project folders");
@@ -388,7 +382,6 @@ impl Targets {
                 kind: RowKind::Folder,
                 regen: c.kind.regen().to_string(),
                 note: None,
-                bulk: false,
             });
         }
         // Installed runtimes and their packages (the Packages & runtimes page).
@@ -436,7 +429,6 @@ impl Targets {
                     },
                 },
                 regen: e.regen,
-                bulk: r.bulk && left_behind.is_none(),
                 note: match left_behind {
                     Some(cmd) => Some(format!(
                         "left behind by `{cmd}`: this row now moves the folder to ToBeDeleted"
@@ -523,7 +515,6 @@ impl Targets {
                 regen: c.regen,
                 note: c.note,
                 kept: c.kept,
-                bulk: c.bulk,
             };
             match groups
                 .iter_mut()

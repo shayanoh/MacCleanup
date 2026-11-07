@@ -78,9 +78,10 @@ so nothing runs twice.
   Matching is by major (and exact version when given); a range it cannot read
   is shown as "maybe". The details pane lists the projects. It is a note, not a
   block: the user said a pinned version may still be deleted (fnm reinstalls it).
-- **Bulk marking** **(my call)**: marking a section or group takes only Node
-  versions that are old, not default and not pinned. Everything else (commands
-  that remove an install) is marked row by row, like command rows in Caches.
+- **Bulk marking** **[User, changed after the first build]**: marking a section or
+  group header marks every markable row beneath it (an iOS version selects its
+  simulators) and again unmarks them; running simulators and packages of a
+  marked Node version are skipped.
 
 ## Leftovers
 

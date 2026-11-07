@@ -133,9 +133,8 @@ pub struct UiLayout {
     pub list_top: u16,
     /// How many list rows are visible.
     pub list_rows: u16,
-    /// The review dialog cannot show every tool command at this terminal size.
-    pub review_clipped: bool,
-    /// How many items of the review list fit at this terminal size.
+    /// How many lines of the review list (folders, then commands) fit at this
+    /// terminal size.
     pub review_rows: usize,
 }
 
@@ -291,6 +290,24 @@ pub struct Review {
     /// Things that stop it from running (Docker would refuse part of it);
     /// while there are any, confirming only explains them.
     pub problems: Vec<String>,
+}
+
+impl Review {
+    /// Lines of the review's scrolling list: one per folder, then the
+    /// commands block (a blank line, a heading, and per command its line, its
+    /// "via" line, and one more each for a warning and for a force hint).
+    pub fn body_len(&self) -> usize {
+        let commands = if self.commands.is_empty() {
+            0
+        } else {
+            2 + self
+                .commands
+                .iter()
+                .map(|c| 2 + usize::from(c.warn.is_some()) + usize::from(c.can_force))
+                .sum::<usize>()
+        };
+        self.items.len() + commands
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -484,6 +501,9 @@ pub struct App {
     pub layout: UiLayout,
     /// First item of the review list that is shown (the list scrolls).
     pub review_scroll: usize,
+    /// The review list has been scrolled to its end since it opened, so every
+    /// command has been on screen (`y` is off until then when it scrolls).
+    pub review_seen_end: bool,
     /// Where a click on the graph lands, written by the UI every frame.
     pub graph_hits: Vec<(Rect, (usize, usize))>,
     /// What every box or bar of the graph is, written by the UI every frame.
@@ -660,6 +680,7 @@ impl App {
             hover: None,
             hover_since: 0,
             review_scroll: 0,
+            review_seen_end: false,
             animations,
             glyphs,
             transition_start: 0,
@@ -1011,6 +1032,7 @@ impl App {
                 {
                     let commands = f.retry.clone();
                     self.review_scroll = 0;
+                    self.review_seen_end = false;
                     self.dialog = Some(Dialog::Review(Review {
                         items: Vec::new(),
                         commands,
@@ -1195,7 +1217,7 @@ impl App {
             return;
         };
         let visible = self.layout.review_rows.max(1);
-        let max = r.items.len().saturating_sub(visible);
+        let max = r.body_len().saturating_sub(visible);
         let now = self.review_scroll.min(max) as i64;
         let next = match action {
             Action::Up => now - 1,
@@ -1208,6 +1230,9 @@ impl App {
             _ => now,
         };
         self.review_scroll = next.clamp(0, max as i64) as usize;
+        if self.review_scroll >= max {
+            self.review_seen_end = true;
+        }
     }
 
     /// What the running tool command is doing, for the Working dialog.
@@ -1317,10 +1342,16 @@ impl App {
                 self.dialog = Some(Dialog::Review(r));
             }
             Some(Dialog::Review(r)) => {
-                if !r.commands.is_empty() && self.layout.review_clipped {
-                    // Never run a command the review could not show.
+                let rows = self.layout.review_rows;
+                if !r.commands.is_empty()
+                    && rows > 0
+                    && r.body_len() > rows
+                    && !self.review_seen_end
+                {
+                    // Never run a command that was not on screen: they are at
+                    // the end of the list.
                     self.notice = Some(
-                        "Some commands do not fit on screen. Make the terminal taller, or Esc."
+                        "Scroll to the end of the list first: the commands are there (End)."
                             .to_string(),
                     );
                     self.dialog = Some(Dialog::Review(r));
@@ -1663,23 +1694,41 @@ impl App {
         self.tool_marks.contains(&key).then_some(key)
     }
 
-    /// Bulk-mark the command rows of the chosen groups that are flagged for
-    /// it (old Node versions nothing asks for); again unmarks them.
+    /// On the Runtimes page a group or section header marks every command row
+    /// beneath it that can be marked (an iOS version selects all its
+    /// simulators); again unmarks them. Left out: rows that refuse (a running
+    /// simulator), rows under a marked folder, and packages of a marked Node
+    /// version (they go with it). Caches & Projects never marks commands in
+    /// bulk: there each command is a cleanup the user picks on purpose.
     fn mark_bulk_commands(&mut self, keep: impl Fn(usize, &crate::targets::Group) -> bool) {
-        let ids: Vec<String> = self
+        if self.page() != crate::targets::Page::Runtimes {
+            return;
+        }
+        let (mut ids, mut refused) = (Vec::new(), 0);
+        for (_, g) in self
             .targets
             .groups
             .iter()
             .enumerate()
             .filter(|(i, g)| keep(*i, g))
-            .flat_map(|(_, g)| g.rows.iter())
-            .filter(|r| r.bulk)
-            .filter_map(|r| match &r.kind {
-                crate::targets::RowKind::Command { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
+        {
+            for r in &g.rows {
+                let crate::targets::RowKind::Command { id, notes, .. } = &r.kind else {
+                    continue;
+                };
+                if notes.refuse.is_some() {
+                    refused += 1;
+                } else if !matches!(self.mark_state(&r.row.path), MarkState::Covered(_))
+                    && self.version_covering(id).is_none()
+                {
+                    ids.push(id.clone());
+                }
+            }
+        }
         if ids.is_empty() {
+            if refused > 0 {
+                self.notice = Some(format!("{refused} item(s) here cannot be marked right now"));
+            }
             return;
         }
         if ids.iter().all(|id| self.tool_marks.contains(id)) {
@@ -1996,6 +2045,7 @@ impl App {
         }
         let commands = self.review_commands();
         self.review_scroll = 0;
+        self.review_seen_end = false;
         if self.marks.is_empty() && commands.is_empty() {
             self.notice = Some("Nothing marked yet. Press space to mark items.".to_string());
             return;
@@ -6037,17 +6087,34 @@ mod runtime_page_tests {
     }
 
     #[test]
-    fn marking_the_section_takes_only_old_versions_never_the_default() {
+    fn marking_a_header_marks_everything_beneath_it_and_again_unmarks() {
         let mut e = fnm_env();
         open(&mut e);
         cursor_on(&mut e.app, Some(SectionKind::NodeVersions), None);
         e.app.update(Action::ToggleMark);
         assert_eq!(
             e.app.tool_marks.iter().cloned().collect::<Vec<_>>(),
-            ["node:fnm:v20.9.0"]
+            ["node:fnm:v20.9.0", "node:fnm:v22.10.0"],
+            "the default too: the review warns about it"
         );
+        // Their packages go with them, so the packages section has nothing left to mark.
+        cursor_on(&mut e.app, Some(SectionKind::NodeGlobals), None);
+        e.app.update(Action::ToggleMark);
+        assert_eq!(e.app.tool_marks.len(), 2);
+        cursor_on(&mut e.app, Some(SectionKind::NodeVersions), None);
         e.app.update(Action::ToggleMark);
         assert!(e.app.tool_marks.is_empty(), "again unmarks");
+        // With no version marked the packages section marks its own rows.
+        cursor_on(&mut e.app, Some(SectionKind::NodeGlobals), None);
+        e.app.update(Action::ToggleMark);
+        assert_eq!(e.app.tool_marks.len(), 2, "{:?}", e.app.tool_marks);
+        // Marking a version afterwards drops the packages it takes with it.
+        cursor_on(&mut e.app, None, Some("v20.9.0"));
+        e.app.update(Action::ToggleMark);
+        assert_eq!(
+            e.app.tool_marks.iter().cloned().collect::<Vec<_>>(),
+            ["node-global:fnm:v22.10.0:@x/tool", "node:fnm:v20.9.0"]
+        );
     }
 
     #[test]
@@ -6171,7 +6238,6 @@ mod runtime_page_tests {
         e.app.tools_started = true; // no discovery thread: we set the rows
         e.app.runtime_extra = vec![RuntimeEntry {
             section: SectionKind::Simulators,
-            bulk: false,
             warn: None,
             refuse: Some("iPhone is running: shut it down first".to_string()),
             entry: ToolEntry {
@@ -6212,5 +6278,79 @@ mod runtime_page_tests {
         };
         let w = r.commands[0].warn.clone().unwrap();
         assert!(w.contains("default Node"), "{w}");
+    }
+
+    fn sim(
+        udid: &str,
+        name: &str,
+        group: &str,
+        home: &Path,
+        running: bool,
+    ) -> crate::catalog::runtimes::RuntimeEntry {
+        use crate::catalog::runtimes::RuntimeEntry;
+        use crate::catalog::{CommandSpec, Mode, ToolEntry};
+        RuntimeEntry {
+            section: SectionKind::Simulators,
+            warn: None,
+            refuse: running.then(|| format!("{name} is running: shut it down first")),
+            entry: ToolEntry {
+                id: format!("sim:{udid}"),
+                tool: group.to_string(),
+                label: name.to_string(),
+                path: home.join(format!("Library/Developer/CoreSimulator/Devices/{udid}")),
+                regen: String::new(),
+                mode: Mode::Command(CommandSpec::new(
+                    "/usr/bin/xcrun",
+                    &["simctl", "delete", udid],
+                )),
+                note: None,
+            },
+        }
+    }
+
+    #[test]
+    fn marking_an_ios_version_marks_every_simulator_below_it_except_a_running_one() {
+        let ids = [
+            "11111111-2222-3333-4444-555555555551",
+            "11111111-2222-3333-4444-555555555552",
+            "11111111-2222-3333-4444-555555555553",
+            "11111111-2222-3333-4444-555555555554",
+        ];
+        let files: Vec<String> = ids
+            .iter()
+            .map(|u| format!("Library/Developer/CoreSimulator/Devices/{u}/data/x.bin"))
+            .collect();
+        let refs: Vec<(&str, usize)> = files.iter().map(|f| (f.as_str(), 3000)).collect();
+        let mut e = env_with(&refs, |_| {});
+        let h = e.home.clone();
+        e.app.tools_started = true; // no discovery thread: we set the rows
+        e.app.runtime_extra = vec![
+            sim(ids[0], "iPhone 15", "iOS 17.2", &h, false),
+            sim(ids[1], "iPhone 15 Pro", "iOS 17.2", &h, false),
+            sim(ids[2], "iPad", "iOS 17.2", &h, true),
+            sim(ids[3], "iPhone SE", "iOS 16.0", &h, false),
+        ];
+        open(&mut e);
+        e.app.tcursor = e
+            .app
+            .tlines
+            .iter()
+            .position(
+                |l| matches!(*l, Line::Group(g) if e.app.targets.groups[g].title == "iOS 17.2"),
+            )
+            .expect("group header");
+        e.app.update(Action::ToggleMark);
+        let marked: Vec<String> = e.app.tool_marks.iter().cloned().collect();
+        assert_eq!(
+            marked,
+            [format!("sim:{}", ids[0]), format!("sim:{}", ids[1])],
+            "the running one and the other version stay unmarked"
+        );
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.tool_marks.is_empty(), "again unmarks them");
+        // The section header marks every version at once.
+        cursor_on(&mut e.app, Some(SectionKind::Simulators), None);
+        e.app.update(Action::ToggleMark);
+        assert_eq!(e.app.tool_marks.len(), 3);
     }
 }
