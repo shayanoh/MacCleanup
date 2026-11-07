@@ -19,6 +19,9 @@ pub enum Safety {
 pub struct Policy {
     home: PathBuf,
     holding: PathBuf,
+    /// Extra folders whose children count as app locations (tests only: the
+    /// real ones are `/Applications` and `/Library`, which tests cannot use).
+    extra_roots: Vec<PathBuf>,
 }
 
 const PROTECTED_TOP_LEVEL: &[&str] = &[
@@ -166,7 +169,15 @@ impl Policy {
         Policy {
             home: canonicalize_lenient(home),
             holding: canonicalize_lenient(holding),
+            extra_roots: Vec::new(),
         }
+    }
+
+    /// Treat the children of `root` as app locations outside home (tests).
+    #[cfg(test)]
+    pub fn with_extra_root(mut self, root: &Path) -> Policy {
+        self.extra_roots.push(canonicalize_lenient(root));
+        self
     }
 
     /// The home folder this policy protects around.
@@ -184,6 +195,13 @@ impl Policy {
             return Safety::Protected;
         }
         let Ok(rel) = path.strip_prefix(&self.home) else {
+            if self
+                .extra_roots
+                .iter()
+                .any(|r| path.starts_with(r) && path != r.as_path())
+            {
+                return Safety::Caution;
+            }
             // Outside home only the Uninstall/Leftovers locations are offered.
             return crate::catalog::apppolicy::app_location(path).unwrap_or(Safety::Protected);
         };

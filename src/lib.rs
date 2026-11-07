@@ -5,6 +5,7 @@ pub mod bg;
 pub mod catalog;
 pub mod cli;
 pub mod docker;
+pub mod elevate;
 pub mod filter;
 pub mod fmt;
 pub mod glyphs;

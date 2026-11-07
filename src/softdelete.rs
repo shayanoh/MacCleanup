@@ -45,6 +45,15 @@ mod path_bytes {
     }
 }
 
+/// A holding slot that is booked (manifest entry written) but not yet filled.
+#[derive(Clone, Debug)]
+pub struct Reserved {
+    pub item: HeldItem,
+    /// Where the moved item must end up.
+    pub payload: PathBuf,
+    item_dir: PathBuf,
+}
+
 /// One soft-deleted item. The payload lives at `<dir>/items/<id>/payload`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldItem {
@@ -198,6 +207,24 @@ impl Holding {
         path: &Path,
         usage: Usage,
     ) -> Result<HeldItem, HoldError> {
+        let reserved = self.reserve(policy, path, usage)?;
+        if let Err(e) = fs::rename(path, &reserved.payload) {
+            self.unreserve(&reserved);
+            return Err(map_rename_error(e, path));
+        }
+        Ok(reserved.item)
+    }
+
+    /// Everything `move_in` does before the rename: the checks, the item
+    /// folder and the manifest entry. The caller then moves `path` to
+    /// `payload` (by itself or through an elevated command) and, if that
+    /// fails, calls [`unreserve`](Self::unreserve).
+    pub fn reserve(
+        &self,
+        policy: &Policy,
+        path: &Path,
+        usage: Usage,
+    ) -> Result<Reserved, HoldError> {
         if policy.classify_real(path) == Safety::Protected {
             return Err(HoldError::Protected(path.to_path_buf()));
         }
@@ -247,16 +274,21 @@ impl Holding {
                 return Err(HoldError::Io(e));
             }
         }
-        if let Err(e) = fs::rename(path, item_dir.join("payload")) {
-            let _g = self.guard();
-            if let Ok(mut items) = self.read_manifest() {
-                items.retain(|i| i.id != item.id);
-                let _ = self.write_manifest(&items);
-            }
-            let _ = fs::remove_dir(&item_dir);
-            return Err(map_rename_error(e, path));
+        Ok(Reserved {
+            payload: item_dir.join("payload"),
+            item_dir,
+            item,
+        })
+    }
+
+    /// Undo a [`reserve`](Self::reserve) whose move did not happen.
+    pub fn unreserve(&self, r: &Reserved) {
+        let _g = self.guard();
+        if let Ok(mut items) = self.read_manifest() {
+            items.retain(|i| i.id != r.item.id);
+            let _ = self.write_manifest(&items);
         }
-        Ok(item)
+        let _ = fs::remove_dir(&r.item_dir);
     }
 
     pub fn list(&self) -> io::Result<Vec<HeldItem>> {
@@ -592,6 +624,24 @@ mod tests {
         assert_eq!(again.list().unwrap()[0].original, file);
         again.restore(&item.id).unwrap();
         assert!(file.exists());
+    }
+
+    #[test]
+    fn reserve_writes_manifest_before_any_move_and_unreserve_removes_it() {
+        let s = sandbox();
+        let file = s.home.join("p/f");
+        write(&file, "data");
+        let r = s
+            .holding
+            .reserve(&s.policy, &file, Usage::new(4, 4))
+            .unwrap();
+        assert!(file.exists(), "reserve moves nothing");
+        assert_eq!(s.holding.list().unwrap().len(), 1, "entry written first");
+        assert!(r.payload.ends_with("payload"));
+        assert!(!r.payload.exists());
+        s.holding.unreserve(&r);
+        assert!(s.holding.list().unwrap().is_empty());
+        assert!(!r.payload.parent().unwrap().exists(), "slot folder removed");
     }
 
     #[test]
