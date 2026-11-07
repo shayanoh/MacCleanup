@@ -66,9 +66,18 @@ Press `6` (needs Docker Desktop). One list, drawn like Caches & Projects, of eve
 - **Running simulators** are listed but cannot be marked (shut them down first). Simulator runtimes, Go, Deno and JDKs (outside the home folder, protected in this release) and Homebrew (its own page later) are left out.
 - **Known limits:** projects are found by the scan's build folders (a project with only an `.nvmrc` and no `node_modules` is not seen); global npm packages of a Node version are listed only when that version has its own `npm`.
 
+### Uninstall and Leftovers
+
+- **Uninstall (menu entry 4):** every app in `/Applications`, `~/Applications` and their subfolders (not macOS's own), each as a group with the folders that belong to it: the app and its wrapper bundles (Fusion's "Service Utility" and "Remove ..." bundles), `Caches`, `Containers`, `Group Containers` (team id ignored), `Application Support`, preferences, saved state, `HTTPStorages`, `WebKit`, launch agents, the matching items in `/Library` (daemons, helper tools), a launcher script's real payload (Autodesk Fusion's `destfolder=` folder under `Application Support`), and the vendor folder. Columns: Name, Size, On disk, Opened (the app's last use from Spotlight, `never` when it has none; `never` sorts as the oldest). A vendor folder that other installed apps use too is shown under each of them and can be marked only when every installed app of that vendor is marked. Space on an app's header marks the app and its folders in your home folder; outside-home parts (daemons, helper tools, `/Library` folders) are marked one by one.
+- **Leftovers (menu entry 3):** folders whose name is a bundle id (or `<id>.plist`, `<id>.savedState`, ...) of an app that is not installed anywhere (scan roots, helpers nested inside apps, and everything Spotlight lists), plus launch items whose program is gone. Name-only folders (`Application Support/Some App`), Apple ids and vendors that still have an installed app are never listed (big vendors, Google/Microsoft/Adobe/Mozilla/JetBrains, are matched by full id only). If Spotlight is off the page lists nothing and says why. Every group says why it is listed.
+- **Never removable:** Apple's own apps (`com.apple.*`, Safari, Xcode, ...), anything under `/System`, and any app that is running (the terminal MacCleanup runs in is running, so it is covered). The running check is repeated when the review opens.
+- **Removing:** the usual review and soft delete. A root-owned item that a normal move is not allowed to touch is tried normally first; what fails goes into one batch behind macOS's own password prompt (`osascript ... with administrator privileges`, one prompt for all). The app never sees the password. The review marks such rows "may ask for your password" and needs `y`. If you cancel the prompt (or it cannot run), a dialog shows the exact `sudo mv` and `chown` commands against a booked ToBeDeleted slot: `c` copies them, `r` ("I ran the commands") rescans, `Esc` gives the slot back.
+- **Package-manager apps** (Homebrew casks found in a Caskroom, MacPorts apps) are removed with the manager's own command (`brew uninstall --cask`, `port uninstall`); their other folders stay ordinary moves. `port uninstall` normally needs root and may report a failure.
+- **Known limits:** `launchctl bootout` is not run (a moved daemon keeps running until the next logout or reboot); sizes outside home are plain allocated bytes (no clone accounting); Frees is not shown (the column reads `...`); the vendor's own uninstaller is never run.
+
 ## Planned
 
-Next are app leftovers and the app uninstaller, then the other candidates: the rest of the runtimes screen (see above) and a Homebrew page, simulators and runtimes, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed (their menu numbers already work and say they are coming).
+Next are the other candidates: a Homebrew page, simulators and runtimes, and large and duplicate files. The sidebar lists what is not built yet dimmed.
 
 ## Build and run
 
@@ -106,8 +115,8 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `r` / `R` | Rescan the folder you are viewing / rescan everything (refused while a scan is running; on the ToBeDeleted screen `r` is restore) |
 | `s` | Cycle sort in header order: name, size, on-disk size (the default), frees, modified. The sorted column is white with an arrow in the header |
 | `Tab` | Switch focus between the menu and the list (the menu has focus at startup: `j`/`k` choose a screen, `Enter` opens it) |
-| `1` to `9` | Open the page at that position in the menu (the number is shown beside each entry; planned pages say they are coming) |
-| `h` / `l` (Caches & Projects) | Fold / open the group; `l` or `Enter` on a row shows it in the Explorer |
+| `1` to `9` | Open the page at that position in the menu (the number is shown beside each entry; a planned page says it is coming) |
+| `h` / `l` (Caches & Projects, Runtimes, Uninstall, Leftovers) | Fold / open the group; `l` or `Enter` on a row shows it in the Explorer |
 | `m` (Caches & Projects) | Mark the selected folder and every folder that shares its data; press again to unmark them |
 | `m` (Docker) | Mark the stopped containers the selected image or volume needs removed first; press again to unmark them |
 | `b` (Docker) | Look inside the selected image or volume, read-only (`l` / `Enter` open a folder, `h` up, `Esc` back, `s` sorts, `/` filters) |
@@ -129,7 +138,7 @@ In the review dialog the list is one scrolling list: the folders first, then the
 - Build products (a built program, an APK, a bundle, a `dist` folder) are listed as separate rows marked *(kept)*; marking a project or a section never selects them. Caches that may hold offline downloads or saved media (Spotify, Telegram, model caches, sync clients...) are drawn as caution, never as safe, but you can still clear them.
 - SDKs and toolchain installs (a Flutter SDK, Node or Rust installs, editor extensions, app bundles) are recognised by their layout and never listed as projects, wherever they live.
 - Docker removals (`docker image rm`, `container rm`, `volume rm`, build-cache prune) cannot be undone: they run only after `y` in the review, volumes (which can hold databases) are never taken by a bulk mark, and anything a running container holds cannot be marked.
-- The app never asks for your password. (Admin-only actions are planned: it will show the exact command with a copy button, you run it in another terminal, and then confirm in the app.)
+- The app never asks for, reads or stores your password. The only admin step is the Uninstall/Leftovers batch described above: macOS's own prompt, after the review, minimal `mv` + `chown` commands built from separate arguments and checked against the protected list just before they run; if it fails the exact commands are shown for you to run.
 
 ## Development
 
