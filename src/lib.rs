@@ -13,6 +13,7 @@ pub mod jobs;
 pub mod perms;
 pub mod safety;
 pub mod scan;
+pub mod snapshots;
 pub mod softdelete;
 pub mod targets;
 #[cfg(test)]
