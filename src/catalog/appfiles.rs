@@ -118,6 +118,18 @@ fn starting_with(dir: &Path, prefix: &str) -> Vec<PathBuf> {
 pub fn parts_of(app: &AppBundle, siblings: &[AppBundle], home: &Path, lib: &Path) -> Vec<AppPart> {
     let hl = home.join("Library");
     let (id, name) = (app.id.as_str(), app.name.as_str());
+    // An empty or slash-carrying id/name would turn `Caches/<id>` into the
+    // whole `Caches` folder: such an app gets only its own bundle.
+    if !super::apps::plain_component(id) || !super::apps::plain_component(name) {
+        let mut only = Vec::new();
+        push_if_exists(
+            &mut only,
+            app.path.clone(),
+            "app",
+            !app.path.starts_with(home),
+        );
+        return only;
+    }
     let mut out = Vec::new();
     push_if_exists(
         &mut out,
@@ -312,6 +324,21 @@ mod tests {
         ] {
             assert!(n.iter().any(|x| x == want), "{want} missing in {n:?}");
         }
+    }
+
+    #[test]
+    fn an_empty_name_never_expands_to_a_whole_library_folder() {
+        let e = env();
+        mk(&e.home.join("Library/Caches/something"));
+        let mut a = app(&e.home.join("Applications/Foo.app"), "com.foo.app", "");
+        mk(&a.path);
+        let parts = parts_of(&a, std::slice::from_ref(&a), &e.home, &e.lib);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        a.name = "a/b".into();
+        assert_eq!(
+            parts_of(&a, std::slice::from_ref(&a), &e.home, &e.lib).len(),
+            1
+        );
     }
 
     #[test]

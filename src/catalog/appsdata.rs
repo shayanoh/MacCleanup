@@ -47,12 +47,6 @@ pub fn discover_apps(
 ) -> AppsInput {
     let index = build_index(roots, runner);
     let running = running_executables(runner);
-    let running_ids: BTreeSet<String> = index
-        .apps
-        .iter()
-        .filter(|a| running.iter().any(|r| r.starts_with(&a.path)))
-        .map(|a| a.id.clone())
-        .collect();
     let absorbed: BTreeSet<PathBuf> = index
         .apps
         .iter()
@@ -74,7 +68,7 @@ pub fn discover_apps(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let leftovers = find_leftovers(&index, home, lib, &running_ids, now);
+    let leftovers = find_leftovers(&index, home, lib, &running, now);
     AppsInput {
         installed,
         leftovers,

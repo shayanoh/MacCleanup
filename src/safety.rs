@@ -22,6 +22,10 @@ pub struct Policy {
     /// Extra folders whose children count as app locations (tests only: the
     /// real ones are `/Applications` and `/Library`, which tests cannot use).
     extra_roots: Vec<PathBuf>,
+    /// Paths outside home that the Uninstall and Leftovers pages found for an
+    /// app (and everything inside them). Nothing else outside home is ever
+    /// offered, whatever its name.
+    allowed: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
 }
 
 const PROTECTED_TOP_LEVEL: &[&str] = &[
@@ -170,7 +174,14 @@ impl Policy {
             home: canonicalize_lenient(home),
             holding: canonicalize_lenient(holding),
             extra_roots: Vec::new(),
+            allowed: Default::default(),
         }
+    }
+
+    /// Replace the set of outside-home paths this feature found. Apple's and
+    /// the system's paths stay protected even inside it.
+    pub fn allow_outside(&self, paths: Vec<PathBuf>) {
+        *self.allowed.lock().unwrap_or_else(|e| e.into_inner()) = paths;
     }
 
     /// Treat the children of `root` as app locations outside home (tests).
@@ -202,8 +213,16 @@ impl Policy {
             {
                 return Safety::Caution;
             }
-            // Outside home only the Uninstall/Leftovers locations are offered.
-            return crate::catalog::apppolicy::app_location(path).unwrap_or(Safety::Protected);
+            // Outside home only what the Uninstall/Leftovers pages found for an
+            // app is offered (and what is inside it), never Apple's or the
+            // system's.
+            let allowed = self.allowed.lock().unwrap_or_else(|e| e.into_inner());
+            if allowed.iter().any(|a| path.starts_with(a))
+                && !crate::catalog::apppolicy::is_apple_path(path)
+            {
+                return Safety::Caution;
+            }
+            return Safety::Protected;
         };
         let comps: Vec<String> = rel
             .components()
@@ -715,16 +734,39 @@ mod app_location_tests {
     use super::*;
 
     #[test]
-    fn policy_allows_app_locations_only() {
+    fn policy_allows_only_what_was_found_for_an_app() {
         let p = Policy::new(Path::new("/Users/x"), Path::new("/Users/x/hold"));
+        assert_eq!(
+            p.classify(Path::new("/Applications/Foo.app")),
+            Safety::Protected,
+            "nothing outside home is offered until a page found it"
+        );
+        p.allow_outside(vec![
+            "/Applications/Foo.app".into(),
+            "/Applications/Safari.app".into(),
+        ]);
         assert_eq!(
             p.classify(Path::new("/Applications/Foo.app")),
             Safety::Caution
         );
+        assert_eq!(
+            p.classify(Path::new("/Applications/Foo.app/Contents/MacOS")),
+            Safety::Caution,
+            "what is inside an allowed app goes with it"
+        );
+        assert_eq!(
+            p.classify(Path::new("/Applications/Bar.app")),
+            Safety::Protected
+        );
+        assert_eq!(
+            p.classify(Path::new("/Library/Preferences/.GlobalPreferences.plist")),
+            Safety::Protected
+        );
         assert_eq!(p.classify(Path::new("/etc/hosts")), Safety::Protected);
         assert_eq!(
             p.classify(Path::new("/Applications/Safari.app")),
-            Safety::Protected
+            Safety::Protected,
+            "Apple's apps stay protected even if listed"
         );
         assert_eq!(
             p.classify(Path::new("/Applications/Foo.app/../Safari.app")),

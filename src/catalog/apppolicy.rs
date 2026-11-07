@@ -42,8 +42,19 @@ const LIBRARY_APP_DIRS: &[&str] = &[
 /// Roots that are never offered, whatever else matches.
 const SYSTEM_ROOTS: &[&str] = &["System", "usr", "bin", "sbin", "etc", "private", "var"];
 
+/// Apple's own ids that do not start with `com.apple.` (Shortcuts' data,
+/// macOS printing).
+const APPLE_LEGACY_PREFIXES: &[&str] = &["is.workflow.", "org.cups.", "com.apple."];
+
 pub fn is_apple_id(id: &str) -> bool {
-    id.to_ascii_lowercase().starts_with("com.apple.")
+    let id = id.to_ascii_lowercase();
+    let id = id
+        .strip_prefix("group.")
+        .or_else(|| id.strip_prefix("groups."))
+        .unwrap_or(&id);
+    APPLE_LEGACY_PREFIXES.iter().any(|p| id.starts_with(p))
+        || id.contains(".com.apple.")
+        || id.ends_with(".com.apple")
 }
 
 fn is_apple_name(name: &str) -> bool {
@@ -166,6 +177,9 @@ mod tests {
         assert!(is_apple_id("com.apple.Safari"));
         assert!(is_apple_id("COM.APPLE.x"));
         assert!(!is_apple_id("com.applesauce.x"));
+        assert!(is_apple_id("243LU875E5.groups.com.apple.podcasts"));
+        assert!(is_apple_id("group.is.workflow.shortcuts"));
+        assert!(is_apple_id("org.cups.PrintingPrefs"));
     }
 
     #[test]

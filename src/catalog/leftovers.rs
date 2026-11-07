@@ -2,7 +2,7 @@
 //! A group is listed only with positive evidence (see the design doc, "Leftover
 //! evidence"); when unsure, nothing is listed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -46,7 +46,10 @@ fn id_of(name: &str) -> Option<String> {
             n = s;
         }
     }
-    let n = n.strip_prefix("group.").unwrap_or(n);
+    let n = n
+        .strip_prefix("group.")
+        .or_else(|| n.strip_prefix("groups."))
+        .unwrap_or(n);
     // Temporary files (`...binarycookies_tmp_597_0.dat`) are not app ids.
     (id_shaped(n) && !n.contains("_tmp_")).then(|| n.to_string())
 }
@@ -136,7 +139,7 @@ pub fn find_leftovers(
     index: &InstalledIndex,
     home: &Path,
     lib: &Path,
-    running_ids: &BTreeSet<String>,
+    running: &[PathBuf],
     now: i64,
 ) -> LeftoversState {
     if !index.spotlight_ok {
@@ -150,7 +153,6 @@ pub fn find_leftovers(
     let allowed = |id: &str| {
         !is_apple_id(id)
             && !index.has_id(id)
-            && !running_ids.contains(id)
             && !(index.vendor_has_app(id) && !BIG_VENDORS.contains(&vendor_of(id).as_str()))
     };
     let hl = home.join("Library");
@@ -203,7 +205,13 @@ pub fn find_leftovers(
             let Some(prog) = plist_program(&e.path()) else {
                 continue;
             };
-            if allowed(&id) && !prog.exists() {
+            // Only "not found" means gone: a program in a folder we may not
+            // read is still there.
+            let gone = matches!(
+                fs::metadata(&prog),
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+            );
+            if allowed(&id) && gone {
                 let outside = !e.path().starts_with(home);
                 add_part(&mut groups, id, e.path(), dir, outside);
             }
@@ -221,6 +229,18 @@ pub fn find_leftovers(
     }
     let idle_before = now - MIN_IDLE_DAYS * 86_400;
     groups.retain(|_, g| newest_mtime(&g.parts) < idle_before);
+    // Nothing a running process executes from, and nothing that might belong
+    // to an app whose Info.plist could not be read.
+    groups.retain(|_, g| {
+        let squashed = super::apps::squash(&g.id);
+        !running
+            .iter()
+            .any(|r| g.parts.iter().any(|p| r.starts_with(&p.path)))
+            && !index
+                .unreadable
+                .iter()
+                .any(|u| squashed.contains(u.as_str()))
+    });
     LeftoversState::Ready(merge_children(groups))
 }
 
@@ -272,6 +292,7 @@ mod tests {
                 .collect(),
             nested_ids: nested.iter().map(|s| s.to_string()).collect(),
             spotlight_ok: ok,
+            unreadable: Vec::new(),
         }
     }
 
@@ -283,25 +304,13 @@ mod tests {
     }
 
     fn run(e: &Env, idx: &InstalledIndex) -> Vec<LeftoverGroup> {
-        ready(find_leftovers(
-            idx,
-            &e.home,
-            &e.lib,
-            &BTreeSet::new(),
-            LATER,
-        ))
+        ready(find_leftovers(idx, &e.home, &e.lib, &[], LATER))
     }
 
     #[test]
     fn unavailable_when_spotlight_not_ok() {
         let e = env();
-        match find_leftovers(
-            &index(&[], &[], false),
-            &e.home,
-            &e.lib,
-            &BTreeSet::new(),
-            LATER,
-        ) {
+        match find_leftovers(&index(&[], &[], false), &e.home, &e.lib, &[], LATER) {
             LeftoversState::Unavailable(w) => assert!(w.contains("Spotlight")),
             _ => panic!("expected unavailable"),
         }
@@ -367,12 +376,42 @@ mod tests {
     }
 
     #[test]
-    fn running_ids_are_skipped() {
+    fn a_group_with_a_running_program_inside_is_skipped() {
         let e = env();
-        mk(&e.home.join("Library/Caches/com.run.app"));
-        let running = BTreeSet::from(["com.run.app".to_string()]);
+        let dir = e.home.join("Library/Caches/com.run.app");
+        mk(&dir);
+        let running = vec![dir.join("helper")];
         let s = find_leftovers(&index(&[], &[], true), &e.home, &e.lib, &running, LATER);
         assert!(ready(s).is_empty());
+    }
+
+    #[test]
+    fn data_of_an_app_with_an_unreadable_plist_is_not_called_a_leftover() {
+        let e = env();
+        mk(&e.home.join("Library/Caches/com.vendor.broken-app"));
+        mk(&e.home.join("Library/Caches/com.other.thing"));
+        let mut idx = index(&[], &[], true);
+        idx.unreadable = vec!["brokenapp".to_string()];
+        let g = run(&e, &idx);
+        let ids: Vec<_> = g.iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(ids, ["com.other.thing"]);
+    }
+
+    #[test]
+    fn apple_group_ids_and_data_of_installed_products_are_not_leftovers() {
+        let e = env();
+        let hl = e.home.join("Library");
+        mk(&hl.join("Group Containers/243LU875E5.groups.com.apple.podcasts"));
+        mk(&hl.join("Group Containers/group.is.workflow.shortcuts"));
+        touch(&hl.join("Preferences/org.cups.PrintingPrefs.plist"));
+        touch(&hl.join("Preferences/com.google.drivefs.settings.plist"));
+        mk(&hl.join("Containers/com.microsoft.teams2.agent"));
+        let idx = index(&["com.google.drivefs", "com.microsoft.teams2"], &[], true);
+        assert!(
+            run(&e, &idx).is_empty(),
+            "{:?}",
+            run(&e, &idx).iter().map(|g| &g.id).collect::<Vec<_>>()
+        );
     }
 
     fn daemon(path: &Path, program: &str) {
@@ -417,13 +456,13 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let fresh = ready(find_leftovers(&idx, &e.home, &e.lib, &BTreeSet::new(), now));
+        let fresh = ready(find_leftovers(&idx, &e.home, &e.lib, &[], now));
         assert!(fresh.is_empty(), "touched today means still in use");
         let old = ready(find_leftovers(
             &idx,
             &e.home,
             &e.lib,
-            &BTreeSet::new(),
+            &[],
             now + 31 * 86_400,
         ));
         assert_eq!(old.len(), 1);

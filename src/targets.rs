@@ -327,11 +327,13 @@ fn add_app_groups(
     use rayon::prelude::*;
     let mut specs: Vec<GroupSpec> = Vec::new();
     for g in &apps.installed {
+        // What can run: the bundles and a launcher's real payload, by their
+        // real paths (`ps` reports those, not the symlink we listed).
         let bundles: Vec<PathBuf> = g
             .parts
             .iter()
-            .filter(|p| p.label == "app")
-            .map(|p| p.path.clone())
+            .filter(|p| p.label == "app" || p.label == "payload")
+            .map(|p| p.path.canonicalize().unwrap_or_else(|_| p.path.clone()))
             .collect();
         let running = apps
             .running
@@ -1802,6 +1804,44 @@ mod tests {
         assert_eq!(g.rows.len(), 2, "both rows are listed");
         let outer_row = g.rows.iter().find(|r| r.row.path == outer).unwrap();
         assert_eq!(g.size(), outer_row.row.size, "but the bytes count once");
+    }
+
+    #[test]
+    fn payload_and_symlinked_bundles_count_for_the_running_check() {
+        let s = sandbox(|h| {
+            write(&h.join("real/A.app/Contents/x"), 10);
+            write(&h.join("Library/Application Support/V/payload/y"), 10);
+        });
+        std::fs::create_dir_all(s.home.join("Applications")).unwrap();
+        let link = s.home.join("Applications/A.app");
+        std::os::unix::fs::symlink(s.home.join("real/A.app"), &link).unwrap();
+        let payload = s.home.join("Library/Application Support/V/payload");
+        let t = with_apps(
+            &s,
+            AppsInput {
+                installed: vec![AppGroup {
+                    managed: None,
+                    app: bundle(&link, "com.v.a", "A", 1),
+                    parts: vec![part(link.clone(), "app"), part(payload.clone(), "payload")],
+                }],
+                // What `ps` shows: the real path of the program inside the payload.
+                running: vec![payload.join("prog")],
+                leftovers: LeftoversState::Ready(Vec::new()),
+            },
+        );
+        let g = t
+            .groups
+            .iter()
+            .find(|g| g.section == SectionKind::Apps)
+            .unwrap();
+        assert!(
+            g.rows.iter().all(|r| r.locked.is_some()),
+            "running payload locks the group"
+        );
+        assert!(
+            g.bundles
+                .contains(&s.home.join("real/A.app").canonicalize().unwrap())
+        );
     }
 
     #[test]

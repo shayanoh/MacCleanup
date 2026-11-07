@@ -29,6 +29,10 @@ pub struct InstalledIndex {
     pub nested_ids: BTreeSet<String>,
     /// Did Spotlight answer the question "which apps exist"?
     pub spotlight_ok: bool,
+    /// Names (letters and digits, lowercase) of app bundles whose
+    /// `Info.plist` could not be read: their ids are unknown, so data that
+    /// might be theirs is never called a leftover.
+    pub unreadable: Vec<String>,
 }
 
 /// The first two dot-separated parts of an id, lowercased (`com.autodesk`).
@@ -54,7 +58,13 @@ impl InstalledIndex {
         let id = id.to_ascii_lowercase();
         self.known_ids().any(|k| {
             let k = k.to_ascii_lowercase();
-            k == id || k.starts_with(&format!("{id}."))
+            // The same id, a longer one that starts with it, a shorter one it
+            // starts with (an app's `.settings`, `.agent`), or one that shares
+            // the first three parts (the same product).
+            k == id
+                || k.starts_with(&format!("{id}."))
+                || id.starts_with(&format!("{k}."))
+                || shared_parts(&k, &id) >= 3
         })
     }
 
@@ -63,6 +73,26 @@ impl InstalledIndex {
         let v = vendor_of(id);
         self.known_ids().any(|k| vendor_of(k) == v)
     }
+}
+
+fn shared_parts(a: &str, b: &str) -> usize {
+    a.split('.')
+        .zip(b.split('.'))
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+/// Letters and digits only, lowercase: `Foo Bar-2` → `foobar2`.
+pub fn squash(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// A usable single path component (never `""`, `.`, `..`, or with a slash).
+pub fn plain_component(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\0')
 }
 
 fn plist_string(dict: &plist::Dictionary, key: &str) -> Option<String> {
@@ -93,14 +123,19 @@ fn owner_name(uid: u32) -> String {
 /// Read an app bundle's identity. `None` when it has no readable plist.
 pub fn read_bundle(path: &Path) -> Option<AppBundle> {
     let info = read_plist(path)?;
-    let id = plist_string(&info, "CFBundleIdentifier")?;
+    let id = plist_string(&info, "CFBundleIdentifier")
+        .filter(|i| plain_component(i) && i.contains('.'))?;
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let name = plist_string(&info, "CFBundleDisplayName")
         .or_else(|| plist_string(&info, "CFBundleName"))
+        .filter(|n| plain_component(n) && !n.starts_with('.'))
         .unwrap_or(stem);
+    if !plain_component(&name) || name.starts_with('.') {
+        return None;
+    }
     let exe = plist_string(&info, "CFBundleExecutable").unwrap_or_default();
     let uid = fs::metadata(path).map_or(0, |m| m.uid());
     Some(AppBundle {
@@ -137,7 +172,7 @@ fn nested_ids(app: &Path, out: &mut BTreeSet<String>) {
             {
                 out.insert(id);
             }
-            if depth < 4 {
+            if depth < 12 {
                 stack.push((p, depth + 1));
             }
         }
@@ -147,7 +182,13 @@ fn nested_ids(app: &Path, out: &mut BTreeSet<String>) {
 /// Apps under `root`, descending into plain subfolders (`Utilities`,
 /// `Chrome Apps.localized`) but never into an app. A symlink to an app counts
 /// once, by its real location.
-fn collect(root: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec<AppBundle>) {
+fn collect(
+    root: &Path,
+    depth: usize,
+    seen: &mut HashSet<PathBuf>,
+    out: &mut Vec<AppBundle>,
+    unreadable: &mut Vec<String>,
+) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
@@ -158,14 +199,20 @@ fn collect(root: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec
             continue;
         };
         if is_app {
-            if seen.insert(real.clone())
-                && let Some(mut b) = read_bundle(&real)
-            {
-                b.path = path.clone();
-                out.push(b);
+            if seen.insert(real.clone()) {
+                match read_bundle(&real) {
+                    Some(mut b) => {
+                        b.path = path.clone();
+                        out.push(b);
+                    }
+                    None => {
+                        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+                        unreadable.extend(stem.map(|s| squash(&s)).filter(|s| !s.is_empty()));
+                    }
+                }
             }
         } else if depth < 2 && e.file_type().is_ok_and(|t| t.is_dir()) {
-            collect(&path, depth + 1, seen, out);
+            collect(&path, depth + 1, seen, out, unreadable);
         }
     }
 }
@@ -206,8 +253,26 @@ fn fill_last_used(apps: &mut [AppBundle], runner: &dyn CommandRunner) {
         let Some(out) = runner.query(&CommandSpec::new("/usr/bin/mdls", &refs)) else {
             continue;
         };
-        for (app, field) in chunk.iter_mut().zip(out.split('\0')) {
-            app.last_used = parse_md_date(field).unwrap_or(0);
+        let fields: Vec<&str> = out.split('\0').collect();
+        if fields.len() == chunk.len() {
+            for (app, field) in chunk.iter_mut().zip(fields) {
+                app.last_used = parse_md_date(field).unwrap_or(0);
+            }
+        } else {
+            // The answers cannot be matched to the apps (one was missing):
+            // ask one app at a time rather than put dates on the wrong app.
+            for app in chunk.iter_mut() {
+                let one = [
+                    "-name",
+                    "kMDItemLastUsedDate",
+                    "-raw",
+                    &app.path.to_string_lossy(),
+                ];
+                app.last_used = runner
+                    .query(&CommandSpec::new("/usr/bin/mdls", &one))
+                    .and_then(|t| parse_md_date(&t))
+                    .unwrap_or(0);
+            }
         }
     }
 }
@@ -216,8 +281,9 @@ fn fill_last_used(apps: &mut [AppBundle], runner: &dyn CommandRunner) {
 pub fn build_index(roots: &[PathBuf], runner: &dyn CommandRunner) -> InstalledIndex {
     let mut seen = HashSet::new();
     let mut apps = Vec::new();
+    let mut unreadable = Vec::new();
     for r in roots {
-        collect(r, 0, &mut seen, &mut apps);
+        collect(r, 0, &mut seen, &mut apps, &mut unreadable);
     }
     // Spotlight knows apps in places we do not scan (other volumes, Setapp).
     let found = runner.query(&CommandSpec::new(
@@ -228,6 +294,7 @@ pub fn build_index(roots: &[PathBuf], runner: &dyn CommandRunner) -> InstalledIn
         .as_deref()
         .is_some_and(|t| t.lines().any(|l| l.starts_with("/Applications/")));
     let mut spotlight_nested = BTreeSet::new();
+    let mut library_apps: Vec<PathBuf> = Vec::new();
     for line in found.as_deref().unwrap_or("").lines() {
         let p = PathBuf::from(line);
         // Only top-level app bundles; nested ones are covered by `nested_ids`.
@@ -243,6 +310,7 @@ pub fn build_index(roots: &[PathBuf], runner: &dyn CommandRunner) -> InstalledIn
             // not a program to uninstall by itself.
             if p.components().any(|c| c.as_os_str() == "Library") {
                 spotlight_nested.insert(b.id);
+                library_apps.push(p);
             } else {
                 b.path = p;
                 apps.push(b);
@@ -253,12 +321,16 @@ pub fn build_index(roots: &[PathBuf], runner: &dyn CommandRunner) -> InstalledIn
     for a in &apps {
         nested_ids(&a.path, &mut nested);
     }
+    for p in &library_apps {
+        nested_ids(p, &mut nested);
+    }
     apps.sort_by_key(|a| a.name.to_lowercase());
     fill_last_used(&mut apps, runner);
     InstalledIndex {
         apps,
         nested_ids: nested,
         spotlight_ok,
+        unreadable,
     }
 }
 
@@ -316,6 +388,50 @@ mod tests {
         fs::create_dir_all(app.join("Contents")).unwrap();
         fs::write(app.join("Contents/Info.plist"), b"not a plist \x00\xff").unwrap();
         assert!(read_bundle(&app).is_none());
+    }
+
+    #[test]
+    fn read_bundle_rejects_an_empty_or_slashy_identity() {
+        let d = tempfile::tempdir().unwrap();
+        let mk = |name: &str, id: &str, bname: &str| {
+            let app = d.path().join(format!("{name}.app"));
+            fs::create_dir_all(app.join("Contents")).unwrap();
+            let mut dict = plist::Dictionary::new();
+            dict.insert("CFBundleIdentifier".into(), id.into());
+            dict.insert("CFBundleName".into(), bname.into());
+            plist::Value::Dictionary(dict)
+                .to_file_xml(app.join("Contents/Info.plist"))
+                .unwrap();
+            app
+        };
+        assert!(read_bundle(&mk("A", "", "A")).is_none(), "empty id");
+        assert!(read_bundle(&mk("B", "no-dots", "B")).is_none(), "not an id");
+        assert!(read_bundle(&mk("C", "a/b.c", "C")).is_none(), "slash in id");
+        let ok = read_bundle(&mk("D", "com.d.d", "x/y")).unwrap();
+        assert_eq!(ok.name, "D", "a bad name falls back to the file name");
+    }
+
+    #[test]
+    fn an_unreadable_bundle_is_remembered_by_name() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("Broken App.app/Contents")).unwrap();
+        let idx = build_index(&[d.path().to_path_buf()], &FakeRunner::new(&[]));
+        assert_eq!(idx.unreadable, ["brokenapp"]);
+    }
+
+    #[test]
+    fn mdls_answers_that_do_not_match_are_asked_one_by_one() {
+        let d = tempfile::tempdir().unwrap();
+        make_app(d.path(), "Foo", "com.foo.app");
+        make_app(d.path(), "Bar", "com.bar.app");
+        // One answer for two apps: they cannot be paired.
+        let runner =
+            FakeRunner::new(&[]).answering(&[("/usr/bin/mdls", "2026-11-05 19:04:38 +0000")]);
+        let idx = build_index(&[d.path().to_path_buf()], &runner);
+        // Asked one at a time, each app gets the single answer the fake
+        // gives; paired by position, the second app would have got nothing.
+        assert_eq!(idx.apps.len(), 2);
+        assert!(idx.apps.iter().all(|a| a.last_used == 1_793_905_478));
     }
 
     #[test]
@@ -378,6 +494,7 @@ mod tests {
             ..Default::default()
         };
         assert!(idx.has_id("com.autodesk.dls.streamer"));
+        assert!(idx.has_id("com.autodesk.dls.streamer.scriptapp.Autodesk-Fusion.helper"));
         assert!(!idx.has_id("com.google.x"));
         assert!(idx.vendor_has_app("com.Autodesk.streamer"));
         assert!(!idx.vendor_has_app("com.google.x"));

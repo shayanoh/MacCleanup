@@ -438,6 +438,30 @@ pub struct Manual {
     slots: Vec<crate::softdelete::Reserved>,
 }
 
+/// The places outside home that the Uninstall and Leftovers pages may offer:
+/// the parts of apps that are not Apple's, and of leftover groups.
+fn outside_parts(input: &AppsInput, home: &Path) -> Vec<PathBuf> {
+    use crate::catalog::apppolicy::is_apple_id;
+    use crate::catalog::leftovers::LeftoversState;
+    let outside = |p: &PathBuf| !p.starts_with(home);
+    let mut out: Vec<PathBuf> = input
+        .installed
+        .iter()
+        .filter(|g| !is_apple_id(&g.app.id))
+        .flat_map(|g| g.parts.iter().map(|p| p.path.clone()))
+        .filter(outside)
+        .collect();
+    if let LeftoversState::Ready(found) = &input.leftovers {
+        out.extend(
+            found
+                .iter()
+                .flat_map(|g| g.parts.iter().map(|p| p.path.clone()))
+                .filter(outside),
+        );
+    }
+    out
+}
+
 /// `'text'` for a POSIX shell, whatever the text holds.
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
@@ -1476,7 +1500,13 @@ impl App {
 
     /// `r`: the user ran the commands; read everything again.
     fn manual_ran(&mut self) {
-        if matches!(self.dialog, Some(Dialog::Manual(_))) {
+        if let Some(Dialog::Manual(m)) = &self.dialog {
+            // Slots whose item never arrived are given back.
+            for r in &m.slots {
+                if std::fs::symlink_metadata(&r.payload).is_err() {
+                    self.holding.unreserve(r);
+                }
+            }
             self.dialog = None;
             self.refresh_held();
             self.rescan(true);
@@ -2513,6 +2543,8 @@ impl App {
         let Some(rx) = &self.apps_rx else { return };
         match rx.try_recv() {
             Ok(input) => {
+                self.policy
+                    .allow_outside(outside_parts(&input, self.policy.home()));
                 self.apps_input = Some(Arc::new(input));
                 self.apps_rx = None;
                 self.rebuild_targets();

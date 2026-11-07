@@ -128,6 +128,24 @@ impl Elevator for OsascriptElevator {
         if moves.is_empty() {
             return Ok(());
         }
+        // Use the real location of the item's folder: a symlink swapped in
+        // after the check must not redirect the privileged move.
+        let mut resolved = Vec::with_capacity(moves.len());
+        for m in moves {
+            let name = m.from.file_name();
+            let parent = m.from.parent().and_then(|p| p.canonicalize().ok());
+            let (Some(parent), Some(name)) = (parent, name) else {
+                return Err(ElevateError::Failed(format!(
+                    "refused {:?}: its folder cannot be resolved",
+                    m.from
+                )));
+            };
+            resolved.push(ElevatedMove {
+                from: parent.join(name),
+                to: m.to.clone(),
+            });
+        }
+        let moves = &resolved[..];
         for m in moves {
             self.validate(m)?;
         }
@@ -225,9 +243,11 @@ mod tests {
         let hold = base.join("hold");
         std::fs::create_dir_all(home.join("x")).unwrap();
         std::fs::create_dir_all(hold.join("items/1")).unwrap();
+        let policy = Policy::new(&home, &hold);
+        policy.allow_outside(vec!["/Applications".into()]);
         let e = OsascriptElevator {
             runner,
-            policy: Arc::new(Policy::new(&home, &hold)),
+            policy: Arc::new(policy),
             items_dir: hold.join("items"),
         };
         (d, e, base)
