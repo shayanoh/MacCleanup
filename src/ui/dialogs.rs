@@ -42,6 +42,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         Some(Dialog::Deleting(p)) => deleting(frame, area, app, p, scale),
         Some(Dialog::Finish(f)) => finish(frame, area, app, f, scale),
         Some(Dialog::Notice(msg)) => notice(frame, area, g, msg, scale),
+        Some(Dialog::Manual(m)) => manual(frame, area, g, m, scale),
     }
 }
 
@@ -244,6 +245,14 @@ fn review(
                 format!(" {}", safety_word(item.safety)),
                 Style::default().fg(safety_color(item.safety)),
             ),
+            Span::styled(
+                if item.needs_admin {
+                    " may ask for your password"
+                } else {
+                    ""
+                },
+                Style::default().fg(Color::Yellow),
+            ),
         ]));
     }
     if !r.commands.is_empty() {
@@ -423,10 +432,18 @@ fn review(
             g,
             &[("Esc", "Cancel (mark them, then review again)")],
         ));
-    } else if r.commands.is_empty() {
+    } else if !r.needs_y() {
         lines.push(key_line(
             g,
             &[("Enter", "Move to ToBeDeleted"), ("Esc", "Cancel")],
+        ));
+    } else if r.commands.is_empty() {
+        lines.push(key_line(
+            g,
+            &[
+                ("y", "Move to ToBeDeleted (may ask for your password)"),
+                ("Esc", "Cancel"),
+            ],
         ));
     } else if scrollable && !seen_end {
         // y stays off until every command has been scrolled into view.
@@ -850,6 +867,45 @@ fn finish(frame: &mut Frame, area: Rect, app: &App, f: &FinishInfo, scale: f64) 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
+/// Items that need administrator rights, after the password prompt did not
+/// do it: the exact commands, to copy and run in a terminal.
+fn manual(frame: &mut Frame, area: Rect, g: &Glyphs, m: &crate::app::Manual, scale: f64) {
+    let height = (m.lines.len() as u16 + 9).min(area.height.saturating_sub(2));
+    let Some(inner) = popup(
+        frame,
+        area,
+        g,
+        "Needs administrator rights",
+        ACCENT,
+        area.width.saturating_sub(4).min(110),
+        height,
+        scale,
+    ) else {
+        return;
+    };
+    let mut lines = vec![
+        Line::from(super::clean(&m.reason, g)),
+        Line::raw(""),
+        Line::from("Run these in a terminal (nothing was moved yet):"),
+    ];
+    lines.extend(m.lines.iter().map(|l| {
+        Line::from(Span::styled(
+            super::clean(l, g),
+            Style::default().fg(Color::Yellow),
+        ))
+    }));
+    lines.push(Line::raw(""));
+    lines.push(key_line(
+        g,
+        &[
+            ("c", if m.copied { "Copied" } else { "Copy" }),
+            ("r", "I ran the commands"),
+            ("Esc", "Cancel"),
+        ],
+    ));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn notice(frame: &mut Frame, area: Rect, g: &Glyphs, msg: &str, scale: f64) {
     let Some(inner) = popup(
         frame,
@@ -934,6 +990,7 @@ mod review_layout_tests {
                     path: format!("/x/{i}").into(),
                     usage: Usage::default(),
                     safety: Safety::Safe,
+                    needs_admin: false,
                 })
                 .collect(),
             commands: (0..commands)

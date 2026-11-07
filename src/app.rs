@@ -182,6 +182,10 @@ pub enum Action {
     GoTo(Screen),
     /// In a review: switch commands that have one to their `--force` form (`f`).
     ToggleForce,
+    /// Copy the commands of the "run it yourself" dialog.
+    ManualCopy,
+    /// "I ran the commands": look again.
+    ManualRan,
     /// On the result screen: run the lock-blocked commands again with `--force`.
     RetryForced,
     /// A digit key: the page at this position (1-based) in the menu.
@@ -237,6 +241,9 @@ pub struct ReviewItem {
     pub path: PathBuf,
     pub usage: Usage,
     pub safety: Safety,
+    /// Outside home in a folder we cannot write to: moving it will ask for
+    /// the password (through the system's own prompt).
+    pub needs_admin: bool,
 }
 
 /// A tool's own cleanup command in the review.
@@ -308,6 +315,13 @@ pub struct Review {
 }
 
 impl Review {
+    /// Does confirming need an explicit `y` (Enter never confirms)? Tool
+    /// commands cannot be undone, and a password prompt must not come as a
+    /// surprise.
+    pub fn needs_y(&self) -> bool {
+        !self.commands.is_empty() || self.items.iter().any(|i| i.needs_admin)
+    }
+
     /// Lines of the review's scrolling list: one per folder, then the
     /// commands block (a blank line, a heading, and per command its line, its
     /// "via" line, and one more each for a warning and for a force hint).
@@ -409,6 +423,24 @@ pub enum Dialog {
     Deleting(DeleteProgress),
     Finish(FinishInfo),
     Notice(String),
+    /// The password prompt did not work out: the exact commands to run by hand.
+    Manual(Manual),
+}
+
+/// The "run it yourself" dialog for items that need administrator rights.
+#[derive(Clone, Debug)]
+pub struct Manual {
+    /// Why the automatic way did not work.
+    pub reason: String,
+    /// The commands, one per line.
+    pub lines: Vec<String>,
+    pub copied: bool,
+    slots: Vec<crate::softdelete::Reserved>,
+}
+
+/// `'text'` for a POSIX shell, whatever the text holds.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Where the selected row's disk space would go.
@@ -556,6 +588,9 @@ pub struct App {
     apps_input: Option<Arc<AppsInput>>,
     apps_rx: Option<mpsc::Receiver<AppsInput>>,
     apps_started: bool,
+    /// Items outside home that the last job could not move, and their sizes.
+    job_failed: Vec<PathBuf>,
+    job_usage: std::collections::HashMap<PathBuf, Usage>,
     /// Where installed apps are looked for, and the system `/Library`.
     apps_roots: Vec<std::path::PathBuf>,
     apps_lib: std::path::PathBuf,
@@ -727,6 +762,8 @@ impl App {
             apps_input: None,
             apps_rx: None,
             apps_started: false,
+            job_failed: Vec::new(),
+            job_usage: std::collections::HashMap::new(),
             apps_roots: apps_roots_default,
             apps_lib: std::path::PathBuf::from("/Library"),
             apps_managers: crate::catalog::appmgr::Managers::system(),
@@ -1056,6 +1093,8 @@ impl App {
             Action::Quit => self.request_quit(),
             Action::Tick => self.on_tick(),
             Action::Cancel => self.cancel(),
+            Action::ManualCopy => self.manual_copy(),
+            Action::ManualRan => self.manual_ran(),
             Action::Confirm => self.confirm(),
             Action::ConfirmIrreversible => match self.dialog.take() {
                 Some(Dialog::Review(r)) => self.dialog = Some(Dialog::Irreversible(r)),
@@ -1366,6 +1405,12 @@ impl App {
     }
 
     fn cancel(&mut self) {
+        // Nothing was moved by hand: give the booked slots back.
+        if let Some(Dialog::Manual(m)) = &self.dialog {
+            for r in &m.slots {
+                self.holding.unreserve(r);
+            }
+        }
         // A move or a delete cannot be cancelled half-way; a running tool
         // command can (it is stopped, and the ones after it are skipped).
         if let Some(Dialog::Deleting(p)) = self.dialog.take() {
@@ -1408,7 +1453,69 @@ impl App {
             Some(Dialog::Irreversible(r)) => self.run_delete(r, DeleteMode::SoftThenEmpty),
             Some(Dialog::ConfirmForever(t)) => self.run_forever(t),
             Some(Dialog::Deleting(p)) => self.dialog = Some(Dialog::Deleting(p)),
+            Some(d @ Dialog::Manual(_)) => self.dialog = Some(d),
             Some(Dialog::Finish(_)) | Some(Dialog::Notice(_)) | None => {}
+        }
+    }
+
+    /// `c` in the "run it yourself" dialog: put the commands on the clipboard.
+    fn manual_copy(&mut self) {
+        let Some(Dialog::Manual(m)) = &mut self.dialog else {
+            return;
+        };
+        let text = m.lines.join("\n");
+        let spec = CommandSpec::new("/usr/bin/pbcopy", &[]).with_stdin(&text);
+        let ok = self.runner.run(&spec, &RunControl::new()).ok;
+        m.copied = ok;
+        self.notice = Some(if ok {
+            "Copied the commands".to_string()
+        } else {
+            "Could not copy; select the lines with the mouse".to_string()
+        });
+    }
+
+    /// `r`: the user ran the commands; read everything again.
+    fn manual_ran(&mut self) {
+        if matches!(self.dialog, Some(Dialog::Manual(_))) {
+            self.dialog = None;
+            self.refresh_held();
+            self.rescan(true);
+        }
+    }
+
+    /// After a delete: items outside home that could not be moved get their
+    /// exact commands, each against a booked ToBeDeleted slot, so doing it by
+    /// hand keeps the soft delete.
+    fn open_manual(&mut self, reason: String) {
+        let failed = std::mem::take(&mut self.job_failed);
+        let user = crate::elevate::current_user().unwrap_or_default();
+        let (mut slots, mut lines) = (Vec::new(), Vec::new());
+        for path in failed {
+            if std::fs::symlink_metadata(&path).is_err() {
+                continue;
+            }
+            let usage = self.job_usage.get(&path).copied().unwrap_or_default();
+            if let Ok(r) = self.holding.reserve(&self.policy, &path, usage) {
+                lines.push(format!(
+                    "sudo /bin/mv -- {} {}",
+                    shell_quote(&path.to_string_lossy()),
+                    shell_quote(&r.payload.to_string_lossy())
+                ));
+                lines.push(format!(
+                    "sudo /usr/sbin/chown -R {} {}",
+                    shell_quote(&user),
+                    shell_quote(&r.payload.to_string_lossy())
+                ));
+                slots.push(r);
+            }
+        }
+        if !slots.is_empty() {
+            self.dialog = Some(Dialog::Manual(Manual {
+                reason,
+                lines,
+                copied: false,
+                slots,
+            }));
         }
     }
 
@@ -2189,6 +2296,8 @@ impl App {
                 path: path.clone(),
                 usage: *usage,
                 safety: self.policy.classify_real(path),
+                needs_admin: !path.starts_with(self.policy.home())
+                    && path.parent().is_none_or(|p| !crate::elevate::can_write(p)),
             })
             .collect();
         items.sort_by(|a, b| {
@@ -2716,11 +2825,19 @@ impl App {
             phase: Phase::Moving,
             current: PathBuf::new(),
         }));
-        self.job = Some(DeleteJob::start(
+        self.job_failed.clear();
+        self.job_usage = items.iter().cloned().collect();
+        let elevator = Arc::new(crate::elevate::OsascriptElevator {
+            runner: Arc::clone(&self.runner),
+            policy: Arc::clone(&self.policy),
+            items_dir: self.holding.dir().join("items"),
+        });
+        self.job = Some(DeleteJob::start_with(
             Arc::clone(&self.holding),
             Arc::clone(&self.policy),
             items,
             mode,
+            elevator,
         ));
     }
 
@@ -2750,7 +2867,10 @@ impl App {
                         };
                     }
                 }
-                DeleteEvent::Failed { error, .. } => {
+                DeleteEvent::Failed { path, error } => {
+                    if !path.starts_with(self.policy.home()) {
+                        self.job_failed.push(path);
+                    }
                     if self.job_failure.is_none() {
                         self.job_failure = Some(error);
                     }
@@ -2772,7 +2892,11 @@ impl App {
                 return;
             }
             let (mode, free_before) = (self.job_mode, self.job_free_before);
+            let reason = self.job_failure.clone().unwrap_or_default();
             self.after_delete(mode, moved, emptied, failures, free_before);
+            if mode == DeleteMode::SoftOnly && !self.job_failed.is_empty() {
+                self.open_manual(reason);
+            }
             if self.quit_after_job {
                 self.quit_after_job = false;
                 self.request_quit();
@@ -6793,5 +6917,89 @@ mod apps_marking_tests {
             !e.app.marks.keys().any(|p| p.ends_with("A.app")),
             "the bundle goes by the command"
         );
+    }
+}
+
+#[cfg(test)]
+mod admin_flow_tests {
+    use super::*;
+    use crate::testutil::{Env, env_with, settle};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// An app-like file outside home in a folder we cannot write to.
+    fn locked_outside(e: &mut Env) -> Option<PathBuf> {
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+        let outside = e.home.parent().unwrap().join("outside");
+        let file = outside.join("locked/Foo.app");
+        std::fs::create_dir_all(&file).unwrap();
+        std::fs::write(file.join("x"), b"data").unwrap();
+        std::fs::set_permissions(
+            outside.join("locked"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        e.app.policy =
+            Arc::new(Policy::new(&e.home, e.app.holding.dir()).with_extra_root(&outside));
+        e.app.marks.insert(file.clone(), Usage::new(4, 4096));
+        Some(file)
+    }
+
+    fn unlock(e: &Env) {
+        let dir = e.home.parent().unwrap().join("outside/locked");
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    }
+
+    #[test]
+    fn review_marks_admin_rows_and_needs_y() {
+        let mut e = env_with(&[("a", 1)], |_| {});
+        let Some(file) = locked_outside(&mut e) else {
+            return;
+        };
+        e.app.update(Action::GoTo(Screen::Targets));
+        e.app.update(Action::OpenReview);
+        let Some(Dialog::Review(r)) = &e.app.dialog else {
+            panic!("no review");
+        };
+        assert!(r.needs_y());
+        assert!(r.items.iter().any(|i| i.path == file && i.needs_admin));
+        unlock(&e);
+    }
+
+    #[test]
+    fn failed_prompt_opens_copy_command_dialog_with_exact_commands() {
+        let mut e = env_with(&[("a", 1)], |_| {});
+        let Some(file) = locked_outside(&mut e) else {
+            return;
+        };
+        e.app.update(Action::GoTo(Screen::Targets));
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        let Some(Dialog::Manual(m)) = &e.app.dialog else {
+            unlock(&e);
+            panic!("expected the manual dialog, got {:?}", e.app.dialog);
+        };
+        let from = format!("sudo /bin/mv -- '{}'", file.display());
+        assert!(m.lines[0].starts_with(&from), "{:?}", m.lines);
+        assert!(m.lines[0].contains("/payload'"));
+        assert!(m.lines[1].starts_with("sudo /usr/sbin/chown -R "));
+        assert!(file.exists(), "nothing moved");
+        assert_eq!(
+            e.app.holding.list().unwrap().len(),
+            1,
+            "slot is booked for the manual move"
+        );
+        // Cancel gives the slot back.
+        e.app.update(Action::Cancel);
+        assert!(e.app.holding.list().unwrap().is_empty());
+        unlock(&e);
+    }
+
+    #[test]
+    fn shell_quote_survives_quotes() {
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_quote("plain"), "'plain'");
     }
 }

@@ -45,6 +45,16 @@ impl Elevator for NoElevator {
     }
 }
 
+/// Can this process write into the folder (`access(W_OK)`)?
+pub fn can_write(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}
+
 /// The login name of the current user.
 pub fn current_user() -> Option<String> {
     // SAFETY: getpwuid returns static storage or null; copied out at once.

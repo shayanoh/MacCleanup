@@ -153,7 +153,7 @@ fn dialog_key(code: KeyCode, dialog: &Dialog) -> Option<Action> {
             _ => None,
         },
         // Tool commands cannot be undone: only an explicit `y` runs them.
-        Dialog::Review(r) if !r.commands.is_empty() => match code {
+        Dialog::Review(r) if r.needs_y() => match code {
             code if review_scroll_key(code).is_some() => review_scroll_key(code),
             KeyCode::Char('f') if r.commands.iter().any(|c| c.can_force) => {
                 Some(Action::ToggleForce)
@@ -187,6 +187,12 @@ fn dialog_key(code: KeyCode, dialog: &Dialog) -> Option<Action> {
         Dialog::Finish(f) if !f.retry.is_empty() && code == KeyCode::Char('f') => {
             Some(Action::RetryForced)
         }
+        Dialog::Manual(_) => match code {
+            KeyCode::Char('c') => Some(Action::ManualCopy),
+            KeyCode::Char('r') => Some(Action::ManualRan),
+            KeyCode::Esc | KeyCode::Char('n') => Some(Action::Cancel),
+            _ => None,
+        },
         Dialog::Finish(_) | Dialog::Notice(_) => match code {
             KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => Some(Action::Cancel),
             _ => None,
@@ -609,6 +615,7 @@ mod tests {
                     path: format!("/x/{i}").into(),
                     usage: Usage::default(),
                     safety: Safety::Safe,
+                    needs_admin: false,
                 })
                 .collect(),
             commands: (0..commands)
@@ -646,6 +653,16 @@ mod tests {
             Some(Action::ConfirmIrreversible)
         );
         assert_eq!(dialog_key(KeyCode::Esc, &d), Some(Action::Cancel));
+    }
+
+    #[test]
+    fn enter_does_not_confirm_a_review_with_admin_rows() {
+        let mut d = review_with(1, 0);
+        if let Dialog::Review(r) = &mut d {
+            r.items[0].needs_admin = true;
+        }
+        assert_eq!(dialog_key(KeyCode::Enter, &d), None);
+        assert_eq!(dialog_key(KeyCode::Char('y'), &d), Some(Action::Confirm));
     }
 
     #[test]
