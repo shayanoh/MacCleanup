@@ -13,6 +13,7 @@ pub mod resolve;
 pub mod runtimes;
 pub use tools::{Mode, ToolEntry, discover_tools};
 pub mod appfiles;
+pub mod appmgr;
 pub mod apppolicy;
 pub mod apps;
 pub mod appsdata;

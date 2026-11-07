@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::appfiles::{AppPart, parts_of, wrappers};
+use super::appmgr::{ManagedApp, Managers, detect};
 use super::apppolicy::is_apple_id;
 use super::apps::{AppBundle, build_index, running_executables};
 use super::command::CommandRunner;
@@ -14,6 +15,8 @@ use super::leftovers::{LeftoversState, find_leftovers};
 pub struct AppGroup {
     pub app: AppBundle,
     pub parts: Vec<AppPart>,
+    /// Installed by a package manager: removed with its own command.
+    pub managed: Option<ManagedApp>,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +42,7 @@ pub fn discover_apps(
     home: &Path,
     lib: &Path,
     roots: &[PathBuf],
+    managers: &Managers,
     runner: &dyn CommandRunner,
 ) -> AppsInput {
     let index = build_index(roots, runner);
@@ -63,6 +67,7 @@ pub fn discover_apps(
         .filter(|a| !is_apple_id(&a.id) || a.path.starts_with("/Applications"))
         .map(|a| AppGroup {
             parts: parts_of(a, &index.apps, home, lib),
+            managed: detect(a, home, managers, runner),
             app: a.clone(),
         })
         .collect();

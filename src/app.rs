@@ -559,6 +559,7 @@ pub struct App {
     /// Where installed apps are looked for, and the system `/Library`.
     apps_roots: Vec<std::path::PathBuf>,
     apps_lib: std::path::PathBuf,
+    apps_managers: crate::catalog::appmgr::Managers,
     /// Keys of the groups the user folded (kept across rebuilds).
     closed_groups: HashSet<String>,
     targets_synced: bool,
@@ -728,6 +729,7 @@ impl App {
             apps_started: false,
             apps_roots: apps_roots_default,
             apps_lib: std::path::PathBuf::from("/Library"),
+            apps_managers: crate::catalog::appmgr::Managers::system(),
             closed_groups: HashSet::new(),
             targets_synced: false,
             targets_job: Latest::new(),
@@ -780,6 +782,7 @@ impl App {
     ) -> App {
         self.apps_roots = roots;
         self.apps_lib = lib;
+        self.apps_managers = crate::catalog::appmgr::Managers::default();
         self
     }
 
@@ -1743,7 +1746,10 @@ impl App {
     /// version (they go with it). Caches & Projects never marks commands in
     /// bulk: there each command is a cleanup the user picks on purpose.
     fn mark_bulk_commands(&mut self, keep: impl Fn(usize, &crate::targets::Group) -> bool) {
-        if self.page() != crate::targets::Page::Runtimes {
+        if !matches!(
+            self.page(),
+            crate::targets::Page::Runtimes | crate::targets::Page::Uninstall
+        ) {
             return;
         }
         let (mut ids, mut refused) = (Vec::new(), 0);
@@ -1758,7 +1764,7 @@ impl App {
                 let crate::targets::RowKind::Command { id, notes, .. } = &r.kind else {
                     continue;
                 };
-                if notes.refuse.is_some() {
+                if notes.refuse.is_some() || r.locked.is_some() {
                     refused += 1;
                 } else if !matches!(self.mark_state(&r.row.path), MarkState::Covered(_))
                     && self.version_covering(id).is_none()
@@ -1878,7 +1884,7 @@ impl App {
                     }
                     crate::targets::RowKind::Command { id, notes, .. } => {
                         if !self.tool_marks.contains(id)
-                            && let Some(why) = &notes.refuse
+                            && let Some(why) = notes.refuse.as_ref().or(t.locked.as_ref())
                         {
                             self.notice = Some(why.clone());
                             return;
@@ -2377,9 +2383,19 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let runner = Arc::clone(&self.runner);
         let home = self.policy.home().to_path_buf();
-        let (roots, lib) = (self.apps_roots.clone(), self.apps_lib.clone());
+        let (roots, lib, managers) = (
+            self.apps_roots.clone(),
+            self.apps_lib.clone(),
+            self.apps_managers.clone(),
+        );
         std::thread::spawn(move || {
-            let _ = tx.send(discover_apps(&home, &lib, &roots, runner.as_ref()));
+            let _ = tx.send(discover_apps(
+                &home,
+                &lib,
+                &roots,
+                &managers,
+                runner.as_ref(),
+            ));
         });
         self.apps_rx = Some(rx);
     }
@@ -6633,6 +6649,7 @@ mod apps_marking_tests {
         let vendor = home.join("Library/Application Support/Vendor");
         vec![
             AppGroup {
+                managed: None,
                 app: bundle(&a, "com.v.a", "A"),
                 parts: vec![
                     part(a.clone(), "app", false, false),
@@ -6642,6 +6659,7 @@ mod apps_marking_tests {
                 ],
             },
             AppGroup {
+                managed: None,
                 app: bundle(&b, "com.v.b", "B"),
                 parts: vec![part(b.clone(), "app", false, false)],
             },
@@ -6713,6 +6731,7 @@ mod apps_marking_tests {
             |h| {
                 let a = h.join("A.app");
                 vec![AppGroup {
+                    managed: None,
                     app: bundle(&a, "com.apple.thing", "A"),
                     parts: vec![part(a, "app", false, false)],
                 }]
@@ -6736,5 +6755,43 @@ mod apps_marking_tests {
         e.app.update(Action::OpenReview);
         assert!(e.app.marks.is_empty(), "a running app is unmarked");
         assert!(e.app.notice.as_deref().unwrap().contains("running"));
+    }
+
+    #[test]
+    fn manager_app_is_a_command_row_marked_by_the_header_with_its_folders() {
+        use crate::catalog::appmgr::ManagedApp;
+        use crate::catalog::command::CommandSpec;
+        let mut e = setup(
+            |h| {
+                let a = h.join("A.app");
+                vec![AppGroup {
+                    app: bundle(&a, "com.v.a", "A"),
+                    parts: vec![
+                        part(a.clone(), "app", false, false),
+                        part(h.join("Library/Caches/com.a.a"), "Caches", false, false),
+                    ],
+                    managed: Some(ManagedApp {
+                        id: "app:brew:a".into(),
+                        spec: CommandSpec::new(
+                            "/opt/homebrew/bin/brew",
+                            &["uninstall", "--cask", "a"],
+                        ),
+                    }),
+                }]
+            },
+            Vec::new(),
+        );
+        cursor_on_group(&mut e, "A");
+        e.app.update(Action::ToggleMark);
+        assert!(
+            e.app.tool_marks.contains("app:brew:a"),
+            "{:?}",
+            e.app.tool_marks
+        );
+        assert!(e.app.marks.keys().any(|p| p.ends_with("com.a.a")));
+        assert!(
+            !e.app.marks.keys().any(|p| p.ends_with("A.app")),
+            "the bundle goes by the command"
+        );
     }
 }

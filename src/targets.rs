@@ -289,6 +289,8 @@ struct PartSpec {
     /// vendor folder other apps use.
     bulk_skip: bool,
     shared_with: Vec<PathBuf>,
+    /// Removed with a package manager's command instead of a move.
+    command: Option<(String, crate::catalog::CommandSpec)>,
 }
 
 struct GroupSpec {
@@ -358,6 +360,11 @@ fn add_app_groups(
                     } else {
                         Vec::new()
                     },
+                    command: g
+                        .managed
+                        .as_ref()
+                        .filter(|_| p.label == "app" && p.path == g.app.path)
+                        .map(|m| (m.id.clone(), m.spec.clone())),
                 })
                 .collect(),
         });
@@ -382,6 +389,7 @@ fn add_app_groups(
                             why: g.reason.clone(),
                             bulk_skip: p.outside_home,
                             shared_with: Vec::new(),
+                            command: None,
                         })
                         .collect(),
                 });
@@ -419,7 +427,14 @@ fn add_app_groups(
             }
             trows.push(TRow {
                 row,
-                kind: RowKind::Folder,
+                kind: match p.command {
+                    Some((id, spec)) => RowKind::Command {
+                        id,
+                        spec,
+                        notes: Box::default(),
+                    },
+                    None => RowKind::Folder,
+                },
                 safety: src.policy.classify(&p.path),
                 regen: format!("{} of {}", p.label, spec.title),
                 note: Some(p.why),
@@ -1690,6 +1705,7 @@ mod tests {
             &s,
             AppsInput {
                 installed: vec![AppGroup {
+                    managed: None,
                     parts: vec![
                         part(app.path.clone(), "app"),
                         part(s.home.join("Library/Caches/com.foo.app"), "Caches"),
@@ -1772,6 +1788,7 @@ mod tests {
             &s,
             AppsInput {
                 installed: vec![AppGroup {
+                    managed: None,
                     parts: vec![part(bundle_path.clone(), "app")],
                     app,
                 }],
@@ -1799,10 +1816,12 @@ mod tests {
             AppsInput {
                 installed: vec![
                     AppGroup {
+                        managed: None,
                         app: bundle(&a, "com.a.a", "Never", 0),
                         parts: vec![part(a, "app")],
                     },
                     AppGroup {
+                        managed: None,
                         app: bundle(&b, "com.b.b", "Recent", 100),
                         parts: vec![part(b, "app")],
                     },
