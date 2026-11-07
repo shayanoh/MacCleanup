@@ -109,6 +109,11 @@ pub struct TRow {
     /// A final product (a built program) that bulk marks leave alone: it is
     /// deleted only when the user marks that row itself.
     pub kept: bool,
+    /// Why the row cannot be marked now (an Apple app, a running app).
+    pub locked: Option<String>,
+    /// Bundles of the other installed apps that use this folder too; it can
+    /// be marked only when all of them are marked.
+    pub shared_with: Vec<PathBuf>,
 }
 
 impl TRow {
@@ -126,6 +131,8 @@ pub struct Group {
     pub section: SectionKind,
     pub rows: Vec<TRow>,
     pub open: bool,
+    /// The app bundles of an Uninstall group (to see if the app is running).
+    pub bundles: Vec<PathBuf>,
 }
 
 impl Group {
@@ -273,6 +280,27 @@ fn place_row(root: &Arc<Node>, path: &Path, name: String) -> Option<Row> {
     }
 }
 
+/// A place of an app, with what bulk marks and marking need to know.
+struct PartSpec {
+    path: PathBuf,
+    label: String,
+    why: String,
+    /// Skipped by bulk marks: outside home (but not the app itself), or a
+    /// vendor folder other apps use.
+    bulk_skip: bool,
+    shared_with: Vec<PathBuf>,
+}
+
+struct GroupSpec {
+    section: SectionKind,
+    title: String,
+    subtitle: String,
+    last_used: i64,
+    lock: Option<String>,
+    bundles: Vec<PathBuf>,
+    parts: Vec<PartSpec>,
+}
+
 /// Add the Uninstall and Leftovers groups. Returns the note for an empty
 /// Leftovers page.
 fn add_app_groups(
@@ -281,42 +309,82 @@ fn add_app_groups(
     src: &BuildSource,
     closed: &HashSet<String>,
 ) -> Option<String> {
+    use crate::catalog::apppolicy::is_apple_id;
+    use crate::catalog::apps::vendor_of;
     use rayon::prelude::*;
-    // (section, title, label, subtitle, last_used, [(path, label, why)])
-    type Spec = (
-        SectionKind,
-        String,
-        String,
-        i64,
-        Vec<(PathBuf, String, String)>,
-    );
-    let mut specs: Vec<Spec> = Vec::new();
+    let mut specs: Vec<GroupSpec> = Vec::new();
     for g in &apps.installed {
-        specs.push((
-            SectionKind::Apps,
-            g.app.name.clone(),
-            g.app.version.clone(),
-            g.app.last_used,
-            g.parts
+        let bundles: Vec<PathBuf> = g
+            .parts
+            .iter()
+            .filter(|p| p.label == "app")
+            .map(|p| p.path.clone())
+            .collect();
+        let running = apps
+            .running
+            .iter()
+            .any(|r| bundles.iter().any(|b| r.starts_with(b)));
+        let lock = if is_apple_id(&g.app.id) {
+            Some(format!("{} is one of Apple's own apps", g.app.name))
+        } else if running {
+            Some(format!("{} is running: quit it first", g.app.name))
+        } else {
+            None
+        };
+        let vendor = vendor_of(&g.app.id);
+        let partners: Vec<PathBuf> = apps
+            .installed
+            .iter()
+            .filter(|o| o.app.path != g.app.path && vendor_of(&o.app.id) == vendor)
+            .map(|o| o.app.path.clone())
+            .collect();
+        specs.push(GroupSpec {
+            section: SectionKind::Apps,
+            title: g.app.name.clone(),
+            subtitle: g.app.version.clone(),
+            last_used: g.app.last_used,
+            lock,
+            bundles,
+            parts: g
+                .parts
                 .iter()
-                .map(|p| (p.path.clone(), p.label.clone(), p.label.clone()))
+                .map(|p| PartSpec {
+                    path: p.path.clone(),
+                    label: p.label.clone(),
+                    why: p.label.clone(),
+                    bulk_skip: (p.outside_home && p.label != "app") || p.shared_vendor,
+                    shared_with: if p.shared_vendor {
+                        partners.clone()
+                    } else {
+                        Vec::new()
+                    },
+                })
                 .collect(),
-        ));
+        });
     }
     let mut note = None;
     match &apps.leftovers {
         LeftoversState::Ready(found) => {
             for g in found {
-                specs.push((
-                    SectionKind::Leftovers,
-                    g.id.clone(),
-                    String::new(),
-                    0,
-                    g.parts
+                specs.push(GroupSpec {
+                    section: SectionKind::Leftovers,
+                    title: g.id.clone(),
+                    subtitle: String::new(),
+                    last_used: 0,
+                    lock: None,
+                    bundles: Vec::new(),
+                    parts: g
+                        .parts
                         .iter()
-                        .map(|p| (p.path.clone(), p.label.clone(), g.reason.clone()))
+                        .map(|p| PartSpec {
+                            path: p.path.clone(),
+                            label: p.label.clone(),
+                            why: g.reason.clone(),
+                            bulk_skip: p.outside_home,
+                            shared_with: Vec::new(),
+                        })
                         .collect(),
-                ));
+                });
             }
         }
         LeftoversState::Unavailable(why) => note = Some(why.clone()),
@@ -325,49 +393,53 @@ fn add_app_groups(
     let jobs: Vec<(usize, usize)> = specs
         .iter()
         .enumerate()
-        .flat_map(|(si, s)| (0..s.4.len()).map(move |pi| (si, pi)))
+        .flat_map(|(si, s)| (0..s.parts.len()).map(move |pi| (si, pi)))
         .collect();
     let rows: Vec<Option<Row>> = crate::bg::walk_pool().install(|| {
         jobs.par_iter()
             .map(|&(si, pi)| {
-                let (path, label, _) = &specs[si].4[pi];
-                let name = path
+                let p = &specs[si].parts[pi];
+                let name = p
+                    .path
                     .file_name()
-                    .map_or_else(|| label.clone(), |n| n.to_string_lossy().into_owned());
-                place_row(&src.root, path, name)
+                    .map_or_else(|| p.label.clone(), |n| n.to_string_lossy().into_owned());
+                place_row(&src.root, &p.path, name)
             })
             .collect()
     });
-    for (si, (section, title, subtitle, last_used, parts)) in specs.iter().enumerate() {
+    for (si, spec) in specs.into_iter().enumerate() {
         let mut trows = Vec::new();
-        for (pi, (path, label, why)) in parts.iter().enumerate() {
+        for (pi, p) in spec.parts.into_iter().enumerate() {
             let idx = jobs.iter().position(|&j| j == (si, pi)).unwrap_or(0);
             let Some(mut row) = rows[idx].clone() else {
                 continue;
             };
-            if *section == SectionKind::Apps {
-                row.mtime = *last_used; // "Last used" belongs to the app
+            if spec.section == SectionKind::Apps {
+                row.mtime = spec.last_used; // "Opened" belongs to the app
             }
             trows.push(TRow {
                 row,
                 kind: RowKind::Folder,
-                safety: src.policy.classify(path),
-                regen: format!("{label} of {title}"),
-                note: Some(why.clone()),
-                kept: false,
+                safety: src.policy.classify(&p.path),
+                regen: format!("{} of {}", p.label, spec.title),
+                note: Some(p.why),
+                kept: p.bulk_skip || spec.lock.is_some(),
+                locked: spec.lock.clone(),
+                shared_with: p.shared_with,
             });
         }
         if trows.is_empty() {
             continue;
         }
-        let key = format!("{section:?}:{title}");
+        let key = format!("{:?}:{}", spec.section, spec.title);
         groups.push(Group {
             open: !closed.contains(&key),
-            title: title.clone(),
-            label: title.clone(),
-            subtitle: subtitle.clone(),
-            section: *section,
+            label: spec.title.clone(),
+            title: spec.title,
+            subtitle: spec.subtitle,
+            section: spec.section,
             rows: trows,
+            bundles: spec.bundles,
         });
     }
     note
@@ -701,6 +773,8 @@ impl Targets {
                 regen: c.regen,
                 note: c.note,
                 kept: c.kept,
+                locked: None,
+                shared_with: Vec::new(),
             };
             match groups
                 .iter_mut()
@@ -714,6 +788,7 @@ impl Targets {
                     subtitle: c.subtitle,
                     section: c.section,
                     rows: vec![trow],
+                    bundles: Vec::new(),
                 }),
             }
         }

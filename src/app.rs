@@ -1784,6 +1784,82 @@ impl App {
         self.marks_changed();
     }
 
+    /// A locked row, or a folder other installed apps still use, cannot be
+    /// marked; say why. Unmarking is always allowed.
+    fn row_blocked(&mut self, t: &TRow, name: &str) -> bool {
+        if self.marks.contains_key(&t.row.path) {
+            return false;
+        }
+        if let Some(why) = &t.locked {
+            self.notice = Some(why.clone());
+            return true;
+        }
+        if !t.shared_with.is_empty()
+            && !t
+                .shared_with
+                .iter()
+                .all(|b| self.mark_state(b) != MarkState::Unmarked)
+        {
+            self.notice = Some(format!(
+                "{name} is used by other installed apps of the same vendor: mark all of them first"
+            ));
+            return true;
+        }
+        false
+    }
+
+    /// When the review opens: unmark what became unsafe since it was marked
+    /// (an app that started running, a shared folder whose other apps are no
+    /// longer marked). Returns how many marks were dropped.
+    fn recheck_app_marks(&mut self) -> usize {
+        let apps = self
+            .targets
+            .groups
+            .iter()
+            .any(|g| g.section == SectionKind::Apps);
+        if !apps || self.marks.is_empty() {
+            return 0;
+        }
+        let running = crate::catalog::apps::running_executables(self.runner.as_ref());
+        let mut drop: Vec<(PathBuf, String)> = Vec::new();
+        for g in self
+            .targets
+            .groups
+            .iter()
+            .filter(|g| g.section == SectionKind::Apps)
+        {
+            let is_running = running
+                .iter()
+                .any(|r| g.bundles.iter().any(|b| r.starts_with(b)));
+            for r in &g.rows {
+                if !self.marks.contains_key(&r.row.path) {
+                    continue;
+                }
+                if is_running {
+                    drop.push((r.row.path.clone(), format!("{} is running", g.title)));
+                } else if !r.shared_with.is_empty()
+                    && !r
+                        .shared_with
+                        .iter()
+                        .all(|b| self.mark_state(b) != MarkState::Unmarked)
+                {
+                    drop.push((
+                        r.row.path.clone(),
+                        "a shared folder is used by an app that is not marked".to_string(),
+                    ));
+                }
+            }
+        }
+        for (p, _) in &drop {
+            self.marks.remove(p);
+        }
+        if let Some((_, why)) = drop.first() {
+            self.notice = Some(format!("Unmarked {} item(s): {why}", drop.len()));
+            self.marks_changed();
+        }
+        drop.len()
+    }
+
     fn toggle_target_mark(&mut self) {
         match self.tlines.get(self.tcursor).copied() {
             Some(Line::Row { group, row }) => {
@@ -1791,6 +1867,9 @@ impl App {
                 let name = t.row.name.to_string_lossy().into_owned();
                 match &t.kind {
                     crate::targets::RowKind::Folder => {
+                        if self.row_blocked(&t, &name) {
+                            return;
+                        }
                         self.mark_path(
                             t.row.path.clone(),
                             Usage::new(t.row.size, t.row.disk),
@@ -1848,7 +1927,7 @@ impl App {
             .filter(|(i, g)| keep(*i, g))
             .flat_map(|(_, g)| g.rows.iter())
             // Commands and finished products are never swept up by a bulk mark.
-            .filter(|r| !r.is_command() && !r.kept)
+            .filter(|r| !r.is_command() && !r.kept && r.locked.is_none())
             .map(|r| (r.row.path.clone(), Usage::new(r.row.size, r.row.disk)))
             .collect()
     }
@@ -2087,11 +2166,14 @@ impl App {
         ) {
             return;
         }
+        let dropped = self.recheck_app_marks();
         let commands = self.review_commands();
         self.review_scroll = 0;
         self.review_seen_end = false;
         if self.marks.is_empty() && commands.is_empty() {
-            self.notice = Some("Nothing marked yet. Press space to mark items.".to_string());
+            if dropped == 0 {
+                self.notice = Some("Nothing marked yet. Press space to mark items.".to_string());
+            }
             return;
         }
         let mut items: Vec<ReviewItem> = self
@@ -6463,5 +6545,196 @@ mod apps_page_tests {
         assert_eq!(e.app.screen, Screen::Leftovers);
         e.app.update(Action::Menu(4));
         assert_eq!(e.app.screen, Screen::Uninstall);
+    }
+}
+
+#[cfg(test)]
+mod apps_marking_tests {
+    use super::*;
+    use crate::catalog::appfiles::AppPart;
+    use crate::catalog::apps::AppBundle;
+    use crate::catalog::appsdata::{AppGroup, AppsInput};
+    use crate::catalog::command::FakeRunner;
+    use crate::catalog::leftovers::LeftoversState;
+    use crate::testutil::{Env, env_with};
+
+    fn bundle(path: &Path, id: &str, name: &str) -> AppBundle {
+        AppBundle {
+            path: path.to_path_buf(),
+            id: id.to_string(),
+            name: name.to_string(),
+            version: String::new(),
+            executable: path.join("Contents/MacOS").join(name),
+            owner: "u".to_string(),
+            last_used: 1,
+        }
+    }
+
+    fn part(path: PathBuf, label: &str, outside: bool, shared: bool) -> AppPart {
+        AppPart {
+            path,
+            label: label.to_string(),
+            shared_vendor: shared,
+            outside_home: outside,
+        }
+    }
+
+    fn setup(groups: impl FnOnce(&Path) -> Vec<AppGroup>, running: Vec<PathBuf>) -> Env {
+        let mut e = env_with(
+            &[
+                ("A.app/Contents/x", 100),
+                ("B.app/Contents/x", 100),
+                ("Library/Caches/com.a.a/c", 50),
+                ("Library/Application Support/Vendor/v", 10),
+                ("Library/Daemon/d", 10),
+            ],
+            |_| {},
+        );
+        let installed = groups(&e.home);
+        e.app.apps_input = Some(Arc::new(AppsInput {
+            installed,
+            leftovers: LeftoversState::Ready(Vec::new()),
+            running,
+        }));
+        e.app.apps_started = true;
+        e.app.update(Action::GoTo(Screen::Uninstall));
+        e.app.settle_targets();
+        e
+    }
+
+    fn cursor_on_row(e: &mut Env, group: &str, name: &str) {
+        let idx = e
+            .app
+            .tlines
+            .iter()
+            .position(|l| match *l {
+                Line::Row { group: g, row } => {
+                    e.app.targets.groups[g].title == group
+                        && e.app.targets.row(g, row).row.name.to_string_lossy() == name
+                }
+                _ => false,
+            })
+            .expect("row not listed");
+        e.app.tcursor = idx;
+    }
+
+    fn cursor_on_group(e: &mut Env, group: &str) {
+        let idx = e
+            .app
+            .tlines
+            .iter()
+            .position(|l| matches!(*l, Line::Group(g) if e.app.targets.groups[g].title == group))
+            .expect("group not listed");
+        e.app.tcursor = idx;
+    }
+
+    fn two_apps(home: &Path) -> Vec<AppGroup> {
+        let (a, b) = (home.join("A.app"), home.join("B.app"));
+        let vendor = home.join("Library/Application Support/Vendor");
+        vec![
+            AppGroup {
+                app: bundle(&a, "com.v.a", "A"),
+                parts: vec![
+                    part(a.clone(), "app", false, false),
+                    part(home.join("Library/Caches/com.a.a"), "Caches", false, false),
+                    part(vendor.clone(), "Vendor folder", false, true),
+                    part(home.join("Library/Daemon"), "LaunchDaemons", true, false),
+                ],
+            },
+            AppGroup {
+                app: bundle(&b, "com.v.b", "B"),
+                parts: vec![part(b.clone(), "app", false, false)],
+            },
+        ]
+    }
+
+    #[test]
+    fn running_app_group_cannot_be_marked() {
+        let mut e = setup(two_apps, vec![PathBuf::new()]);
+        // Make A running: its executable is under its bundle.
+        let a = e.home.join("A.app");
+        e.app.apps_input = Some(Arc::new(AppsInput {
+            running: vec![a.join("Contents/MacOS/A")],
+            ..(*e.app.apps_input.clone().unwrap()).clone()
+        }));
+        e.app.rebuild_targets();
+        e.app.settle_targets();
+        cursor_on_row(&mut e, "A", "A.app");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.is_empty());
+        assert!(e.app.notice.as_deref().unwrap().contains("running"));
+        cursor_on_row(&mut e, "B", "B.app");
+        e.app.update(Action::ToggleMark);
+        assert_eq!(e.app.marks.len(), 1);
+    }
+
+    #[test]
+    fn header_mark_skips_outside_home_parts_and_shared_vendor_rows() {
+        let mut e = setup(two_apps, Vec::new());
+        cursor_on_group(&mut e, "A");
+        e.app.update(Action::ToggleMark);
+        let names: Vec<String> = e
+            .app
+            .marks
+            .keys()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"A.app".to_string()), "{names:?}");
+        assert!(names.contains(&"com.a.a".to_string()), "{names:?}");
+        assert!(!names.contains(&"Vendor".to_string()), "{names:?}");
+        assert!(!names.contains(&"Daemon".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn shared_vendor_folder_markable_when_all_vendor_apps_marked() {
+        let mut e = setup(two_apps, Vec::new());
+        cursor_on_row(&mut e, "A", "Vendor");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.is_empty());
+        assert!(
+            e.app
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("other installed apps")
+        );
+        for (g, n) in [("A", "A.app"), ("B", "B.app")] {
+            cursor_on_row(&mut e, g, n);
+            e.app.update(Action::ToggleMark);
+        }
+        cursor_on_row(&mut e, "A", "Vendor");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.keys().any(|p| p.ends_with("Vendor")));
+    }
+
+    #[test]
+    fn apple_row_refuses_with_notice() {
+        let mut e = setup(
+            |h| {
+                let a = h.join("A.app");
+                vec![AppGroup {
+                    app: bundle(&a, "com.apple.thing", "A"),
+                    parts: vec![part(a, "app", false, false)],
+                }]
+            },
+            Vec::new(),
+        );
+        cursor_on_row(&mut e, "A", "A.app");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.is_empty());
+        assert!(e.app.notice.as_deref().unwrap().contains("Apple"));
+    }
+
+    #[test]
+    fn review_rechecks_running() {
+        let mut e = setup(two_apps, Vec::new());
+        cursor_on_row(&mut e, "B", "B.app");
+        e.app.update(Action::ToggleMark);
+        assert_eq!(e.app.marks.len(), 1);
+        let exe = e.home.join("B.app/Contents/MacOS/B");
+        e.app.runner = Arc::new(FakeRunner::new(&[]).answering(&[("ps", exe.to_str().unwrap())]));
+        e.app.update(Action::OpenReview);
+        assert!(e.app.marks.is_empty(), "a running app is unmarked");
+        assert!(e.app.notice.as_deref().unwrap().contains("running"));
     }
 }
