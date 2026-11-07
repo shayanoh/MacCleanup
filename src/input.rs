@@ -47,6 +47,8 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
                 Screen::Explorer
                     | Screen::Targets
                     | Screen::Runtimes
+                    | Screen::Uninstall
+                    | Screen::Leftovers
                     | Screen::Docker
                     | Screen::DockerFiles
             ) =>

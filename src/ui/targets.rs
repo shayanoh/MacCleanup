@@ -42,7 +42,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let g = app.glyphs;
-    let title = format!(" {} Caches & Projects ", g.folder());
+    let page_name = match app.screen {
+        crate::app::Screen::Runtimes => "Runtimes",
+        crate::app::Screen::Uninstall => "Uninstall",
+        crate::app::Screen::Leftovers => "Leftovers",
+        _ => "Caches & Projects",
+    };
+    let title = format!(" {} {page_name} ", g.folder());
     let block = panel(&g, title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -69,7 +75,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             Rect::new(inner.x, inner.y + 2, inner.width, 1),
         );
     }
-    let c = cols(inner.width, &g);
+    let mut c = cols(inner.width, &g);
+    c.last_used = app.screen == crate::app::Screen::Uninstall;
     frame.render_widget(
         Paragraph::new(header_line(app.sort, &c, &g)),
         Rect::new(inner.x, inner.y + 2 + filter_h, inner.width, 1),
@@ -106,8 +113,17 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     if app.tlines.is_empty() {
         let msg = if app.filter.active() {
             "(nothing matches the filter)".to_string()
-        } else if app.targets_building() {
-            format!("(building the list{})", g.ellipsis())
+        } else if app.targets_building() || app.apps_looking() {
+            format!("(looking at the installed apps{})", g.ellipsis())
+        } else if let (crate::app::Screen::Leftovers, Some(why)) =
+            (app.screen, &app.targets.leftovers_note)
+        {
+            format!("(nothing is listed: {why})")
+        } else if matches!(
+            app.screen,
+            crate::app::Screen::Uninstall | crate::app::Screen::Leftovers
+        ) {
+            "(nothing found)".to_string()
         } else if app.scanner.is_idle() {
             "(nothing to clean was found in the scan)".to_string()
         } else {
@@ -351,6 +367,8 @@ fn section_line(app: &App, kind: SectionKind, width: usize) -> TextLine<'static>
         SectionKind::CargoBinaries => (" CARGO BINARIES", Color::LightRed),
         SectionKind::AndroidSdk => (" ANDROID SDK", Color::Green),
         SectionKind::Simulators => (" IOS SIMULATORS", Color::LightBlue),
+        SectionKind::Apps => (" INSTALLED APPS", Color::Green),
+        SectionKind::Leftovers => (" LEFT BEHIND BY REMOVED APPS", Color::Yellow),
     };
     let (mut disk, mut marked) = (0u64, 0usize);
     for grp in app.targets.groups.iter().filter(|x| x.section == kind) {
@@ -428,6 +446,7 @@ fn group_line(app: &App, gi: usize, c: &Cols) -> TextLine<'static> {
         app.sort,
         None,
         c.show_modified,
+        c.last_used,
         g,
     ));
     TextLine::from(spans)
@@ -539,6 +558,7 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
         app.sort,
         frees_text,
         c.show_modified,
+        c.last_used,
         g,
     ));
     if c.show_share {

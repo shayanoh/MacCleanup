@@ -92,6 +92,7 @@ fn docker_cols(width: u16, g: &Glyphs) -> DCols {
             name_w: cw.saturating_sub(fixed).max(4),
             show_share,
             show_modified: false,
+            last_used: false,
         },
         last_used,
         created: created_on,

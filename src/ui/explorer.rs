@@ -211,6 +211,9 @@ pub(super) struct Cols {
     pub show_share: bool,
     /// The Modified column fits without squeezing the names.
     pub show_modified: bool,
+    /// The fourth column is "Opened" (the app's last use, 0 = never) instead
+    /// of "Modified": the Uninstall page.
+    pub last_used: bool,
 }
 
 /// The widths of what sits left of the name: `(icon, mark, everything)`.
@@ -243,6 +246,7 @@ pub(super) fn cols(inner_width: u16, g: &Glyphs) -> Cols {
         name_w,
         show_share,
         show_modified,
+        last_used: false,
     }
 }
 
@@ -293,7 +297,14 @@ pub(super) fn header_line(sort: SortBy, c: &Cols, g: &Glyphs) -> Line<'static> {
     if c.show_modified {
         header.push(Span::raw(" "));
         header.push(Span::styled(
-            right(&format!("Modified{}", arrow(SortBy::Modified)), 10),
+            right(
+                &format!(
+                    "{}{}",
+                    if c.last_used { "Opened" } else { "Modified" },
+                    arrow(SortBy::Modified)
+                ),
+                10,
+            ),
             head_style(SortBy::Modified),
         ));
     }
@@ -311,6 +322,7 @@ pub(super) fn number_spans(
     sort: SortBy,
     frees_text: Option<String>,
     modified: bool,
+    last_used: bool,
     g: &Glyphs,
 ) -> Vec<Span<'static>> {
     // A queued folder has no numbers yet: show that, not a misleading 0 B.
@@ -343,6 +355,8 @@ pub(super) fn number_spans(
                 " {}",
                 if queued {
                     right(g.ellipsis(), 10)
+                } else if last_used && r.mtime <= 0 {
+                    right("never", 10)
                 } else {
                     right(&crate::fmt::ago(crate::fmt::now_secs(), r.mtime), 10)
                 }
@@ -417,7 +431,15 @@ fn row_line<'a>(
         name_style,
         name_style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
     ));
-    spans.extend(number_spans(&r, queued, app.sort, None, show_modified, g));
+    spans.extend(number_spans(
+        &r,
+        queued,
+        app.sort,
+        None,
+        show_modified,
+        false,
+        g,
+    ));
     if show_share {
         let color = if queued { DIM } else { Color::Yellow };
         spans.push(Span::styled(
@@ -654,5 +676,41 @@ mod tests {
         ] {
             assert_eq!(text_width(&text), 9);
         }
+    }
+
+    #[test]
+    fn opened_column_says_never_for_an_app_never_used() {
+        let g = Glyphs::new(GlyphMode::Ascii);
+        let mut c = cols(120, &g);
+        c.last_used = true;
+        let head: String = header_line(SortBy::Modified, &c, &g)
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(head.contains("Opened"), "{head}");
+        let row = Row {
+            name: "x".into(),
+            path: "/x".into(),
+            is_dir: true,
+            size: 1,
+            disk: 1,
+            files: 1,
+            scanning: false,
+            node: None,
+            space: None,
+            frees: None,
+            mtime: 0,
+        };
+        let cells: String = number_spans(&row, false, SortBy::Modified, None, true, true, &g)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(cells.contains("never"), "{cells}");
+        let plain: String = number_spans(&row, false, SortBy::Modified, None, true, false, &g)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(!plain.contains("never"));
     }
 }

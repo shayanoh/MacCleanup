@@ -222,7 +222,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Home => home::render(frame, main, app),
         Screen::Explorer => explorer::render(frame, main, app),
-        Screen::Targets | Screen::Runtimes => targets::render(frame, main, app),
+        Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => {
+            targets::render(frame, main, app)
+        }
         Screen::Docker => docker::render(frame, main, app),
         Screen::Snapshots => snapshots::render(frame, main, app),
         Screen::DockerFiles => docker_files::render(frame, main, app),
@@ -327,7 +329,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 "tab menu",
                 "q quit",
             ],
-            Screen::Targets | Screen::Runtimes => &[
+            Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => &[
                 "j/k move",
                 "h/l fold/open",
                 "/ filter",

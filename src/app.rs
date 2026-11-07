@@ -7,6 +7,7 @@ use ratatui::layout::Rect;
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
 use crate::bg::{Latest, Work};
+use crate::catalog::appsdata::{AppsInput, discover_apps};
 use crate::catalog::resolve::Places;
 use crate::catalog::runtimes::{RuntimeEntry, discover_slow};
 use crate::catalog::{
@@ -33,12 +34,26 @@ pub enum Screen {
     Targets,
     /// Packages & runtimes: the same list as `Targets`, showing the other sections.
     Runtimes,
+    /// Installed apps with their folders: the same list as `Targets`.
+    Uninstall,
+    /// Folders of apps that are gone: the same list as `Targets`.
+    Leftovers,
     Docker,
     /// Local Time Machine snapshots.
     Snapshots,
     /// Looking inside a Docker image or volume (opened from the Docker page).
     DockerFiles,
     Holding,
+}
+
+impl Screen {
+    /// The screens that show the shared Caches & Projects style list.
+    pub fn is_list(self) -> bool {
+        matches!(
+            self,
+            Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,11 +111,11 @@ pub const SIDEBAR: [SidebarEntry; 9] = [
     },
     SidebarEntry {
         label: "Leftovers",
-        screen: None,
+        screen: Some(Screen::Leftovers),
     },
     SidebarEntry {
         label: "Uninstall",
-        screen: None,
+        screen: Some(Screen::Uninstall),
     },
     SidebarEntry {
         label: "Caches & Projects",
@@ -537,6 +552,13 @@ pub struct App {
     /// Ids of commands that ran this session (see `BuildSource::ran`).
     ran_commands: HashSet<String>,
     tools_started: bool,
+    /// Apps and leftovers for the Uninstall and Leftovers pages (read once).
+    apps_input: Option<Arc<AppsInput>>,
+    apps_rx: Option<mpsc::Receiver<AppsInput>>,
+    apps_started: bool,
+    /// Where installed apps are looked for, and the system `/Library`.
+    apps_roots: Vec<std::path::PathBuf>,
+    apps_lib: std::path::PathBuf,
     /// Keys of the groups the user folded (kept across rebuilds).
     closed_groups: HashSet<String>,
     targets_synced: bool,
@@ -645,6 +667,7 @@ impl App {
         accounting.set_pending(holding.total().unwrap_or_default());
         let free_now = volume::free_space(&root.path).unwrap_or(0);
         let total_space = volume::total_space(&root.path).unwrap_or(0);
+        let apps_roots_default = crate::catalog::appsdata::default_roots(policy.home());
         let mut app = App {
             screen: Screen::Home,
             // The menu starts focused so j/k and Enter work straight away.
@@ -700,6 +723,11 @@ impl App {
             runtime_extra: Vec::new(),
             ran_commands: HashSet::new(),
             tools_started: false,
+            apps_input: None,
+            apps_rx: None,
+            apps_started: false,
+            apps_roots: apps_roots_default,
+            apps_lib: std::path::PathBuf::from("/Library"),
             closed_groups: HashSet::new(),
             targets_synced: false,
             targets_job: Latest::new(),
@@ -740,6 +768,18 @@ impl App {
     /// Use another way of running tool commands (tests pass a fake).
     pub fn with_runner(mut self, runner: Arc<dyn CommandRunner>) -> App {
         self.runner = runner;
+        self
+    }
+
+    /// Where the Uninstall and Leftovers pages look for apps (tests point
+    /// this at a sandbox).
+    pub fn with_app_roots(
+        mut self,
+        roots: Vec<std::path::PathBuf>,
+        lib: std::path::PathBuf,
+    ) -> App {
+        self.apps_roots = roots;
+        self.apps_lib = lib;
         self
     }
 
@@ -889,6 +929,8 @@ impl App {
             Screen::Explorer
                 | Screen::Targets
                 | Screen::Runtimes
+                | Screen::Uninstall
+                | Screen::Leftovers
                 | Screen::Docker
                 | Screen::DockerFiles
         ) {
@@ -1282,6 +1324,7 @@ impl App {
             self.refresh_free();
         }
         self.poll_discovery();
+        self.poll_apps();
         self.process_refresh();
         self.poll_targets();
         self.poll_docker();
@@ -1369,19 +1412,12 @@ impl App {
     fn goto(&mut self, screen: Screen) {
         self.filter.editing = false;
         // The filter belongs to one list; it does not follow to another screen.
-        let own_filter = |s: Screen| {
-            matches!(
-                s,
-                Screen::Targets | Screen::Runtimes | Screen::Docker | Screen::DockerFiles
-            )
-        };
+        let own_filter =
+            |s: Screen| s.is_list() || matches!(s, Screen::Docker | Screen::DockerFiles);
         if (own_filter(self.screen) || own_filter(screen)) && self.screen != screen {
             self.reset_filter();
         }
-        let switching = matches!(
-            (self.screen, screen),
-            (Screen::Targets, Screen::Runtimes) | (Screen::Runtimes, Screen::Targets)
-        );
+        let switching = self.screen != screen && self.screen.is_list() && screen.is_list();
         self.screen = screen;
         self.transition_start = self.tick;
         if switching {
@@ -1401,6 +1437,10 @@ impl App {
                 self.start_discovery();
                 self.rebuild_targets();
             }
+            Screen::Uninstall | Screen::Leftovers => {
+                self.start_apps_discovery();
+                self.rebuild_targets();
+            }
             Screen::Docker => self.reload_docker(),
             Screen::Snapshots => self.reload_snapshots(),
             Screen::DockerFiles | Screen::Home => {}
@@ -1414,6 +1454,8 @@ impl App {
                 let order = [
                     Screen::Home,
                     Screen::Explorer,
+                    Screen::Leftovers,
+                    Screen::Uninstall,
                     Screen::Targets,
                     Screen::Docker,
                     Screen::Snapshots,
@@ -1443,7 +1485,7 @@ impl App {
             (_, Screen::Docker) => self.docker_move(delta),
             (_, Screen::Snapshots) => self.snap_move(delta),
             (_, Screen::DockerFiles) => self.browse_move(delta),
-            (_, Screen::Targets | Screen::Runtimes) => {
+            (_, Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers) => {
                 self.tcursor = step(self.tcursor, delta, self.tlines.len());
                 self.ensure_visible();
                 self.request_holders();
@@ -1493,10 +1535,7 @@ impl App {
             return;
         }
         let whole =
-            all || matches!(
-                self.screen,
-                Screen::Home | Screen::Targets | Screen::Runtimes
-            ) || self.stack.len() == 1;
+            all || self.screen == Screen::Home || self.screen.is_list() || self.stack.len() == 1;
         if whole {
             let root_path = self.stack[0].path.clone();
             let Some(root) = self.scanner.rescan_all(&root_path) else {
@@ -1595,7 +1634,9 @@ impl App {
                 let name = row.name.to_string_lossy().into_owned();
                 self.mark_path(path, usage, &name);
             }
-            Screen::Targets | Screen::Runtimes => self.toggle_target_mark(),
+            Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => {
+                self.toggle_target_mark()
+            }
             Screen::Docker => self.toggle_docker_mark(),
             Screen::Snapshots => self.toggle_snapshot_mark(),
             _ => {}
@@ -1658,15 +1699,16 @@ impl App {
 
     /// Is this the Caches & Projects list or the Packages & runtimes one?
     pub fn on_targets(&self) -> bool {
-        matches!(self.screen, Screen::Targets | Screen::Runtimes)
+        self.screen.is_list()
     }
 
     /// Which sections of the list the current screen shows.
     pub fn page(&self) -> crate::targets::Page {
-        if self.screen == Screen::Runtimes {
-            crate::targets::Page::Runtimes
-        } else {
-            crate::targets::Page::Caches
+        match self.screen {
+            Screen::Runtimes => crate::targets::Page::Runtimes,
+            Screen::Uninstall => crate::targets::Page::Uninstall,
+            Screen::Leftovers => crate::targets::Page::Leftovers,
+            _ => crate::targets::Page::Caches,
         }
     }
 
@@ -2038,6 +2080,8 @@ impl App {
             Screen::Explorer
                 | Screen::Targets
                 | Screen::Runtimes
+                | Screen::Uninstall
+                | Screen::Leftovers
                 | Screen::Docker
                 | Screen::Snapshots
         ) {
@@ -2197,7 +2241,7 @@ impl App {
                         self.held_cursor = idx;
                     }
                 }
-                Screen::Targets | Screen::Runtimes => {
+                Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => {
                     let idx = self.toffset + i;
                     if idx < self.tlines.len() {
                         if idx == self.tcursor {
@@ -2242,6 +2286,40 @@ impl App {
         self.tools_rx = Some(rx);
     }
 
+    /// Read the installed apps and the leftovers once, on a thread.
+    fn start_apps_discovery(&mut self) {
+        if self.apps_started {
+            return;
+        }
+        self.apps_started = true;
+        let (tx, rx) = mpsc::channel();
+        let runner = Arc::clone(&self.runner);
+        let home = self.policy.home().to_path_buf();
+        let (roots, lib) = (self.apps_roots.clone(), self.apps_lib.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(discover_apps(&home, &lib, &roots, runner.as_ref()));
+        });
+        self.apps_rx = Some(rx);
+    }
+
+    fn poll_apps(&mut self) {
+        let Some(rx) = &self.apps_rx else { return };
+        match rx.try_recv() {
+            Ok(input) => {
+                self.apps_input = Some(Arc::new(input));
+                self.apps_rx = None;
+                self.rebuild_targets();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.apps_rx = None,
+        }
+    }
+
+    /// Is the look for installed apps still running?
+    pub fn apps_looking(&self) -> bool {
+        self.apps_rx.is_some()
+    }
+
     fn poll_discovery(&mut self) {
         let Some(rx) = &self.tools_rx else { return };
         match rx.try_recv() {
@@ -2278,6 +2356,7 @@ impl App {
             runtime_extra: self.runtime_extra.clone(),
             ran: self.ran_commands.clone(),
             closed: self.closed_groups.clone(),
+            apps: self.apps_input.clone(),
         };
         let work = Arc::clone(&self.build_work);
         work.begin("starting", 3);
@@ -2450,7 +2529,7 @@ impl App {
                 self.docker.cursor = group;
                 self.ensure_visible();
             }
-            Screen::Targets | Screen::Runtimes => {
+            Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => {
                 // `usize::MAX` stands for the project's header line.
                 let wanted = if row == usize::MAX {
                     Line::Group(group)
@@ -3281,9 +3360,10 @@ mod tests {
         assert_eq!(app.screen, Screen::Home);
         app.update(Action::Click { x: 2, y: 2 }); // Explorer
         assert_eq!(app.screen, Screen::Explorer);
-        app.update(Action::Click { x: 2, y: 3 }); // Leftovers: not built yet
-        assert_eq!(app.screen, Screen::Explorer);
-        assert!(app.notice.is_some());
+        app.update(Action::Click { x: 2, y: 3 }); // Leftovers
+        assert_eq!(app.screen, Screen::Leftovers);
+        app.update(Action::Click { x: 2, y: 4 }); // Uninstall
+        assert_eq!(app.screen, Screen::Uninstall);
     }
 
     #[test]
@@ -3306,6 +3386,10 @@ mod tests {
         assert_eq!(app.screen, Screen::Home);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Explorer);
+        app.update(Action::Down);
+        assert_eq!(app.screen, Screen::Leftovers);
+        app.update(Action::Down);
+        assert_eq!(app.screen, Screen::Uninstall);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Targets);
         app.update(Action::Down);
@@ -6352,5 +6436,32 @@ mod runtime_page_tests {
         cursor_on(&mut e.app, Some(SectionKind::Simulators), None);
         e.app.update(Action::ToggleMark);
         assert_eq!(e.app.tool_marks.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod apps_page_tests {
+    use super::*;
+    use crate::targets::Page;
+    use crate::testutil::env_with;
+
+    #[test]
+    fn page_for_screen() {
+        let mut e = env_with(&[], |_| {});
+        e.app.update(Action::GoTo(Screen::Uninstall));
+        assert_eq!(e.app.page(), Page::Uninstall);
+        e.app.update(Action::GoTo(Screen::Leftovers));
+        assert_eq!(e.app.page(), Page::Leftovers);
+        e.app.update(Action::GoTo(Screen::Targets));
+        assert_eq!(e.app.page(), Page::Caches);
+    }
+
+    #[test]
+    fn menu_digits_open_the_two_pages() {
+        let mut e = env_with(&[], |_| {});
+        e.app.update(Action::Menu(3));
+        assert_eq!(e.app.screen, Screen::Leftovers);
+        e.app.update(Action::Menu(4));
+        assert_eq!(e.app.screen, Screen::Uninstall);
     }
 }
