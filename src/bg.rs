@@ -75,6 +75,28 @@ impl<T: Send + 'static> Default for Latest<T> {
     }
 }
 
+/// The threads for long background walks over many files (measuring a
+/// snapshot, sizing a pnpm store). They must not use rayon's global pool:
+/// the UI thread's own parallel work (`Scanner::fill_frees`) is queued behind
+/// a running walk there, and the screen froze for as long as the walk lasted
+/// (47 s measured). Half the cores, so the UI keeps some.
+pub fn walk_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = thread::available_parallelism().map_or(2, |n| n.get());
+        let build = |n: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .thread_name(|i| format!("maccleanup-walk-{i}"))
+                .build()
+        };
+        // If the system will not give that many threads, try one.
+        build((cores / 2).clamp(2, 8))
+            .or_else(|_| build(1))
+            .expect("could not start a thread for background work")
+    })
+}
+
 /// Progress of one piece of background work, readable from the UI thread:
 /// what it is doing, and how far along when the number of steps is known.
 pub struct Work {
@@ -231,5 +253,37 @@ mod tests {
             w.step();
         }
         assert_eq!(w.snapshot().fraction(), Some(1.0));
+    }
+
+    #[test]
+    fn a_busy_walk_pool_does_not_block_the_global_pool() {
+        use rayon::prelude::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use std::time::Duration;
+        let pool = walk_pool();
+        let release = Arc::new(AtomicBool::new(false));
+        // Keep every walk worker busy, as a long snapshot measurement does.
+        for _ in 0..pool.current_num_threads() * 2 {
+            let r = Arc::clone(&release);
+            pool.spawn(move || {
+                while !r.load(Relaxed) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            });
+        }
+        // What the UI thread does in `Scanner::fill_frees`.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut rows = vec![0u8; 50];
+            rows.par_iter_mut().for_each(|r| *r += 1);
+            let _ = tx.send(());
+        });
+        let done = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        release.store(true, Relaxed);
+        assert!(
+            done,
+            "parallel work on the global pool waited for the walk pool"
+        );
     }
 }

@@ -11,6 +11,7 @@
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -197,6 +198,50 @@ pub struct Held {
     pub high: u64,
 }
 
+/// How far a measurement has got, readable by the UI while it runs: files
+/// looked at and bytes found so far in the snapshot being measured, and which
+/// snapshot that is of how many.
+#[derive(Default)]
+pub struct Progress {
+    files: AtomicU64,
+    low: AtomicU64,
+    high: AtomicU64,
+    index: AtomicU64,
+    of: AtomicU64,
+}
+
+impl Progress {
+    pub fn new() -> Arc<Progress> {
+        Arc::new(Progress::default())
+    }
+
+    /// Begin snapshot number `index` (from 0) of `of`: the counts start again.
+    pub fn start(&self, index: u64, of: u64) {
+        self.files.store(0, Relaxed);
+        self.low.store(0, Relaxed);
+        self.high.store(0, Relaxed);
+        self.index.store(index, Relaxed);
+        self.of.store(of, Relaxed);
+    }
+
+    pub fn files(&self) -> u64 {
+        self.files.load(Relaxed)
+    }
+
+    /// The bytes found so far.
+    pub fn held(&self) -> Held {
+        Held {
+            low: self.low.load(Relaxed),
+            high: self.high.load(Relaxed),
+        }
+    }
+
+    /// `(index, of)`: the snapshot being measured (from 0) and how many there are.
+    pub fn position(&self) -> (u64, u64) {
+        (self.index.load(Relaxed), self.of.load(Relaxed))
+    }
+}
+
 /// What one estimate needs, shared by the walking threads.
 struct Estimate<'a> {
     live: &'a Path,
@@ -204,8 +249,7 @@ struct Estimate<'a> {
     /// The other snapshots' folders: what they also hold is not private.
     others: &'a [PathBuf],
     cancel: &'a AtomicBool,
-    low: AtomicU64,
-    high: AtomicU64,
+    progress: &'a Progress,
 }
 
 /// What the snapshot at `snap` holds that `live` no longer does, and no
@@ -213,11 +257,13 @@ struct Estimate<'a> {
 /// Size). A file gone from `live` counts in full; one rewritten counts what
 /// the live copy does not still share with it; one that was renamed or moved
 /// (same inode elsewhere) counts only in `high`; an unchanged one counts
-/// nothing. `None` if `cancel` was set.
+/// nothing. `progress` counts as it goes and must be fresh (`Progress::start`)
+/// for each snapshot. `None` if `cancel` was set.
 pub fn estimate_held(
     snap: &Path,
     live: &Path,
     others: &[PathBuf],
+    progress: &Progress,
     cancel: &AtomicBool,
 ) -> Option<Held> {
     let est = Estimate {
@@ -225,14 +271,10 @@ pub fn estimate_held(
         vol: volume_of(live),
         others,
         cancel,
-        low: AtomicU64::new(0),
-        high: AtomicU64::new(0),
+        progress,
     };
-    rayon::scope(|s| walk(snap, snap.to_path_buf(), &est, s));
-    (!cancel.load(Relaxed)).then(|| Held {
-        low: est.low.load(Relaxed),
-        high: est.high.load(Relaxed),
-    })
+    crate::bg::walk_pool().scope(|s| walk(snap, snap.to_path_buf(), &est, s));
+    (!cancel.load(Relaxed)).then(|| progress.held())
 }
 
 fn walk<'s>(root: &'s Path, dir: PathBuf, est: &'s Estimate<'s>, s: &rayon::Scope<'s>) {
@@ -253,8 +295,9 @@ fn walk<'s>(root: &'s Path, dir: PathBuf, est: &'s Estimate<'s>, s: &rayon::Scop
             && let Ok(rel) = path.strip_prefix(root)
         {
             let (low, high) = held_by_file(&meta, rel, est);
-            est.low.fetch_add(low, Relaxed);
-            est.high.fetch_add(high, Relaxed);
+            est.progress.files.fetch_add(1, Relaxed);
+            est.progress.low.fetch_add(low, Relaxed);
+            est.progress.high.fetch_add(high, Relaxed);
         }
     }
 }
@@ -377,6 +420,7 @@ pub fn measure(
     runner: &dyn CommandRunner,
     date: &str,
     all: &[String],
+    progress: &Progress,
     cancel: &AtomicBool,
 ) -> Result<Held, String> {
     if !valid_date(date) {
@@ -390,7 +434,7 @@ pub fn measure(
         .filter_map(|d| mount(runner, d).ok())
         .collect();
     let paths: Vec<PathBuf> = others.iter().map(|m| m.path.clone()).collect();
-    let result = estimate_held(&target.path, Path::new(LIVE_ROOT), &paths, cancel)
+    let result = estimate_held(&target.path, Path::new(LIVE_ROOT), &paths, progress, cancel)
         .ok_or_else(|| "cancelled".to_string());
     for m in others {
         unmount(runner, m);
@@ -507,9 +551,15 @@ mod tests {
         // rewritten since: its old bytes are held
         write(&snap.join("changed"), 30_000);
         write(&live.join("changed"), 50_000);
-        let held = estimate_held(&snap, &live, &[], &AtomicBool::new(false))
-            .unwrap()
-            .low;
+        let held = estimate_held(
+            &snap,
+            &live,
+            &[],
+            &Progress::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .low;
         assert!(held >= 70_000, "{held}");
         assert!(
             held < 70_000 + 3 * 4096 * 2,
@@ -545,12 +595,38 @@ mod tests {
         write(&a.join("only_a"), 40_000);
         fs::create_dir_all(&live).unwrap();
         let stop = AtomicBool::new(false);
-        let alone = estimate_held(&a, &live, &[], &stop).unwrap().low;
-        let with_b = estimate_held(&a, &live, std::slice::from_ref(&b), &stop)
+        let alone = estimate_held(&a, &live, &[], &Progress::default(), &stop)
             .unwrap()
             .low;
+        let with_b = estimate_held(
+            &a,
+            &live,
+            std::slice::from_ref(&b),
+            &Progress::default(),
+            &stop,
+        )
+        .unwrap()
+        .low;
         assert!(alone >= 80_000, "{alone}");
         assert!((40_000..40_000 + 2 * 4096).contains(&with_b), "{with_b}");
+    }
+
+    #[test]
+    fn progress_counts_files_and_bytes_and_restarts_per_snapshot() {
+        let t = tempfile::tempdir().unwrap();
+        let (snap, live) = (t.path().join("snap"), t.path().join("live"));
+        for n in 0..5 {
+            write(&snap.join(format!("d/f{n}")), 20_000);
+        }
+        fs::create_dir_all(&live).unwrap();
+        let p = Progress::default();
+        p.start(1, 3);
+        assert_eq!(p.position(), (1, 3));
+        estimate_held(&snap, &live, &[], &p, &AtomicBool::new(false)).unwrap();
+        assert_eq!(p.files(), 5);
+        assert!(p.held().low >= 100_000, "{:?}", p.held());
+        p.start(2, 3);
+        assert_eq!((p.files(), p.held()), (0, Held::default()));
     }
 
     #[test]
@@ -559,7 +635,13 @@ mod tests {
         write(&t.path().join("snap/a"), 10);
         let stop = AtomicBool::new(true);
         assert_eq!(
-            estimate_held(&t.path().join("snap"), &t.path().join("live"), &[], &stop),
+            estimate_held(
+                &t.path().join("snap"),
+                &t.path().join("live"),
+                &[],
+                &Progress::default(),
+                &stop
+            ),
             None
         );
     }

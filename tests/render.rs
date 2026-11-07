@@ -3143,3 +3143,19 @@ fn time_machine_page_is_ascii_in_ascii_mode() {
         assert!(c.is_ascii(), "non-ascii cell {c:?}");
     }
 }
+
+#[test]
+fn time_machine_heading_is_the_select_all_row_and_measuring_shows_state() {
+    let mut e = snapshots_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 120, 30);
+    assert!(t.contains("TIME MACHINE"), "{t}");
+    assert!(t.contains("1 snapshot"), "{t}");
+    e.app.update(Action::Up);
+    e.app.update(Action::ToggleMark);
+    let marked = render(&mut e.app, 120, 30);
+    assert!(marked.contains("1 marked"), "{marked}");
+    e.app.snaps.measuring = vec!["2026-11-07-032842".to_string()];
+    e.app.snaps.progress.start(0, 1);
+    let measuring = render(&mut e.app, 120, 30);
+    assert!(measuring.contains("mounting..."), "{measuring}");
+}

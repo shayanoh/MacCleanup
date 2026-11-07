@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
 use super::*;
-use crate::snapshots::{self, Held, Settle, Snapshot};
+use crate::snapshots::{self, Held, Progress, Settle, Snapshot};
 
 /// Is this key in the shared selection a snapshot's?
 pub fn is_snapshot_id(id: &str) -> bool {
@@ -33,6 +33,8 @@ pub struct SnapState {
     pub measure: Latest<Measured>,
     pub cancel: Arc<AtomicBool>,
     pub measuring: Vec<String>,
+    /// Files looked at and bytes found so far by the running measurement.
+    pub progress: Arc<Progress>,
     pub settle: Settle,
 }
 
@@ -50,12 +52,20 @@ impl SnapState {
             measure: Latest::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             measuring: Vec::new(),
+            progress: Progress::new(),
             settle: Settle::default(),
         }
     }
 
+    /// The snapshot under the cursor; `None` on the heading (cursor 0), which
+    /// stands for all of them.
     pub fn selected(&self) -> Option<&Snapshot> {
-        self.items.get(self.cursor)
+        self.cursor.checked_sub(1).and_then(|i| self.items.get(i))
+    }
+
+    /// How many list rows there are: the heading and one per snapshot.
+    pub fn rows(&self) -> usize {
+        self.items.len() + 1
     }
 
     /// Sum of the sizes measured so far, and how many Time Machine snapshots
@@ -113,11 +123,12 @@ impl App {
                 }
                 None => {}
             }
+            // The first read puts the cursor on the first snapshot, not the heading.
+            if !self.snaps.loaded && !self.snaps.items.is_empty() {
+                self.snaps.cursor = 1;
+            }
             self.snaps.loaded = true;
-            self.snaps.cursor = self
-                .snaps
-                .cursor
-                .min(self.snaps.items.len().saturating_sub(1));
+            self.snaps.cursor = self.snaps.cursor.min(self.snaps.items.len());
         }
         if !self.snaps.job.pending && self.snaps.stale {
             self.reload_snapshots();
@@ -147,18 +158,23 @@ impl App {
     }
 
     pub(super) fn snap_move(&mut self, delta: i64) {
-        self.snaps.cursor = step(self.snaps.cursor, delta, self.snaps.items.len());
+        self.snaps.cursor = step(self.snaps.cursor, delta, self.snaps.rows());
     }
 
     pub(super) fn snap_click(&mut self, row: usize) {
         let idx = self.snaps.offset + row;
-        if idx < self.snaps.items.len() {
+        if idx < self.snaps.rows() {
             self.snaps.cursor = idx;
         }
     }
 
-    /// Space: mark or unmark the selected snapshot for deletion.
+    /// Space: mark or unmark the selected snapshot for deletion (on the
+    /// heading: all of them).
     pub(super) fn toggle_snapshot_mark(&mut self) {
+        if self.snaps.cursor == 0 {
+            self.mark_all_snapshots();
+            return;
+        }
         let Some(snap) = self.snaps.selected() else {
             return;
         };
@@ -193,7 +209,7 @@ impl App {
         if self.screen != Screen::Snapshots {
             return;
         }
-        let dates: Vec<String> = if all {
+        let dates: Vec<String> = if all || self.snaps.cursor == 0 {
             self.snaps.dates()
         } else {
             self.snaps
@@ -212,14 +228,19 @@ impl App {
         }
         let runner = Arc::clone(&self.runner);
         let every = self.snaps.dates();
+        let progress = Arc::clone(&self.snaps.progress);
+        progress.start(0, dates.len() as u64);
         let cancel = Arc::new(AtomicBool::new(false));
         self.snaps.cancel = Arc::clone(&cancel);
         self.snaps.measuring = dates.clone();
         self.snaps.measure.spawn(move || {
+            let of = dates.len() as u64;
             dates
                 .into_iter()
-                .map(|d| {
-                    let r = snapshots::measure(&*runner, &d, &every, &cancel);
+                .enumerate()
+                .map(|(i, d)| {
+                    progress.start(i as u64, of);
+                    let r = snapshots::measure(&*runner, &d, &every, &progress, &cancel);
                     (d, r)
                 })
                 .collect()
@@ -324,10 +345,22 @@ mod tests {
         assert!(e.app.tool_marks.contains("snapshot:2026-11-06-020608"));
         e.app.update(Action::ToggleMark);
         assert!(e.app.tool_marks.is_empty(), "again unmarks");
-        e.app.snaps.cursor = 2;
+        e.app.snaps.cursor = 3;
         e.app.update(Action::ToggleMark);
         assert!(e.app.tool_marks.is_empty());
         assert!(e.app.notice.as_deref().unwrap().contains("Time Machine"));
+    }
+
+    #[test]
+    fn space_on_the_heading_marks_every_time_machine_snapshot() {
+        let mut e = loaded(runner());
+        assert_eq!(e.app.snaps.cursor, 1, "the first read starts on a snapshot");
+        e.app.update(Action::Up);
+        assert_eq!(e.app.snaps.cursor, 0, "the heading is the row above");
+        e.app.update(Action::ToggleMark);
+        assert_eq!(e.app.tool_marks.len(), 2, "never the system snapshot");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.tool_marks.is_empty(), "again unmarks all");
     }
 
     #[test]

@@ -76,6 +76,7 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 
 ### Responsiveness and background work
 
+- Long walks over many files (snapshot measuring, pnpm store sizing) run on `bg::walk_pool()`, never on rayon's global pool: `Scanner::fill_frees` runs there on the UI thread and queued behind a snapshot walk for 47 s (the screen froze; reproduced and tested by `bg::tests::a_busy_walk_pool_does_not_block_the_global_pool`).
 - Nothing slow may run on the UI thread. Moves and permanent deletes are `DeleteJob`s (`jobs.rs`): `start` for review deletes, `empty_held` for ToBeDeleted. A permanent delete is `Holding::delete_forever_with`, which uses the parallel `remove_tree` and publishes `DeleteCounters`; the job thread turns those into `Progress` events (fraction = bytes done / `of`). The manifest lock is never held while files are removed.
 - Background work: any request that can repeat (list rebuilds, set-wise space) must go through `bg::Latest`, and a caller that can fire every tick must not start a new job while one is `pending` (remember the request and rerun once: see `App::rebuild_targets`). Starting a job per tick makes every result stale before it lands and hammers the clone-table locks the UI thread also needs. Show what a job is doing with `bg::Work` and a bar (`fmt::eighths_bar` for known steps, `fmt::marquee` for unknown).
 

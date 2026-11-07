@@ -388,16 +388,19 @@ pub(crate) fn unused_in_store(store: &Path) -> u64 {
         return 0;
     };
     let shards: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
-    shards
-        .par_iter()
-        .map(|d| {
-            let mut t = 0;
-            if d.is_dir() {
-                walk(d, &mut t);
-            }
-            t
-        })
-        .sum()
+    // Not the global pool: see `bg::walk_pool`.
+    crate::bg::walk_pool().install(|| {
+        shards
+            .par_iter()
+            .map(|d| {
+                let mut t = 0;
+                if d.is_dir() {
+                    walk(d, &mut t);
+                }
+                t
+            })
+            .sum()
+    })
 }
 
 fn unused_note(store: &Path) -> String {

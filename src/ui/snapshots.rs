@@ -1,22 +1,55 @@
-//! The Time Machine page: one row per local snapshot with a mark box, its
-//! date, what deleting it would free (about, once measured) and its kind.
-//! The total held by all snapshots is the scan's exact figure.
+//! The Time Machine page. It looks like the Docker page: a colored heading
+//! bar that is also the select-all row, then one row per local snapshot with
+//! a mark box, an icon, a safety dot, its date, what deleting it would free
+//! (a range, once measured) and its kind. The total held by all snapshots is
+//! the scan's exact figure.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
-use super::{ACCENT, CAUTION, DANGER, DIM, SELECTED_BG, fit, pad, panel, right};
+use super::{
+    ACCENT, CAUTION, DANGER, DIM, SAFE, SELECTED_BG, fit, fit_pad, pad, panel, right, safety_color,
+    safety_dot,
+};
 use crate::app::App;
 use crate::fmt::human_size;
-use crate::snapshots::Held;
+use crate::safety::Safety;
+use crate::snapshots::{Held, Snapshot};
 
 /// `730 MB - 1.2 GB`, or one size when both ends read the same.
 fn range(h: &Held) -> String {
     let (lo, hi) = (human_size(h.low), human_size(h.high));
     if lo == hi { lo } else { format!("{lo} - {hi}") }
+}
+
+/// `950`, `12k`, `3.1M`: a file count in a few characters.
+fn count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{}k", n / 1_000),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// What a snapshot's size cell says while it is being measured: the walk's
+/// count of files and bytes so far for the one running, "waiting" for the rest.
+fn measuring_text(app: &App, date: &str) -> String {
+    let (index, _) = app.snaps.progress.position();
+    if app.snaps.measuring.get(index as usize).map(String::as_str) != Some(date) {
+        return "waiting...".to_string();
+    }
+    let files = app.snaps.progress.files();
+    if files == 0 {
+        return "mounting...".to_string();
+    }
+    format!(
+        "{} files, {}",
+        count(files),
+        human_size(app.snaps.progress.held().low)
+    )
 }
 
 /// `2026-11-07-032842` shown as `2026-11-07 03:28:42`.
@@ -43,18 +76,18 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     app.ensure_visible();
 
     let held = app.stack.first().map_or(0, |n| n.snapshot_held());
-    let (measured, count) = app.snaps.measured_total();
+    let (measured, measured_count) = app.snaps.measured_total();
     let mut totals = format!(
         "held by snapshots {} {} (the scan's total)",
         g.dot(),
         human_size(held)
     );
-    if count > 0 {
+    if measured_count > 0 {
         totals.push_str(&format!(
             " {} measured {} in {} snapshot(s)",
             g.dot(),
             range(&measured),
-            count
+            measured_count
         ));
     }
     frame.render_widget(
@@ -64,30 +97,39 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         )),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
-    let free = format!(
-        "free now {} {} at start {}",
-        human_size(app.free_now),
-        g.dot(),
-        human_size(app.accounting.free_at_start())
-    );
     let settling = if app.snaps.settle.active(app.tick) {
         " (space is being released, updating)"
     } else {
         ""
     };
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            fit(&format!("{free}{settling}"), width, &g),
+    let free = Line::from(vec![
+        Span::styled("free now ", Style::default().fg(DIM)),
+        Span::styled(
+            human_size(app.free_now),
+            Style::default().fg(SAFE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                " {} at start {}{settling}",
+                g.dot(),
+                human_size(app.accounting.free_at_start())
+            ),
             Style::default().fg(DIM),
-        )),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(free),
         Rect::new(inner.x, inner.y + 1, inner.width, 1),
     );
 
+    // Columns: cursor, mark box, icon, safety dot, name, size, kind.
     let size_w = 20;
-    let kind_w = 17;
-    let name_w = width.saturating_sub(4 + size_w + kind_w + 2).max(8);
+    let kind_w = 14;
+    let prefix_w = 2 + 2 + 2 + 2;
+    let name_w = width.saturating_sub(prefix_w + size_w + kind_w + 2).max(8);
     let header = format!(
-        "    {} {} {}",
+        "{}{} {} {}",
+        " ".repeat(prefix_w),
         pad("Snapshot".to_string(), name_w),
         right("Frees (about)", size_w),
         pad("Kind".to_string(), kind_w)
@@ -117,52 +159,18 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             list,
         );
     } else {
-        let start = app.snaps.offset.min(app.snaps.items.len());
-        let end = (start + list.height as usize).min(app.snaps.items.len());
-        let lines: Vec<Line> = app.snaps.items[start..end]
-            .iter()
-            .enumerate()
-            .map(|(i, snap)| {
-                let selected = start + i == app.snaps.cursor;
-                let id = snap.id();
-                let marked = id.as_ref().is_some_and(|id| app.tool_marks.contains(id));
-                let measuring = snap
-                    .date
-                    .as_ref()
-                    .is_some_and(|d| app.snaps.measuring.contains(d));
-                let size = match (&snap.date, measuring) {
-                    (_, true) => "measuring...".to_string(),
-                    (Some(d), _) => app.snaps.sizes.get(d).map_or("press m".to_string(), range),
-                    (None, _) => "-".to_string(),
-                };
-                let label = snap
-                    .date
-                    .as_deref()
-                    .map_or_else(|| snap.name.clone(), pretty);
-                let kind = if snap.date.is_some() {
-                    "Time Machine"
+        // Row 0 is the heading, row n the n-th snapshot.
+        let start = app.snaps.offset.min(app.snaps.rows());
+        let end = (start + list.height as usize).min(app.snaps.rows());
+        let lines: Vec<Line> = (start..end)
+            .map(|row| {
+                let selected = row == app.snaps.cursor;
+                let line = if row == 0 {
+                    heading_line(app, width, selected)
                 } else {
-                    "system, kept"
+                    snapshot_line(app, row - 1, selected, [name_w, size_w, kind_w])
                 };
-                let dim = snap.date.is_none();
-                let mark = if marked { g.marked() } else { g.unmarked() };
-                let cursor = if selected { g.cursor() } else { " " };
-                let mut line = Line::from(vec![
-                    Span::styled(format!("{cursor} "), Style::default().fg(ACCENT)),
-                    Span::styled(
-                        format!("{} ", if dim { " " } else { mark }),
-                        Style::default().fg(if marked { CAUTION } else { DIM }),
-                    ),
-                    Span::raw(pad(fit(&label, name_w, &g), name_w)),
-                    Span::raw(format!(" {}", right(&size, size_w))),
-                    Span::raw(format!(" {}", pad(kind.to_string(), kind_w))),
-                ]);
-                line = if dim {
-                    line.style(Style::default().fg(DIM))
-                } else {
-                    line
-                };
-                if selected {
+                if selected && row > 0 {
                     line.style(
                         Style::default()
                             .bg(SELECTED_BG)
@@ -187,4 +195,102 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         )),
         Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1),
     );
+}
+
+/// The colored bar over the snapshots. Its box is "all marked": space on it
+/// marks or unmarks every Time Machine snapshot. Underlined while selected,
+/// since its background is already a color.
+fn heading_line(app: &App, width: usize, selected: bool) -> Line<'static> {
+    let g = &app.glyphs;
+    let ids: Vec<String> = app.snaps.items.iter().filter_map(Snapshot::id).collect();
+    let marked = ids.iter().filter(|id| app.tool_marks.contains(*id)).count();
+    let all = !ids.is_empty() && marked == ids.len();
+    let cursor = if selected { g.cursor() } else { " " };
+    let boxed = if all { g.marked() } else { g.unmarked() };
+    let mut text = format!(
+        "{cursor} {boxed} TIME MACHINE   {} {} {}",
+        ids.len(),
+        g.dot(),
+        if ids.len() == 1 {
+            "snapshot"
+        } else {
+            "snapshots"
+        }
+    );
+    if marked > 0 {
+        text.push_str(&format!("   {marked} marked"));
+    }
+    let mut style = Style::default()
+        .fg(Color::Black)
+        .bg(ACCENT)
+        .add_modifier(Modifier::BOLD);
+    if selected {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    Line::from(Span::styled(fit_pad(&text, width, g), style))
+}
+
+fn snapshot_line(
+    app: &App,
+    i: usize,
+    selected: bool,
+    [name_w, size_w, kind_w]: [usize; 3],
+) -> Line<'static> {
+    let g = &app.glyphs;
+    let snap = &app.snaps.items[i];
+    let ours = snap.date.is_some();
+    let marked = snap.id().is_some_and(|id| app.tool_marks.contains(&id));
+    let measuring = snap
+        .date
+        .as_ref()
+        .is_some_and(|d| app.snaps.measuring.contains(d));
+    let (size, size_style) = match (&snap.date, measuring) {
+        (Some(d), true) => (measuring_text(app, d), Style::default().fg(CAUTION)),
+        (Some(d), false) => match app.snaps.sizes.get(d) {
+            Some(h) => (range(h), Style::default()),
+            None => ("press m".to_string(), Style::default().fg(DIM)),
+        },
+        (None, _) => ("-".to_string(), Style::default().fg(DIM)),
+    };
+    let label = snap
+        .date
+        .as_deref()
+        .map_or_else(|| snap.name.clone(), pretty);
+    let safety = if ours {
+        Safety::Safe
+    } else {
+        Safety::Protected
+    };
+    let dim = Style::default().fg(DIM);
+    let (mark_glyph, mark_style) = if !ours {
+        (" ", dim)
+    } else if marked {
+        (g.marked(), Style::default().fg(Color::Magenta))
+    } else {
+        (g.unmarked(), Style::default().fg(Color::Magenta))
+    };
+    let name_style = if marked {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else if ours {
+        Style::default().fg(Color::Blue)
+    } else {
+        dim
+    };
+    let cursor = if selected { g.cursor() } else { " " };
+    let icon = if ours { g.snapshot() } else { g.locked() };
+    let kind = if ours { "Time Machine" } else { "system, kept" };
+    Line::from(vec![
+        Span::styled(format!("{cursor} "), Style::default().fg(ACCENT)),
+        Span::styled(format!("{mark_glyph} "), mark_style),
+        Span::styled(format!("{icon} "), Style::default().fg(ACCENT)),
+        Span::styled(
+            format!("{} ", safety_dot(g, safety)),
+            Style::default().fg(safety_color(safety)),
+        ),
+        Span::styled(pad(fit(&label, name_w, g), name_w), name_style),
+        Span::styled(format!(" {}", right(&size, size_w)), size_style),
+        Span::styled(format!(" {}", pad(kind.to_string(), kind_w)), dim),
+    ])
 }

@@ -51,6 +51,14 @@ impl Glyphs {
     pub fn protected(&self) -> &'static str {
         self.pick("●", "X")
     }
+    /// A Time Machine snapshot.
+    pub fn snapshot(&self) -> &'static str {
+        self.pick("\u{f1da}", "[T]")
+    }
+    /// A snapshot macOS keeps for itself.
+    pub fn locked(&self) -> &'static str {
+        self.pick("\u{f023}", "[S]")
+    }
     pub fn pending(&self) -> &'static str {
         self.pick("\u{f017}", "(p)")
     }
