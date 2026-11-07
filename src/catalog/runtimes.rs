@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use super::command::{CommandSpec, is_executable};
+use super::command::{CommandRunner, CommandSpec, is_executable};
 use super::resolve::{Places, resolve_in};
 use super::tools::{Mode, ToolEntry, pinned};
 use crate::targets::SectionKind;
@@ -404,7 +404,388 @@ pub(crate) fn discover_runtimes(
             });
         }
     }
+    corepack_versions(home, &mut out);
+    uv_pythons(home, places, &mut out);
+    uv_tools(home, places, &mut out);
+    rust_toolchains(home, places, &mut out);
+    cargo_binaries(home, places, &mut out);
+    android_sdk(home, &mut out);
     out
+}
+
+fn plain(home: &Path, exe: &Path, args: &[&str]) -> CommandSpec {
+    CommandSpec::new(&exe.to_string_lossy(), args).with_cwd(home)
+}
+
+/// A program of a tool that installs under the home folder: its own bin
+/// folder first, then wherever `PATH` and the version managers have it.
+fn find_exe(home: &Path, places: &Places, rel: &str, name: &str) -> Option<PathBuf> {
+    let own = home.join(rel).join(name);
+    if is_executable(&own) {
+        return Some(own);
+    }
+    resolve_in(home, name, places).into_iter().next()
+}
+
+/// Real (not symlinked) sub-folders of `dir` whose names may reach a command.
+fn real_dirs(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+        .filter(|(n, _)| safe_name(n))
+        .collect();
+    out.sort();
+    out
+}
+
+struct Item<'a> {
+    section: SectionKind,
+    id: String,
+    group: &'a str,
+    label: String,
+    path: PathBuf,
+    regen: String,
+    spec: Option<CommandSpec>,
+    note: Option<String>,
+}
+
+fn push(out: &mut Vec<RuntimeEntry>, i: Item) {
+    out.push(RuntimeEntry {
+        section: i.section,
+        bulk: false,
+        entry: ToolEntry {
+            id: i.id,
+            tool: i.group.to_string(),
+            label: i.label,
+            path: i.path,
+            regen: i.regen,
+            mode: i.spec.map_or(Mode::Folder, Mode::Command),
+            note: i.note,
+        },
+    });
+}
+
+/// Pythons that uv installed. The short names (`cpython-3.12-...`) are links
+/// to the full ones, so only the real folders are listed.
+fn uv_pythons(home: &Path, places: &Places, out: &mut Vec<RuntimeEntry>) {
+    let uv = find_exe(home, places, ".local/bin", "uv");
+    for (name, path) in real_dirs(&home.join(".local/share/uv/python")) {
+        if name.starts_with('.') {
+            continue;
+        }
+        let spec = uv
+            .as_ref()
+            .map(|u| plain(home, u, &["python", "uninstall", &name]));
+        push(
+            out,
+            Item {
+                section: SectionKind::PythonVersions,
+                id: format!("uvpy:{name}"),
+                group: "Python (uv)",
+                label: name.clone(),
+                path,
+                regen: format!("reinstall with uv python install {name}"),
+                spec,
+                note: Some("virtual environments built on it stop working".to_string()),
+            },
+        );
+    }
+}
+
+/// Command line tools that `uv tool install` put in their own environments.
+fn uv_tools(home: &Path, places: &Places, out: &mut Vec<RuntimeEntry>) {
+    let uv = find_exe(home, places, ".local/bin", "uv");
+    for (name, path) in real_dirs(&home.join(".local/share/uv/tools")) {
+        let spec = uv
+            .as_ref()
+            .map(|u| plain(home, u, &["tool", "uninstall", &name]));
+        push(
+            out,
+            Item {
+                section: SectionKind::UvTools,
+                id: format!("uvtool:{name}"),
+                group: "uv tools",
+                label: name.clone(),
+                path,
+                regen: format!("reinstall with uv tool install {name}"),
+                spec,
+                note: None,
+            },
+        );
+    }
+}
+
+/// The toolchain `rustup` uses when nothing overrides it.
+fn rustup_default(home: &Path) -> Option<String> {
+    let text = read_small(&home.join(".rustup/settings.toml"))?;
+    text.lines().find_map(|l| {
+        let v = l.trim().strip_prefix("default_toolchain")?;
+        let v = v.trim().strip_prefix('=')?.trim().trim_matches('"');
+        Some(v.to_string())
+    })
+}
+
+fn rust_toolchains(home: &Path, places: &Places, out: &mut Vec<RuntimeEntry>) {
+    let rustup = find_exe(home, places, ".cargo/bin", "rustup");
+    let default = rustup_default(home);
+    for (name, path) in real_dirs(&home.join(".rustup/toolchains")) {
+        let is_default = default.as_deref() == Some(name.as_str());
+        let spec = rustup
+            .as_ref()
+            .map(|r| plain(home, r, &["toolchain", "uninstall", &name]));
+        push(
+            out,
+            Item {
+                section: SectionKind::RustToolchains,
+                id: format!("rustup:{name}"),
+                group: "Rust (rustup)",
+                label: name.clone(),
+                path,
+                regen: format!("reinstall with rustup toolchain install {name}"),
+                spec,
+                note: is_default.then(|| "the default toolchain".to_string()),
+            },
+        );
+    }
+}
+
+/// Programs that `cargo install` built, from cargo's own record of them.
+fn cargo_binaries(home: &Path, places: &Places, out: &mut Vec<RuntimeEntry>) {
+    let Some(json) = read_small(&home.join(".cargo/.crates2.json"))
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return;
+    };
+    let Some(installs) = json.get("installs").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let cargo = find_exe(home, places, ".cargo/bin", "cargo");
+    let mut keys: Vec<&String> = installs.keys().collect();
+    keys.sort();
+    for key in keys {
+        let mut words = key.split(' ');
+        let (Some(name), Some(version)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let bin = installs[key]
+            .get("bins")
+            .and_then(|b| b.as_array())
+            .and_then(|b| b.first())
+            .and_then(|b| b.as_str());
+        let Some(bin) = bin.filter(|b| safe_name(b) && !b.contains('/')) else {
+            continue;
+        };
+        let path = home.join(".cargo/bin").join(bin);
+        if !path.is_file() || !safe_name(name) {
+            continue;
+        }
+        let spec = cargo.as_ref().map(|c| plain(home, c, &["uninstall", name]));
+        push(
+            out,
+            Item {
+                section: SectionKind::CargoBinaries,
+                id: format!("cargo:{name}"),
+                group: "Cargo",
+                label: format!("{name} {version}"),
+                path,
+                regen: format!("reinstall with cargo install {name}"),
+                spec,
+                note: None,
+            },
+        );
+    }
+}
+
+/// Package manager versions Corepack downloaded (pnpm, yarn). Corepack can
+/// only clear everything, so each version is a folder to move; it downloads
+/// the one a project asks for again.
+fn corepack_versions(home: &Path, out: &mut Vec<RuntimeEntry>) {
+    for (manager, dir) in real_dirs(&home.join(".cache/node/corepack/v1")) {
+        for (version, path) in real_dirs(&dir) {
+            push(
+                out,
+                Item {
+                    section: SectionKind::PackageManagers,
+                    id: format!("corepack:{manager}:{version}"),
+                    group: &manager,
+                    label: version.clone(),
+                    path,
+                    regen: "downloaded again when a project asks for it (needs network)"
+                        .to_string(),
+                    spec: None,
+                    note: None,
+                },
+            );
+        }
+    }
+}
+
+/// A simulator id is a UUID: hex digits and dashes only.
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36
+        && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        && s.matches('-').count() == 4
+}
+
+/// `com.apple.CoreSimulator.SimRuntime.iOS-17-2` as `iOS 17.2`.
+fn runtime_title(key: &str) -> String {
+    let id = key.rsplit('.').next().unwrap_or(key);
+    let mut parts = id.split('-');
+    let name = parts.next().unwrap_or(id);
+    let version: Vec<&str> = parts.collect();
+    if version.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} {}", version.join("."))
+    }
+}
+
+/// iOS simulator devices, from `simctl list -j devices` (slow: it starts
+/// CoreSimulator, so this runs once on the discovery thread). A running
+/// device is left out: it has to be shut down before it can be removed.
+pub fn discover_simulators(home: &Path, runner: &dyn CommandRunner) -> Vec<RuntimeEntry> {
+    let xcrun = Path::new("/usr/bin/xcrun");
+    if !is_executable(xcrun) {
+        return Vec::new();
+    }
+    let spec =
+        CommandSpec::new("/usr/bin/xcrun", &["simctl", "list", "-j", "devices"]).with_cwd(home);
+    let Some(json) = runner
+        .query(&spec)
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return Vec::new();
+    };
+    let Some(runtimes) = json.get("devices").and_then(|d| d.as_object()) else {
+        return Vec::new();
+    };
+    let base = home.join("Library/Developer/CoreSimulator/Devices");
+    let mut out = Vec::new();
+    let mut keys: Vec<&String> = runtimes.keys().collect();
+    keys.sort();
+    for key in keys {
+        let group = runtime_title(key);
+        for d in runtimes[key].as_array().into_iter().flatten() {
+            let (Some(udid), Some(name)) = (
+                d.get("udid").and_then(|v| v.as_str()),
+                d.get("name").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let booted = d.get("state").and_then(|v| v.as_str()) == Some("Booted");
+            let path = base.join(udid);
+            if !is_uuid(udid) || booted || !path.is_dir() {
+                continue;
+            }
+            let usable = d.get("isAvailable").and_then(|v| v.as_bool()) != Some(false);
+            out.push(RuntimeEntry {
+                section: SectionKind::Simulators,
+                bulk: false,
+                entry: ToolEntry {
+                    id: format!("sim:{udid}"),
+                    tool: group.clone(),
+                    label: name.to_string(),
+                    path,
+                    regen: "create it again in Xcode (its apps and data are lost)".to_string(),
+                    mode: Mode::Command(plain(home, xcrun, &["simctl", "delete", udid])),
+                    note: (!usable).then(|| {
+                        "unavailable: its runtime is gone, nothing can start it".to_string()
+                    }),
+                },
+            });
+        }
+    }
+    out
+}
+
+/// The `sdkmanager` of the Android SDK in `sdk`, newest command-line tools first.
+fn sdkmanager(sdk: &Path) -> Option<PathBuf> {
+    let tools = sdk.join("cmdline-tools");
+    let mut dirs: Vec<PathBuf> = vec![tools.join("latest")];
+    if let Ok(rd) = fs::read_dir(&tools) {
+        let mut rest: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        rest.sort();
+        rest.reverse();
+        dirs.extend(rest);
+    }
+    dirs.into_iter()
+        .map(|d| d.join("bin/sdkmanager"))
+        .find(|p| is_executable(p))
+}
+
+/// The package id an SDK component folder says it is (`platforms;android-34`),
+/// read from the `path` of its `package.xml`.
+fn sdk_package_id(dir: &Path) -> Option<String> {
+    let text = read_small(&dir.join("package.xml"))?;
+    let rest = text.split("<localPackage path=\"").nth(1)?;
+    let id = rest.split('"').next()?;
+    (id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._;-".contains(c))
+        && !id.starts_with('-')
+        && !id.is_empty())
+    .then(|| id.to_string())
+}
+
+/// SDK components: platforms, build-tools, ndk, cmake, sources and system
+/// images. `cmdline-tools` and `platform-tools` are what manage the SDK and
+/// are not listed.
+fn android_sdk(home: &Path, out: &mut Vec<RuntimeEntry>) {
+    let sdk = home.join("Library/Android/sdk");
+    let manager = sdkmanager(&sdk);
+    for (category, depth) in [
+        ("platforms", 1),
+        ("build-tools", 1),
+        ("ndk", 1),
+        ("cmake", 1),
+        ("sources", 1),
+        ("system-images", 3),
+    ] {
+        let mut level = vec![sdk.join(category)];
+        for _ in 0..depth {
+            level = level
+                .iter()
+                .flat_map(|d| real_dirs(d).into_iter().map(|(_, p)| p))
+                .collect();
+        }
+        for dir in level {
+            let Some(id) = sdk_package_id(&dir) else {
+                continue;
+            };
+            if !id.starts_with(&format!("{category};")) {
+                continue;
+            }
+            let label = id
+                .split_once(';')
+                .map_or(id.clone(), |(_, rest)| rest.replace(';', " / "));
+            let spec = manager.as_ref().map(|m| {
+                plain(
+                    home,
+                    m,
+                    &[&format!("--sdk_root={}", sdk.display()), "--uninstall", &id],
+                )
+            });
+            let note = spec
+                .is_none()
+                .then(|| "sdkmanager was not found: the folder is moved instead".to_string());
+            push(
+                out,
+                Item {
+                    section: SectionKind::AndroidSdk,
+                    id: format!("android:{id}"),
+                    group: category,
+                    label,
+                    path: dir,
+                    regen: format!("reinstall with sdkmanager \"{id}\""),
+                    spec,
+                    note,
+                },
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -570,7 +951,254 @@ mod tests {
     fn a_two_number_pin_needs_the_minor_too() {
         let d = tempfile::tempdir().unwrap();
         let p = project(d.path(), "p", &[(".nvmrc", "22.1")]);
-        assert_eq!(pins_for("v22.1.5", std::slice::from_ref(&p)), vec![p.clone()]);
+        assert_eq!(
+            pins_for("v22.1.5", std::slice::from_ref(&p)),
+            vec![p.clone()]
+        );
         assert!(pins_for("v22.2.0", &[p]).is_empty());
+    }
+
+    fn exe(p: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn entries(home: &Path, section: SectionKind) -> Vec<RuntimeEntry> {
+        discover_runtimes(home, &places(), &[])
+            .into_iter()
+            .filter(|r| r.section == section)
+            .collect()
+    }
+
+    fn command(r: &RuntimeEntry) -> Vec<String> {
+        match &r.entry.mode {
+            Mode::Command(spec) => spec.args.clone(),
+            Mode::Folder => panic!("not a command: {:?}", r.entry.id),
+        }
+    }
+
+    #[test]
+    fn uv_pythons_list_real_folders_only_and_uninstall_by_full_name() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        exe(&home.join(".local/bin/uv"));
+        let base = home.join(".local/share/uv/python");
+        mk(&base.join("cpython-3.12.13-macos-x86_64-none"));
+        mk(&base.join(".temp"));
+        symlink(
+            base.join("cpython-3.12.13-macos-x86_64-none"),
+            base.join("cpython-3.12-macos-x86_64-none"),
+        )
+        .unwrap();
+        let got = entries(home, SectionKind::PythonVersions);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].entry.id, "uvpy:cpython-3.12.13-macos-x86_64-none");
+        assert_eq!(
+            command(&got[0]),
+            ["python", "uninstall", "cpython-3.12.13-macos-x86_64-none"]
+        );
+    }
+
+    #[test]
+    fn without_uv_a_python_is_a_plain_folder() {
+        let d = tempfile::tempdir().unwrap();
+        mk(&d.path().join(".local/share/uv/python/cpython-3.11.1-x"));
+        let got = entries(d.path(), SectionKind::PythonVersions);
+        assert_eq!(got.len(), 1);
+        assert!(matches!(got[0].entry.mode, Mode::Folder));
+    }
+
+    #[test]
+    fn uv_tools_and_rust_toolchains_have_their_own_commands() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        exe(&home.join(".local/bin/uv"));
+        exe(&home.join(".cargo/bin/rustup"));
+        mk(&home.join(".local/share/uv/tools/graphifyy"));
+        mk(&home.join(".rustup/toolchains/stable-x86_64-apple-darwin"));
+        mk(&home.join(".rustup/toolchains/nightly-2026-01-01-x86_64-apple-darwin"));
+        fs::write(
+            home.join(".rustup/settings.toml"),
+            "version = \"12\"\ndefault_toolchain = \"stable-x86_64-apple-darwin\"\n",
+        )
+        .unwrap();
+        let tools = entries(home, SectionKind::UvTools);
+        assert_eq!(command(&tools[0]), ["tool", "uninstall", "graphifyy"]);
+        let rust = entries(home, SectionKind::RustToolchains);
+        assert_eq!(rust.len(), 2);
+        let stable = rust
+            .iter()
+            .find(|r| r.entry.label.starts_with("stable"))
+            .unwrap();
+        assert_eq!(stable.entry.note.as_deref(), Some("the default toolchain"));
+        assert_eq!(
+            command(stable),
+            ["toolchain", "uninstall", "stable-x86_64-apple-darwin"]
+        );
+        let nightly = rust
+            .iter()
+            .find(|r| r.entry.label.starts_with("nightly"))
+            .unwrap();
+        assert!(nightly.entry.note.is_none());
+    }
+
+    #[test]
+    fn cargo_binaries_come_from_cargos_own_record_and_skip_odd_entries() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        exe(&home.join(".cargo/bin/cargo"));
+        exe(&home.join(".cargo/bin/rg"));
+        exe(&home.join(".cargo/bin/rustc")); // a rustup proxy: not in the record
+        fs::write(
+            home.join(".cargo/.crates2.json"),
+            r#"{"installs":{
+              "ripgrep 14.1.0 (registry+https://github.com/rust-lang/crates.io-index)":{"bins":["rg"]},
+              "gone 1.0.0 (registry+x)":{"bins":["missing"]},
+              "evil 1.0.0 (registry+x)":{"bins":["../../etc/passwd"]},
+              "-rf 1.0.0 (registry+x)":{"bins":["rg"]},
+              "nobins 1.0.0 (registry+x)":{}
+            }}"#,
+        )
+        .unwrap();
+        let got = entries(home, SectionKind::CargoBinaries);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].entry.label, "ripgrep 14.1.0");
+        assert_eq!(command(&got[0]), ["uninstall", "ripgrep"]);
+        assert!(got[0].entry.path.ends_with(".cargo/bin/rg"));
+    }
+
+    #[test]
+    fn a_broken_crates_file_lists_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join(".cargo")).unwrap();
+        fs::write(d.path().join(".cargo/.crates2.json"), "{ nope").unwrap();
+        assert!(entries(d.path(), SectionKind::CargoBinaries).is_empty());
+    }
+
+    #[test]
+    fn corepack_versions_are_folder_rows_per_manager() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        mk(&home.join(".cache/node/corepack/v1/pnpm/12.18.0"));
+        mk(&home.join(".cache/node/corepack/v1/yarn/4.1.0"));
+        fs::write(
+            home.join(".cache/node/corepack/v1/lastKnownGood.json"),
+            "{}",
+        )
+        .unwrap();
+        let got = entries(home, SectionKind::PackageManagers);
+        let ids: Vec<&str> = got.iter().map(|r| r.entry.id.as_str()).collect();
+        assert_eq!(ids, ["corepack:pnpm:12.18.0", "corepack:yarn:4.1.0"]);
+        assert!(got.iter().all(|r| matches!(r.entry.mode, Mode::Folder)));
+    }
+
+    #[test]
+    fn an_empty_home_has_no_runtime_rows() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(discover_runtimes(d.path(), &places(), &[]).is_empty());
+    }
+
+    fn pkg(dir: &Path, id: &str) {
+        mk(dir);
+        fs::write(
+            dir.join("package.xml"),
+            format!("<?xml version=\"1.0\"?><repo><localPackage path=\"{id}\" obsolete=\"false\"/></repo>"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn android_components_use_their_package_id_and_skip_the_sdk_manager_itself() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        let sdk = home.join("Library/Android/sdk");
+        exe(&sdk.join("cmdline-tools/latest/bin/sdkmanager"));
+        pkg(&sdk.join("platforms/android-34"), "platforms;android-34");
+        pkg(&sdk.join("build-tools/34.0.0"), "build-tools;34.0.0");
+        pkg(
+            &sdk.join("system-images/android-34/google_apis/arm64-v8a"),
+            "system-images;android-34;google_apis;arm64-v8a",
+        );
+        pkg(&sdk.join("platform-tools"), "platform-tools");
+        pkg(&sdk.join("cmdline-tools/latest"), "cmdline-tools;latest");
+        pkg(&sdk.join("platforms/android-35"), "platforms;android 35"); // a space: refused
+        pkg(&sdk.join("platforms/android-36"), "build-tools;1.0"); // wrong category
+        mk(&sdk.join("platforms/android-27")); // no package.xml
+        let got = entries(home, SectionKind::AndroidSdk);
+        let ids: Vec<&str> = got.iter().map(|r| r.entry.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "android:platforms;android-34",
+                "android:build-tools;34.0.0",
+                "android:system-images;android-34;google_apis;arm64-v8a"
+            ]
+        );
+        let args = command(&got[0]);
+        assert_eq!(args[0], format!("--sdk_root={}", sdk.display()));
+        assert_eq!(args[1..], ["--uninstall", "platforms;android-34"]);
+    }
+
+    #[test]
+    fn without_sdkmanager_android_components_are_folders() {
+        let d = tempfile::tempdir().unwrap();
+        let sdk = d.path().join("Library/Android/sdk");
+        pkg(&sdk.join("ndk/28.2.1"), "ndk;28.2.1");
+        let got = entries(d.path(), SectionKind::AndroidSdk);
+        assert_eq!(got.len(), 1);
+        assert!(matches!(got[0].entry.mode, Mode::Folder));
+    }
+
+    const SIMS: &str = r#"{"devices":{
+      "com.apple.CoreSimulator.SimRuntime.iOS-17-2":[
+        {"udid":"11111111-2222-3333-4444-555555555555","name":"iPhone 15","state":"Shutdown","isAvailable":true,"dataPathSize":13254656},
+        {"udid":"AAAAAAAA-2222-3333-4444-555555555555","name":"iPhone 15 Pro","state":"Booted","isAvailable":true},
+        {"udid":"../../etc","name":"evil","state":"Shutdown"}],
+      "com.apple.CoreSimulator.SimRuntime.iOS-12-0":[
+        {"udid":"BBBBBBBB-2222-3333-4444-555555555555","name":"iPhone XR","state":"Shutdown","isAvailable":false}]}}"#;
+
+    #[test]
+    fn simulators_leave_out_running_and_odd_devices_and_delete_by_udid() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        for u in [
+            "11111111-2222-3333-4444-555555555555",
+            "AAAAAAAA-2222-3333-4444-555555555555",
+            "BBBBBBBB-2222-3333-4444-555555555555",
+        ] {
+            mk(&home.join("Library/Developer/CoreSimulator/Devices").join(u));
+        }
+        let runner =
+            crate::catalog::command::FakeRunner::new(&[]).answering(&[("simctl list", SIMS)]);
+        let got = discover_simulators(home, &runner);
+        let ids: Vec<&str> = got.iter().map(|r| r.entry.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "sim:BBBBBBBB-2222-3333-4444-555555555555",
+                "sim:11111111-2222-3333-4444-555555555555"
+            ]
+        );
+        assert_eq!(got[1].entry.tool, "iOS 17.2");
+        assert_eq!(command(&got[1])[..2], ["simctl", "delete"]);
+        assert!(
+            got[0]
+                .entry
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("unavailable")
+        );
+    }
+
+    #[test]
+    fn broken_simctl_output_lists_no_simulators() {
+        let d = tempfile::tempdir().unwrap();
+        let runner = crate::catalog::command::FakeRunner::new(&[]).answering(&[("simctl", "oops")]);
+        assert!(discover_simulators(d.path(), &runner).is_empty());
+        let none = crate::catalog::command::FakeRunner::new(&[]);
+        assert!(discover_simulators(d.path(), &none).is_empty());
     }
 }

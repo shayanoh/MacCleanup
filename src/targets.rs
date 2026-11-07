@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::app::{SortBy, cmp_rows};
 use crate::bg::Work;
 use crate::catalog::resolve::Places;
-use crate::catalog::runtimes::discover_runtimes;
+use crate::catalog::runtimes::{RuntimeEntry, discover_runtimes};
 use crate::catalog::split::{SplitKind, split};
 use crate::catalog::{ArtifactKind, CommandSpec, Mode, ToolEntry, detect_artifacts};
 use crate::filter::Query;
@@ -22,6 +22,13 @@ pub enum SectionKind {
     Tools,
     NodeVersions,
     NodeGlobals,
+    PackageManagers,
+    PythonVersions,
+    UvTools,
+    RustToolchains,
+    CargoBinaries,
+    AndroidSdk,
+    Simulators,
 }
 
 /// The screen a section is listed on: Caches & Projects or Packages & runtimes.
@@ -35,16 +42,23 @@ impl SectionKind {
     pub fn page(self) -> Page {
         match self {
             SectionKind::Projects | SectionKind::Tools => Page::Caches,
-            SectionKind::NodeVersions | SectionKind::NodeGlobals => Page::Runtimes,
+            _ => Page::Runtimes,
         }
     }
 
     /// Sections in the order they are listed.
-    pub const ALL: [SectionKind; 4] = [
+    pub const ALL: [SectionKind; 11] = [
         SectionKind::Projects,
         SectionKind::Tools,
         SectionKind::NodeVersions,
         SectionKind::NodeGlobals,
+        SectionKind::PackageManagers,
+        SectionKind::PythonVersions,
+        SectionKind::UvTools,
+        SectionKind::RustToolchains,
+        SectionKind::CargoBinaries,
+        SectionKind::AndroidSdk,
+        SectionKind::Simulators,
     ];
 }
 
@@ -277,6 +291,8 @@ pub struct BuildSource {
     pub scan_idle: bool,
     pub policy: Arc<Policy>,
     pub entries: Vec<ToolEntry>,
+    /// Runtime rows found once by the slow discovery (simulators).
+    pub runtime_extra: Vec<RuntimeEntry>,
     pub closed: HashSet<String>,
 }
 
@@ -289,6 +305,7 @@ impl Targets {
             scan_idle,
             policy,
             entries,
+            runtime_extra,
             closed,
         } = src;
         let (home, scan_idle) = (home.as_path(), *scan_idle);
@@ -355,14 +372,19 @@ impl Targets {
             });
         }
         // Installed runtimes and their packages (the Packages & runtimes page).
-        for r in discover_runtimes(home, &Places::from_env(), &project_roots) {
+        for r in discover_runtimes(home, &Places::from_env(), &project_roots)
+            .into_iter()
+            .chain(runtime_extra.iter().cloned())
+        {
             let e = r.entry;
-            let Some(node) = locate(root, &e.path) else {
+            // A folder in the scan, or a single file (a cargo binary).
+            let node = locate(root, &e.path);
+            if node.is_none() && !e.path.is_file() {
                 continue;
-            };
+            }
             cands.push(Cand {
                 path: e.path,
-                node: Some(node),
+                node,
                 split: None,
                 kept: false,
                 priority: 0,
@@ -643,6 +665,7 @@ mod tests {
             scan_idle: s.scanner.is_idle(),
             policy: Arc::new(Policy::new(&s.home, &s.hold)),
             entries: entries.to_vec(),
+            runtime_extra: Vec::new(),
             closed,
         }
     }
@@ -1375,6 +1398,7 @@ mod stress {
             scan_idle: true,
             policy: Arc::new(policy),
             entries: entries.to_vec(),
+            runtime_extra: Vec::new(),
             closed: HashSet::new(),
         };
         let work = Work::new();
@@ -1417,6 +1441,7 @@ mod stress {
                 scan_idle: true,
                 policy: Arc::new(policy),
                 entries: Vec::new(),
+                runtime_extra: Vec::new(),
                 closed: HashSet::new(),
             };
             let t = Instant::now();

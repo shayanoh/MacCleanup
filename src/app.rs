@@ -7,6 +7,7 @@ use ratatui::layout::Rect;
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
 use crate::bg::{Latest, Work};
+use crate::catalog::runtimes::{RuntimeEntry, discover_simulators};
 use crate::catalog::{
     CommandRunner, CommandSpec, RunControl, SystemRunner, ToolEntry, discover_tools, is_lock_wait,
 };
@@ -507,7 +508,9 @@ pub struct App {
     pub toffset: usize,
     /// Tool caches found by asking the installed tools (empty until looked up).
     pub tool_entries: Vec<ToolEntry>,
-    tools_rx: Option<mpsc::Receiver<Vec<ToolEntry>>>,
+    tools_rx: Option<mpsc::Receiver<(Vec<ToolEntry>, Vec<RuntimeEntry>)>>,
+    /// Runtime rows that need a slow command, found once (simulators).
+    runtime_extra: Vec<RuntimeEntry>,
     tools_started: bool,
     /// Keys of the groups the user folded (kept across rebuilds).
     closed_groups: HashSet<String>,
@@ -668,6 +671,7 @@ impl App {
             toffset: 0,
             tool_entries: Vec::new(),
             tools_rx: None,
+            runtime_extra: Vec::new(),
             tools_started: false,
             closed_groups: HashSet::new(),
             targets_synced: false,
@@ -1356,7 +1360,10 @@ impl App {
                 self.start_discovery();
                 self.rebuild_targets();
             }
-            Screen::Runtimes => self.rebuild_targets(),
+            Screen::Runtimes => {
+                self.start_discovery();
+                self.rebuild_targets();
+            }
             Screen::Docker => self.reload_docker(),
             Screen::Snapshots => self.reload_snapshots(),
             Screen::DockerFiles | Screen::Home => {}
@@ -1819,9 +1826,7 @@ impl App {
                 .map(|g| g.section);
             match section {
                 Some(SectionKind::Projects) => projects.push(Arc::clone(n)),
-                Some(SectionKind::Tools | SectionKind::NodeVersions | SectionKind::NodeGlobals) => {
-                    tools.push(Arc::clone(n))
-                }
+                Some(_) => tools.push(Arc::clone(n)),
                 None => {}
             }
         }
@@ -2167,7 +2172,9 @@ impl App {
         let work = Arc::clone(&self.tools_work);
         work.begin("looking for installed tools", 0);
         std::thread::spawn(move || {
-            let _ = tx.send(discover_tools(&home, runner.as_ref(), &work));
+            let tools = discover_tools(&home, runner.as_ref(), &work);
+            let extra = discover_simulators(&home, runner.as_ref());
+            let _ = tx.send((tools, extra));
         });
         self.tools_rx = Some(rx);
     }
@@ -2175,8 +2182,9 @@ impl App {
     fn poll_discovery(&mut self) {
         let Some(rx) = &self.tools_rx else { return };
         match rx.try_recv() {
-            Ok(entries) => {
+            Ok((entries, extra)) => {
                 self.tool_entries = entries;
+                self.runtime_extra = extra;
                 self.tools_rx = None;
                 self.rebuild_targets();
             }
@@ -2204,6 +2212,7 @@ impl App {
             scan_idle: self.scanner.is_idle(),
             policy: Arc::clone(&self.policy),
             entries: self.tool_entries.clone(),
+            runtime_extra: self.runtime_extra.clone(),
             closed: self.closed_groups.clone(),
         };
         let work = Arc::clone(&self.build_work);
