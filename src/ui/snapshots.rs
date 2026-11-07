@@ -208,9 +208,8 @@ fn heading_line(app: &App, width: usize, selected: bool) -> Line<'static> {
     let cursor = if selected { g.cursor() } else { " " };
     let boxed = if all { g.marked() } else { g.unmarked() };
     let mut text = format!(
-        "{cursor} {boxed} TIME MACHINE   {} {} {}",
+        "{cursor} {boxed} TIME MACHINE   {} {}",
         ids.len(),
-        g.dot(),
         if ids.len() == 1 {
             "snapshot"
         } else {
