@@ -117,7 +117,8 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `s` | Cycle sort in header order: name, size, on-disk size (the default), frees, modified. The sorted column is white with an arrow in the header |
 | `Tab` | Switch focus between the menu and the list (the menu has focus at startup: `j`/`k` choose a screen, `Enter` opens it) |
 | `1` to `9` | Open the page at that position in the menu (the number is shown beside each entry; a planned page says it is coming) |
-| `h` / `l` (Caches & Projects, Runtimes, Uninstall, Leftovers) | Fold / open the group; `l` or `Enter` on a row shows it in the Explorer |
+| `h` / `l` (Caches & Projects, Runtimes, Uninstall, Leftovers, Docker) | Fold / open the group; `l` or `Enter` on a row shows it in the Explorer |
+| `H` / `L` (same pages) | Fold every group / open every group (on Docker: every section and item; layer lists stay folded) |
 | `m` (Caches & Projects) | Mark the selected folder and every folder that shares its data; press again to unmark them |
 | `m` (Docker) | Mark the stopped containers the selected image or volume needs removed first; press again to unmark them |
 | `b` (Docker) | Look inside the selected image or volume, read-only (`l` / `Enter` open a folder, `h` up, `Esc` back, `s` sorts, `/` filters) |

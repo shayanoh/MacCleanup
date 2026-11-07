@@ -182,6 +182,10 @@ pub enum Action {
     GoTo(Screen),
     /// In a review: switch commands that have one to their `--force` form (`f`).
     ToggleForce,
+    /// `H`: fold every group of the list.
+    FoldAll,
+    /// `L`: open every group of the list.
+    UnfoldAll,
     /// Copy the commands of the "run it yourself" dialog.
     ManualCopy,
     /// "I ran the commands": look again.
@@ -1119,6 +1123,8 @@ impl App {
             Action::Quit => self.request_quit(),
             Action::Tick => self.on_tick(),
             Action::Cancel => self.cancel(),
+            Action::FoldAll => self.fold_all(false),
+            Action::UnfoldAll => self.fold_all(true),
             Action::ManualCopy => self.manual_copy(),
             Action::ManualRan => self.manual_ran(),
             Action::Confirm => self.confirm(),
@@ -2050,13 +2056,48 @@ impl App {
                 let items = self.folder_rows_of(|gi, _| gi == g);
                 self.mark_many(items);
                 self.mark_bulk_commands(|gi, _| gi == g);
+                self.note_left_out(|gi, _| gi == g);
             }
             Some(Line::Section(kind)) => {
                 let items = self.folder_rows_of(|_, grp| grp.section == kind);
                 self.mark_many(items);
                 self.mark_bulk_commands(|_, grp| grp.section == kind);
+                self.note_left_out(|_, grp| grp.section == kind);
             }
             None => {}
+        }
+    }
+
+    /// After a header mark on the Uninstall or Leftovers page: say what the
+    /// mark left out and why (a running or Apple app, folders outside home or
+    /// shared with other apps), so a header never seems to do nothing.
+    fn note_left_out(&mut self, keep: impl Fn(usize, &crate::targets::Group) -> bool) {
+        let (mut locked, mut apps, mut left) = (Vec::new(), 0usize, 0usize);
+        for (_, g) in self.targets.groups.iter().enumerate().filter(|(i, g)| {
+            matches!(g.section, SectionKind::Apps | SectionKind::Leftovers) && keep(*i, g)
+        }) {
+            apps += 1;
+            if let Some(why) = g.rows.iter().find_map(|r| r.locked.clone()) {
+                locked.push(why);
+            } else {
+                left += g.rows.iter().filter(|r| r.kept && !r.is_command()).count();
+            }
+        }
+        let mut parts: Vec<String> = Vec::new();
+        match locked.len() {
+            0 => {}
+            1 if apps == 1 => parts.push(locked[0].clone()),
+            n => parts.push(format!(
+                "{n} app(s) are running or Apple's own and cannot be marked"
+            )),
+        }
+        if left > 0 {
+            parts.push(format!(
+                "{left} folder(s) outside your home or shared with other apps were left out: mark them one by one"
+            ));
+        }
+        if !parts.is_empty() {
+            self.notice = Some(parts.join(". "));
         }
     }
 
@@ -2728,6 +2769,42 @@ impl App {
     fn target_out(&mut self) {
         match self.tlines.get(self.tcursor).copied() {
             Some(Line::Group(g)) | Some(Line::Row { group: g, .. }) => self.set_fold(g, false),
+            _ => {}
+        }
+    }
+
+    /// `H` / `L`: fold or open every group of the list on this page.
+    fn fold_all(&mut self, open: bool) {
+        match self.screen {
+            Screen::Docker => self.docker_fold_all(open),
+            Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => {
+                // Stay on the group the cursor is in when folding.
+                let keep = match self.tlines.get(self.tcursor).copied() {
+                    Some(Line::Row { group, .. }) if !open => self
+                        .targets
+                        .groups
+                        .get(group)
+                        .map(|g| LineKey::Group(g.key())),
+                    _ => self.sel_of(self.tcursor),
+                };
+                for g in &mut self.targets.groups {
+                    g.open = open;
+                    if open {
+                        self.closed_groups.remove(&g.key());
+                    } else {
+                        self.closed_groups.insert(g.key());
+                    }
+                }
+                self.rebuild_tlines(keep);
+                self.notice = Some(
+                    if open {
+                        "Opened every group"
+                    } else {
+                        "Folded every group"
+                    }
+                    .to_string(),
+                );
+            }
             _ => {}
         }
     }
@@ -6884,6 +6961,90 @@ mod apps_marking_tests {
         cursor_on_row(&mut e, "A", "Vendor");
         e.app.update(Action::ToggleMark);
         assert!(e.app.marks.keys().any(|p| p.ends_with("Vendor")));
+    }
+
+    #[test]
+    fn a_header_mark_on_a_running_or_apple_app_says_why() {
+        let mut e = setup(two_apps, Vec::new());
+        // Make B running: its program is inside its bundle.
+        let b = e.home.join("B.app");
+        e.app.apps_input = Some(Arc::new(AppsInput {
+            running: vec![b.join("Contents/MacOS/B")],
+            ..(*e.app.apps_input.clone().unwrap()).clone()
+        }));
+        e.app.rebuild_targets();
+        e.app.settle_targets();
+        cursor_on_group(&mut e, "B");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.is_empty());
+        assert!(
+            e.app.notice.as_deref().unwrap().contains("running"),
+            "{:?}",
+            e.app.notice
+        );
+        assert!(
+            e.app
+                .targets
+                .groups
+                .iter()
+                .any(|g| g.title == "B" && g.running)
+        );
+        // A header that skips outside-home parts says so too.
+        cursor_on_group(&mut e, "A");
+        e.app.update(Action::ToggleMark);
+        assert!(
+            e.app.notice.as_deref().unwrap().contains("left out"),
+            "{:?}",
+            e.app.notice
+        );
+    }
+
+    #[test]
+    fn apple_groups_are_flagged_apple() {
+        let e = setup(
+            |h| {
+                let a = h.join("A.app");
+                vec![AppGroup {
+                    managed: None,
+                    app: bundle(&a, "com.apple.thing", "A"),
+                    parts: vec![part(a, "app", false, false)],
+                }]
+            },
+            Vec::new(),
+        );
+        let g = e
+            .app
+            .targets
+            .groups
+            .iter()
+            .find(|g| g.title == "A")
+            .unwrap();
+        assert!(g.apple && !g.running);
+    }
+
+    #[test]
+    fn capital_h_folds_every_group_and_capital_l_opens_them_again() {
+        let mut e = setup(two_apps, Vec::new());
+        let open = e.app.tlines.len();
+        assert!(open > 3);
+        e.app.update(Action::FoldAll);
+        assert!(e.app.targets.groups.iter().all(|g| !g.open));
+        assert!(e.app.tlines.len() < open, "only section and group lines");
+        assert!(e.app.tlines.iter().all(|l| !matches!(l, Line::Row { .. })));
+        e.app.update(Action::UnfoldAll);
+        assert_eq!(e.app.tlines.len(), open);
+    }
+
+    #[test]
+    fn the_keys_for_folding_everything_work_on_list_pages_only() {
+        use crate::input::map_key;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+        let mut e = setup(two_apps, Vec::new());
+        assert_eq!(map_key(key('H'), &e.app), Some(Action::FoldAll));
+        assert_eq!(map_key(key('L'), &e.app), Some(Action::UnfoldAll));
+        e.app.update(Action::GoTo(Screen::Explorer));
+        assert_eq!(map_key(key('H'), &e.app), None);
     }
 
     #[test]

@@ -57,6 +57,12 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         }
         KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
+        KeyCode::Char('H') if app.screen.is_list() || app.screen == Screen::Docker => {
+            Some(Action::FoldAll)
+        }
+        KeyCode::Char('L') if app.screen.is_list() || app.screen == Screen::Docker => {
+            Some(Action::UnfoldAll)
+        }
         KeyCode::Char('h') | KeyCode::Left => Some(Action::Out),
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => Some(Action::Into),
         KeyCode::Home => Some(Action::Top),

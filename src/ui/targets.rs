@@ -112,7 +112,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
     let busy = !app.filter.active() && (app.apps_looking() || app.targets_building());
     if app.tlines.is_empty() && busy {
-        lines.extend(busy_lines(app, width));
+        lines.extend(busy_lines(app));
     } else if app.tlines.is_empty() {
         let msg = if app.filter.active() {
             "(nothing matches the filter)".to_string()
@@ -222,77 +222,41 @@ pub(super) fn work_text(
 /// Scan activity, the tool lookup and the list build (each with a bar), and
 /// warnings when the scan root is not the home folder or Full Disk Access is
 /// missing (then caches outside what was scanned are not listed).
-/// An empty list that is still being worked on: what is happening, which
-/// step of how many, and where it is looking, all moving.
-fn busy_lines(app: &App, width: usize) -> Vec<TextLine<'static>> {
+/// The same spans in the dim color (a row that cannot be marked).
+fn dimmed(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .map(|s| {
+            let style = s.style.fg(DIM);
+            Span::styled(s.content, style)
+        })
+        .collect()
+}
+
+/// An empty list that is still being worked on: always the same two lines
+/// (a moving spinner and where to look), so nothing shifts as the work moves
+/// on. What it is doing, with its steps and bar, is on the status line above.
+fn busy_lines(app: &App) -> Vec<TextLine<'static>> {
     let g = &app.glyphs;
     let idx = anim::spinner_frame(app.tick, g.spinner().len());
-    let accent = Style::default().fg(ACCENT);
-    let dim = Style::default().fg(DIM);
     let title = if app.apps_looking() {
         "Looking at your installed apps"
     } else {
         "Building the list"
     };
-    let mut out = vec![TextLine::from(vec![
-        Span::styled(g.spinner()[idx].to_string(), accent),
-        Span::styled(
-            format!(" {title}"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ])];
-    if app.apps_looking() {
-        out.push(TextLine::from(Span::raw(fit(
-            &format!(
-                "  {}",
-                work_text(
-                    &app.apps_work.snapshot(),
-                    "looking at the installed apps",
-                    app.tick,
-                    24,
-                    g
-                )
+    vec![
+        TextLine::from(vec![
+            Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
+            Span::styled(
+                format!(" {title}"),
+                Style::default().add_modifier(Modifier::BOLD),
             ),
-            width,
-            g,
-        ))));
-    }
-    if app.targets_building() {
-        out.push(TextLine::from(Span::raw(fit(
-            &format!(
-                "  list: {}",
-                work_text(
-                    &app.build_work.snapshot(),
-                    "building the list",
-                    app.tick,
-                    24,
-                    g
-                )
-            ),
-            width,
-            g,
-        ))));
-    }
-    if !app.scanner.is_idle() {
-        out.push(TextLine::from(Span::raw(fit(
-            &format!(
-                "  your home folder is still being scanned: {} files {}",
-                app.scanner.stats().files,
-                marquee(app.tick, 8, g)
-            ),
-            width,
-            g,
-        ))));
-    }
-    out.push(TextLine::from(Span::styled(
-        fit(
-            "  Only reading: nothing is changed or deleted while this runs.",
-            width,
-            g,
-        ),
-        dim,
-    )));
-    out
+        ]),
+        TextLine::from(Span::styled(
+            "  Progress is on the line above. Only reading: nothing is changed or deleted.",
+            Style::default().fg(DIM),
+        )),
+    ]
 }
 
 fn status_line(app: &App, width: usize) -> TextLine<'static> {
@@ -539,13 +503,44 @@ fn group_line(app: &App, gi: usize, c: &Cols) -> TextLine<'static> {
     let base = Style::default()
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
+    // An app that cannot be removed says why, in color, and the rest of its
+    // line is dimmed: Apple's own apps (yellow), running apps (green).
+    let mut tags: Vec<Span<'static>> = Vec::new();
+    if grp.apple {
+        tags.push(Span::styled(
+            format!(" {} Apple's own ", g.dot()),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if grp.running {
+        tags.push(Span::styled(
+            format!(" {} running ", g.dot()),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let tag_w: usize = tags.iter().map(|t| text_width(&t.content)).sum();
+    let dim_line = grp.apple || grp.running;
+    let base = if dim_line {
+        Style::default().fg(DIM)
+    } else {
+        base
+    };
     let mut spans = highlight(
-        &fit_pad(&name_cell, c.prefix_w + c.name_w, g),
+        &fit_pad(
+            name_cell.trim_end(),
+            (c.prefix_w + c.name_w).saturating_sub(tag_w),
+            g,
+        ),
         &positions,
         base,
         base.fg(Color::Yellow),
     );
-    spans.extend(number_spans(
+    spans.extend(tags);
+    let numbers = number_spans(
         &grp.as_row(),
         false,
         app.sort,
@@ -553,7 +548,8 @@ fn group_line(app: &App, gi: usize, c: &Cols) -> TextLine<'static> {
         c.show_modified,
         c.last_used,
         g,
-    ));
+    );
+    spans.extend(if dim_line { dimmed(numbers) } else { numbers });
     TextLine::from(spans)
 }
 
@@ -591,6 +587,8 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD),
         MarkState::Covered(_) => Style::default().fg(DIM),
+        // Running or Apple's: cannot be marked, so it is dimmed.
+        MarkState::Unmarked if t.locked.is_some() => Style::default().fg(DIM),
         // A finished product stands out: it is kept unless marked on its own.
         MarkState::Unmarked if t.kept => Style::default().fg(Color::Cyan),
         MarkState::Unmarked => Style::default().fg(Color::Blue),
@@ -629,7 +627,20 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
     ];
     spans.extend(highlight(
         &fit_pad(
-            &format!("  {name}{}", if t.kept { "  (kept)" } else { "" }),
+            &format!(
+                "  {name}{}",
+                if t.locked.is_some() {
+                    if app.targets.groups[gi].running {
+                        "  (running)"
+                    } else {
+                        "  (Apple's)"
+                    }
+                } else if t.kept {
+                    "  (kept)"
+                } else {
+                    ""
+                }
+            ),
             c.name_w,
             g,
         ),
@@ -657,7 +668,7 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
             9,
         )
     });
-    spans.extend(number_spans(
+    let numbers = number_spans(
         &r,
         queued,
         app.sort,
@@ -665,9 +676,18 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
         c.show_modified,
         c.last_used,
         g,
-    ));
+    );
+    spans.extend(if t.locked.is_some() {
+        dimmed(numbers)
+    } else {
+        numbers
+    });
     if c.show_share {
-        let color = if queued { DIM } else { Color::Yellow };
+        let color = if queued || t.locked.is_some() {
+            DIM
+        } else {
+            Color::Yellow
+        };
         spans.push(Span::styled(
             format!(" {share}"),
             Style::default().fg(color),

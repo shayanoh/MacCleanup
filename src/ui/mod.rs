@@ -332,6 +332,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => &[
                 "j/k move",
                 "h/l fold/open",
+                "H/L fold/open all",
                 "/ filter",
                 "r rescan",
                 "t graph type",
@@ -342,6 +343,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Screen::Docker => &[
                 "j/k move",
                 "h/l fold/open",
+                "H/L fold/open all",
                 "/ filter",
                 "space mark",
                 "d review",

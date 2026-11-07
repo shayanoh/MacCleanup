@@ -133,6 +133,10 @@ pub struct Group {
     pub open: bool,
     /// The app bundles of an Uninstall group (to see if the app is running).
     pub bundles: Vec<PathBuf>,
+    /// The app is running now (shown on the group, its rows are dimmed).
+    pub running: bool,
+    /// One of Apple's own apps: listed, never removable.
+    pub apple: bool,
 }
 
 impl Group {
@@ -311,6 +315,8 @@ struct GroupSpec {
     subtitle: String,
     last_used: i64,
     lock: Option<String>,
+    running: bool,
+    apple: bool,
     bundles: Vec<PathBuf>,
     parts: Vec<PartSpec>,
 }
@@ -361,6 +367,8 @@ fn add_app_groups(
             subtitle: g.app.version.clone(),
             last_used: g.app.last_used,
             lock,
+            running,
+            apple: is_apple_id(&g.app.id),
             bundles,
             parts: g
                 .parts
@@ -394,6 +402,8 @@ fn add_app_groups(
                     subtitle: String::new(),
                     last_used: 0,
                     lock: None,
+                    running: false,
+                    apple: false,
                     bundles: Vec::new(),
                     parts: g
                         .parts
@@ -493,6 +503,8 @@ fn add_app_groups(
             section: spec.section,
             rows: trows,
             bundles: spec.bundles,
+            running: spec.running,
+            apple: spec.apple,
         });
     }
     note
@@ -842,6 +854,8 @@ impl Targets {
                     section: c.section,
                     rows: vec![trow],
                     bundles: Vec::new(),
+                    running: false,
+                    apple: false,
                 }),
             }
         }
@@ -1863,6 +1877,7 @@ mod tests {
             g.rows.iter().all(|r| r.locked.is_some()),
             "running payload locks the group"
         );
+        assert!(g.running && !g.apple, "and the group says it is running");
         assert!(
             g.bundles
                 .contains(&s.home.join("real/A.app").canonicalize().unwrap())
