@@ -65,7 +65,7 @@ pub(crate) fn node_installs(home: &Path, places: &Places) -> Vec<NodeInstall> {
         let Ok(rd) = fs::read_dir(&versions) else {
             continue;
         };
-        let default = default_of(manager, &base);
+        let default = default_of(manager, &base, &versions);
         for e in rd.flatten() {
             let version = e.file_name().to_string_lossy().into_owned();
             let dir = e.path();
@@ -82,8 +82,8 @@ pub(crate) fn node_installs(home: &Path, places: &Places) -> Vec<NodeInstall> {
                 Manager::Nvm => dir.clone(),
             };
             let is_default = match &default {
-                Some(Default::Path(p)) => fs::canonicalize(&root).ok().as_ref() == Some(p),
-                Some(Default::Name(n)) => *n == version,
+                Some(DefaultOf::Path(p)) => fs::canonicalize(&root).ok().as_ref() == Some(p),
+                Some(DefaultOf::Name(n)) => *n == version,
                 None => false,
             };
             out.push(NodeInstall {
@@ -103,22 +103,66 @@ pub(crate) fn node_installs(home: &Path, places: &Places) -> Vec<NodeInstall> {
     out
 }
 
-enum Default {
+enum DefaultOf {
     Path(PathBuf),
     Name(String),
 }
 
-fn default_of(manager: Manager, base: &Path) -> Option<Default> {
+fn default_of(manager: Manager, base: &Path, versions: &Path) -> Option<DefaultOf> {
     match manager {
         // fnm: `aliases/default` links (through `lts-latest`) to an install.
         Manager::Fnm => fs::canonicalize(base.join("aliases/default"))
             .ok()
-            .map(Default::Path),
-        // nvm: `alias/default` is a file holding a version name (or `lts/*`).
-        Manager::Nvm => fs::read_to_string(base.join("alias/default"))
-            .ok()
-            .map(|s| Default::Name(s.trim().to_string())),
+            .map(DefaultOf::Path),
+        Manager::Nvm => resolve_nvm_alias(base, versions, "default").map(DefaultOf::Name),
     }
+}
+
+/// nvm aliases are files: `alias/default` holds `lts/*`, which `alias/lts/*`
+/// turns into `lts/iron`, which `alias/lts/iron` turns into `v20.11.0`. The
+/// names `node` and `stable` mean the newest install, and `v20` or `20` the
+/// newest 20.x. Gives the folder name of an installed version, if any.
+fn resolve_nvm_alias(base: &Path, versions: &Path, start: &str) -> Option<String> {
+    let installed: Vec<String> = fs::read_dir(versions)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| parse_version(n).is_some())
+        .collect();
+    let newest = |prefix: &str| {
+        installed
+            .iter()
+            .filter(|n| n.as_str() == prefix || n.starts_with(&format!("{prefix}.")))
+            .max_by_key(|n| parse_version(n))
+            .cloned()
+    };
+    let mut name = start.trim().to_string();
+    for _ in 0..8 {
+        if matches!(name.as_str(), "node" | "stable") {
+            return installed.iter().max_by_key(|n| parse_version(n)).cloned();
+        }
+        let wanted = if name.starts_with('v') {
+            name.clone()
+        } else {
+            format!("v{name}")
+        };
+        if wanted
+            .chars()
+            .skip(1)
+            .all(|c| c.is_ascii_digit() || c == '.')
+            && wanted.len() > 1
+        {
+            return newest(&wanted);
+        }
+        if name.contains("..") || name.starts_with('/') {
+            return None;
+        }
+        name = fs::read_to_string(base.join("alias").join(&name))
+            .ok()?
+            .trim()
+            .to_string();
+    }
+    None
 }
 
 /// The packages installed globally into one Node version: name (scoped names
@@ -232,6 +276,10 @@ pub struct RuntimeEntry {
     /// Taken by a bulk mark of its section (an old, unpinned, non-default
     /// install); everything else is marked row by row.
     pub bulk: bool,
+    /// Shown in the review next to its command: what removing it may disturb.
+    pub warn: Option<String>,
+    /// Why it cannot be marked right now (a running simulator).
+    pub refuse: Option<String>,
 }
 
 impl Manager {
@@ -314,6 +362,17 @@ pub(crate) fn discover_runtimes(
     places: &Places,
     projects: &[PathBuf],
 ) -> Vec<RuntimeEntry> {
+    // The Node of the shell this program was started from (fnm sets this).
+    let shell = std::env::var_os("FNM_MULTISHELL_PATH").and_then(|p| fs::canonicalize(p).ok());
+    discover_runtimes_in(home, places, projects, shell.as_deref())
+}
+
+pub(crate) fn discover_runtimes_in(
+    home: &Path,
+    places: &Places,
+    projects: &[PathBuf],
+    shell_node: Option<&Path>,
+) -> Vec<RuntimeEntry> {
     let installs = node_installs(home, places);
     // "Old" means older than the default, or than the newest when there is none.
     let reference = installs
@@ -332,25 +391,35 @@ pub(crate) fn discover_runtimes(
         if old {
             notes.push("older than the default".to_string());
         }
+        let in_shell =
+            shell_node.is_some_and(|sh| fs::canonicalize(&i.root).ok().as_deref() == Some(sh));
+        let mut warns: Vec<String> = Vec::new();
+        if i.is_default {
+            warns.push(
+                "this is the default Node: new shells have none until you pick another".to_string(),
+            );
+        }
+        if in_shell {
+            warns.push("the shell this program runs in uses it".to_string());
+            notes.push("used by this shell".to_string());
+        }
         if !pins.is_empty() {
             let names: Vec<String> = pins
                 .iter()
-                .take(3)
                 .map(|p| {
                     p.file_name()
                         .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
                 })
                 .collect();
-            let more = pins.len().saturating_sub(3);
             notes.push(format!(
-                "asked for by {} project(s): {}{}",
+                "asked for by {} project(s): {}",
                 pins.len(),
-                names.join(", "),
-                if more > 0 {
-                    format!(" and {more} more")
-                } else {
-                    String::new()
-                }
+                names.join(", ")
+            ));
+            warns.push(format!(
+                "{} project(s) ask for it; {} installs it again when they need it",
+                pins.len(),
+                i.manager.name()
             ));
         }
         let (mode, tail) = match uninstall_version(home, places, i) {
@@ -367,7 +436,9 @@ pub(crate) fn discover_runtimes(
         let group = format!("Node ({})", i.manager.name());
         out.push(RuntimeEntry {
             section: SectionKind::NodeVersions,
-            bulk: old && !i.is_default && pins.is_empty(),
+            bulk: old && !i.is_default && !in_shell && pins.is_empty(),
+            warn: (!warns.is_empty()).then(|| warns.join("; ")),
+            refuse: None,
             entry: ToolEntry {
                 id: version_id(i),
                 tool: group,
@@ -392,6 +463,8 @@ pub(crate) fn discover_runtimes(
             out.push(RuntimeEntry {
                 section: SectionKind::NodeGlobals,
                 bulk: false,
+                warn: None,
+                refuse: None,
                 entry: ToolEntry {
                     id: format!("{}{name}", globals_prefix(i)),
                     tool: format!("Node {} ({})", i.version, i.manager.name()),
@@ -409,7 +482,7 @@ pub(crate) fn discover_runtimes(
     uv_tools(home, places, &mut out);
     rust_toolchains(home, places, &mut out);
     cargo_binaries(home, places, &mut out);
-    android_sdk(home, &mut out);
+    android_sdk(home, places, &mut out);
     out
 }
 
@@ -457,6 +530,8 @@ fn push(out: &mut Vec<RuntimeEntry>, i: Item) {
     out.push(RuntimeEntry {
         section: i.section,
         bulk: false,
+        warn: None,
+        refuse: None,
         entry: ToolEntry {
             id: i.id,
             tool: i.group.to_string(),
@@ -469,14 +544,42 @@ fn push(out: &mut Vec<RuntimeEntry>, i: Item) {
     });
 }
 
+/// `cpython-3.12.13-macos-x86_64-none` as (what it is a build of, `3.12`
+/// plus the platform, the full version): the first two decide which builds
+/// compete, the third which one is newest.
+type PythonBuild = (String, String);
+type PythonVersion = (u32, u32, u32);
+
+fn python_key(name: &str) -> Option<(PythonBuild, PythonVersion)> {
+    let mut parts = name.splitn(3, '-');
+    let (kind, version, rest) = (parts.next()?, parts.next()?, parts.next()?);
+    let nums: Vec<u32> = version
+        .split('.')
+        .map(|n| n.parse().ok())
+        .collect::<Option<_>>()?;
+    let [a, b, c] = nums[..] else { return None };
+    Some(((kind.to_string(), format!("{a}.{b}-{rest}")), (a, b, c)))
+}
+
 /// Pythons that uv installed. The short names (`cpython-3.12-...`) are links
-/// to the full ones, so only the real folders are listed.
+/// to the full ones, so only the real folders are listed. A build is "old"
+/// when a newer patch of the same minor version is installed beside it.
 fn uv_pythons(home: &Path, places: &Places, out: &mut Vec<RuntimeEntry>) {
     let uv = find_exe(home, places, ".local/bin", "uv");
-    for (name, path) in real_dirs(&home.join(".local/share/uv/python")) {
-        if name.starts_with('.') {
-            continue;
+    let dirs: Vec<(String, PathBuf)> = real_dirs(&home.join(".local/share/uv/python"))
+        .into_iter()
+        .filter(|(n, _)| !n.starts_with('.'))
+        .collect();
+    let mut newest: std::collections::HashMap<(String, String), (u32, u32, u32)> =
+        Default::default();
+    for (name, _) in &dirs {
+        if let Some((k, v)) = python_key(name) {
+            let e = newest.entry(k).or_insert(v);
+            *e = (*e).max(v);
         }
+    }
+    for (name, path) in dirs {
+        let old = python_key(&name).is_some_and(|(k, v)| newest.get(&k).is_some_and(|n| v < *n));
         let spec = uv
             .as_ref()
             .map(|u| plain(home, u, &["python", "uninstall", &name]));
@@ -490,7 +593,11 @@ fn uv_pythons(home: &Path, places: &Places, out: &mut Vec<RuntimeEntry>) {
                 path,
                 regen: format!("reinstall with uv python install {name}"),
                 spec,
-                note: Some("virtual environments built on it stop working".to_string()),
+                note: Some(if old {
+                    "older: a newer patch of this Python is installed; virtual environments built on this one stop working".to_string()
+                } else {
+                    "virtual environments built on it stop working".to_string()
+                }),
             },
         );
     }
@@ -547,9 +654,19 @@ fn rust_toolchains(home: &Path, places: &Places, out: &mut Vec<RuntimeEntry>) {
                 path,
                 regen: format!("reinstall with rustup toolchain install {name}"),
                 spec,
-                note: is_default.then(|| "the default toolchain".to_string()),
+                note: Some(if is_default {
+                    "the default toolchain".to_string()
+                } else {
+                    "not the default toolchain".to_string()
+                }),
             },
         );
+        if is_default && let Some(last) = out.last_mut() {
+            last.warn = Some(
+                "rustup's default toolchain: cargo and rustc stop working until you set another default"
+                    .to_string(),
+            );
+        }
     }
 }
 
@@ -646,7 +763,7 @@ fn runtime_title(key: &str) -> String {
 
 /// iOS simulator devices, from `simctl list -j devices` (slow: it starts
 /// CoreSimulator, so this runs once on the discovery thread). A running
-/// device is left out: it has to be shut down before it can be removed.
+/// device is listed but refused: it has to be shut down before it can be removed.
 pub fn discover_simulators(home: &Path, runner: &dyn CommandRunner) -> Vec<RuntimeEntry> {
     let xcrun = Path::new("/usr/bin/xcrun");
     if !is_executable(xcrun) {
@@ -678,13 +795,17 @@ pub fn discover_simulators(home: &Path, runner: &dyn CommandRunner) -> Vec<Runti
             };
             let booted = d.get("state").and_then(|v| v.as_str()) == Some("Booted");
             let path = base.join(udid);
-            if !is_uuid(udid) || booted || !path.is_dir() {
+            if !is_uuid(udid) || !path.is_dir() {
                 continue;
             }
             let usable = d.get("isAvailable").and_then(|v| v.as_bool()) != Some(false);
             out.push(RuntimeEntry {
                 section: SectionKind::Simulators,
                 bulk: false,
+                warn: None,
+                refuse: booted.then(|| {
+                    format!("{name} is running: shut it down first (xcrun simctl shutdown {udid})")
+                }),
                 entry: ToolEntry {
                     id: format!("sim:{udid}"),
                     tool: group.clone(),
@@ -692,9 +813,13 @@ pub fn discover_simulators(home: &Path, runner: &dyn CommandRunner) -> Vec<Runti
                     path,
                     regen: "create it again in Xcode (its apps and data are lost)".to_string(),
                     mode: Mode::Command(plain(home, xcrun, &["simctl", "delete", udid])),
-                    note: (!usable).then(|| {
-                        "unavailable: its runtime is gone, nothing can start it".to_string()
-                    }),
+                    note: if booted {
+                        Some("running now: it cannot be removed until it is shut down".to_string())
+                    } else {
+                        (!usable).then(|| {
+                            "unavailable: its runtime is gone, nothing can start it".to_string()
+                        })
+                    },
                 },
             });
         }
@@ -702,8 +827,17 @@ pub fn discover_simulators(home: &Path, runner: &dyn CommandRunner) -> Vec<Runti
     out
 }
 
-/// The `sdkmanager` of the Android SDK in `sdk`, newest command-line tools first.
-fn sdkmanager(sdk: &Path) -> Option<PathBuf> {
+/// The `sdkmanager` to run for the SDK in `sdk`. The one the user's `PATH`
+/// finds inside this SDK comes first: they chose it, and a newer one in
+/// `cmdline-tools/latest` may need a newer Java than they have. Then
+/// `latest`, then the other versions, newest first.
+fn sdkmanager(home: &Path, places: &Places, sdk: &Path) -> Option<PathBuf> {
+    if let Some(own) = resolve_in(home, "sdkmanager", places)
+        .into_iter()
+        .find(|p| p.starts_with(sdk))
+    {
+        return Some(own);
+    }
     let tools = sdk.join("cmdline-tools");
     let mut dirs: Vec<PathBuf> = vec![tools.join("latest")];
     if let Ok(rd) = fs::read_dir(&tools) {
@@ -733,9 +867,9 @@ fn sdk_package_id(dir: &Path) -> Option<String> {
 /// SDK components: platforms, build-tools, ndk, cmake, sources and system
 /// images. `cmdline-tools` and `platform-tools` are what manage the SDK and
 /// are not listed.
-fn android_sdk(home: &Path, out: &mut Vec<RuntimeEntry>) {
+fn android_sdk(home: &Path, places: &Places, out: &mut Vec<RuntimeEntry>) {
     let sdk = home.join("Library/Android/sdk");
-    let manager = sdkmanager(&sdk);
+    let manager = sdkmanager(home, places, &sdk);
     for (category, depth) in [
         ("platforms", 1),
         ("build-tools", 1),
@@ -786,6 +920,101 @@ fn android_sdk(home: &Path, out: &mut Vec<RuntimeEntry>) {
             );
         }
     }
+}
+
+/// Packages installed with `pnpm add -g`. pnpm 11 keeps each one (or each
+/// group added together with commas) in its own folder under `global/v11`,
+/// and removing any package of a group removes the whole group, so a row is
+/// a group. Asked from pnpm itself, so it runs on the discovery thread.
+pub(crate) fn pnpm_globals(
+    home: &Path,
+    runner: &dyn CommandRunner,
+    places: &Places,
+) -> Vec<RuntimeEntry> {
+    let mut out: Vec<RuntimeEntry> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for pnpm in resolve_in(home, "pnpm", places) {
+        let spec = pinned(home, &pnpm, &["ls", "-g", "--json", "--depth=0"]);
+        let Some(json) = runner
+            .query(&spec)
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        else {
+            continue;
+        };
+        for root in json.as_array().into_iter().flatten() {
+            let global = root.get("path").and_then(|p| p.as_str()).map(PathBuf::from);
+            let mut groups: std::collections::BTreeMap<PathBuf, Vec<String>> = Default::default();
+            for (name, dep) in root
+                .get("dependencies")
+                .and_then(|d| d.as_object())
+                .into_iter()
+                .flatten()
+            {
+                let Some(path) = dep.get("path").and_then(|p| p.as_str()) else {
+                    continue;
+                };
+                let Some((dir, _)) = path.split_once("/node_modules/") else {
+                    continue;
+                };
+                let dir = PathBuf::from(dir);
+                // A real install group: inside the global folder, never the folder itself.
+                if !safe_name(name)
+                    || !dir.starts_with(home)
+                    || global
+                        .as_ref()
+                        .is_none_or(|g| dir == *g || !dir.starts_with(g))
+                    || !dir.is_dir()
+                {
+                    continue;
+                }
+                groups.entry(dir).or_default().push(name.clone());
+            }
+            for (dir, mut names) in groups {
+                if seen.contains(&dir) {
+                    continue;
+                }
+                seen.push(dir.clone());
+                names.sort();
+                let id = dir
+                    .file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                let first = names[0].clone();
+                out.push(RuntimeEntry {
+                    section: SectionKind::PnpmGlobals,
+                    bulk: false,
+                    warn: None,
+                    refuse: None,
+                    entry: ToolEntry {
+                        id: format!("pnpm-global:{id}"),
+                        tool: "pnpm global packages".to_string(),
+                        label: names.join(", "),
+                        path: dir,
+                        regen: format!("reinstall with pnpm add -g {}", names.join(",")),
+                        mode: Mode::Command(pinned(home, &pnpm, &["remove", "-g", &first])),
+                        note: (names.len() > 1).then(|| {
+                            format!(
+                                "installed together: removing one removes all of {}",
+                                names.join(", ")
+                            )
+                        }),
+                    },
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Everything that needs a program to answer: simulators and pnpm's global
+/// packages. Slow, so the app runs it once on its discovery thread.
+pub(crate) fn discover_slow(
+    home: &Path,
+    runner: &dyn CommandRunner,
+    places: &Places,
+) -> Vec<RuntimeEntry> {
+    let mut out = pnpm_globals(home, runner, places);
+    out.extend(discover_simulators(home, runner));
+    out
 }
 
 #[cfg(test)]
@@ -1041,7 +1270,18 @@ mod tests {
             .iter()
             .find(|r| r.entry.label.starts_with("nightly"))
             .unwrap();
-        assert!(nightly.entry.note.is_none());
+        assert_eq!(
+            nightly.entry.note.as_deref(),
+            Some("not the default toolchain")
+        );
+        assert!(nightly.warn.is_none());
+        assert!(
+            stable
+                .warn
+                .as_deref()
+                .unwrap()
+                .contains("cargo and rustc stop working")
+        );
     }
 
     #[test]
@@ -1160,7 +1400,7 @@ mod tests {
         {"udid":"BBBBBBBB-2222-3333-4444-555555555555","name":"iPhone XR","state":"Shutdown","isAvailable":false}]}}"#;
 
     #[test]
-    fn simulators_leave_out_running_and_odd_devices_and_delete_by_udid() {
+    fn simulators_refuse_running_ones_skip_odd_ones_and_delete_by_udid() {
         let d = tempfile::tempdir().unwrap();
         let home = d.path();
         for u in [
@@ -1178,11 +1418,15 @@ mod tests {
             ids,
             [
                 "sim:BBBBBBBB-2222-3333-4444-555555555555",
-                "sim:11111111-2222-3333-4444-555555555555"
+                "sim:11111111-2222-3333-4444-555555555555",
+                "sim:AAAAAAAA-2222-3333-4444-555555555555"
             ]
         );
         assert_eq!(got[1].entry.tool, "iOS 17.2");
         assert_eq!(command(&got[1])[..2], ["simctl", "delete"]);
+        assert!(got[1].refuse.is_none());
+        let why = got[2].refuse.as_deref().unwrap();
+        assert!(why.contains("shut it down first"), "{why}");
         assert!(
             got[0]
                 .entry
@@ -1200,5 +1444,195 @@ mod tests {
         assert!(discover_simulators(d.path(), &runner).is_empty());
         let none = crate::catalog::command::FakeRunner::new(&[]);
         assert!(discover_simulators(d.path(), &none).is_empty());
+    }
+
+    #[test]
+    fn an_older_patch_of_a_python_is_flagged_old() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join(".local/share/uv/python");
+        for n in [
+            "cpython-3.12.4-macos-aarch64-none",
+            "cpython-3.12.13-macos-aarch64-none",
+            "cpython-3.13.1-macos-aarch64-none",
+        ] {
+            mk(&base.join(n));
+        }
+        let got = entries(d.path(), SectionKind::PythonVersions);
+        let note = |n: &str| {
+            got.iter()
+                .find(|r| r.entry.label == n)
+                .and_then(|r| r.entry.note.clone())
+                .unwrap()
+        };
+        assert!(note("cpython-3.12.4-macos-aarch64-none").starts_with("older"));
+        assert!(!note("cpython-3.12.13-macos-aarch64-none").starts_with("older"));
+        assert!(!note("cpython-3.13.1-macos-aarch64-none").starts_with("older"));
+    }
+
+    #[test]
+    fn nvm_aliases_are_followed_to_an_installed_version() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        mk(&home.join(".nvm/versions/node/v18.2.0/bin"));
+        mk(&home.join(".nvm/versions/node/v20.11.0/bin"));
+        mk(&home.join(".nvm/versions/node/v20.9.0/bin"));
+        mk(&home.join(".nvm/alias/lts"));
+        let default_is = |text: &str| {
+            fs::write(home.join(".nvm/alias/default"), text).unwrap();
+            node_installs(home, &places())
+                .into_iter()
+                .find(|i| i.is_default)
+                .map(|i| i.version)
+        };
+        fs::write(home.join(".nvm/alias/lts/*"), "lts/iron\n").unwrap();
+        fs::write(home.join(".nvm/alias/lts/iron"), "v20.11.0\n").unwrap();
+        assert_eq!(default_is("lts/*").as_deref(), Some("v20.11.0"));
+        assert_eq!(default_is("node").as_deref(), Some("v20.11.0"));
+        assert_eq!(default_is("stable").as_deref(), Some("v20.11.0"));
+        assert_eq!(default_is("20").as_deref(), Some("v20.11.0"));
+        assert_eq!(default_is("v20.9").as_deref(), Some("v20.9.0"));
+        assert_eq!(default_is("18").as_deref(), Some("v18.2.0"));
+        assert_eq!(default_is("v22"), None, "not installed");
+        assert_eq!(default_is("../../etc/passwd"), None);
+        assert_eq!(default_is("lts/missing"), None);
+        // an alias that points at itself ends instead of looping
+        fs::write(home.join(".nvm/alias/loop"), "loop").unwrap();
+        assert_eq!(default_is("loop"), None);
+    }
+
+    #[test]
+    fn the_default_pinned_and_shell_versions_carry_warnings() {
+        let (_d, home) = fnm_home();
+        let proj = project(&home, "shop", &[(".nvmrc", "v22.1")]);
+        let shell =
+            fs::canonicalize(home.join(".local/share/fnm/node-versions/v20.9.0/installation"))
+                .unwrap();
+        let got: Vec<RuntimeEntry> = discover_runtimes_in(&home, &places(), &[proj], Some(&shell))
+            .into_iter()
+            .filter(|r| r.section == SectionKind::NodeVersions)
+            .collect();
+        let w = |v: &str| {
+            got.iter()
+                .find(|r| r.entry.label == v)
+                .unwrap()
+                .warn
+                .clone()
+        };
+        assert!(w("v22.10.0").unwrap().contains("default Node"));
+        assert!(w("v22.1.0").unwrap().contains("1 project(s) ask for it"));
+        assert!(w("v20.9.0").unwrap().contains("shell this program runs in"));
+        let bulk = |v: &str| got.iter().find(|r| r.entry.label == v).unwrap().bulk;
+        assert!(!bulk("v22.10.0") && !bulk("v22.1.0") && !bulk("v20.9.0"));
+        let note = got
+            .iter()
+            .find(|r| r.entry.label == "v22.1.0")
+            .and_then(|r| r.entry.note.clone())
+            .unwrap();
+        assert!(note.contains("shop"), "every project is named: {note}");
+    }
+
+    #[test]
+    fn a_half_removed_install_is_listed_without_packages_and_never_panics() {
+        let d = tempfile::tempdir().unwrap();
+        mk(&d.path().join(".local/share/fnm/node-versions/v18.0.0"));
+        let got = entries(d.path(), SectionKind::NodeVersions);
+        assert_eq!(got.len(), 1);
+        assert!(entries(d.path(), SectionKind::NodeGlobals).is_empty());
+    }
+
+    #[test]
+    fn the_sdkmanager_on_path_inside_the_sdk_wins_over_latest() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        let sdk = home.join("Library/Android/sdk");
+        exe(&sdk.join("cmdline-tools/latest/bin/sdkmanager"));
+        exe(&sdk.join("cmdline-tools/7.0/bin/sdkmanager"));
+        exe(&home.join("elsewhere/sdkmanager"));
+        pkg(&sdk.join("platforms/android-34"), "platforms;android-34");
+        let on_path =
+            std::env::join_paths([home.join("elsewhere"), sdk.join("cmdline-tools/7.0/bin")])
+                .unwrap();
+        let with_path = Places {
+            path_var: Some(on_path),
+            ..places()
+        };
+        let got = discover_runtimes(home, &with_path, &[]);
+        let android = got
+            .iter()
+            .find(|r| r.section == SectionKind::AndroidSdk)
+            .unwrap();
+        let Mode::Command(spec) = &android.entry.mode else {
+            panic!("not a command")
+        };
+        assert!(
+            spec.program.ends_with("cmdline-tools/7.0/bin/sdkmanager"),
+            "{}",
+            spec.program
+        );
+        // with nothing on PATH, latest is the fallback
+        let got = entries(home, SectionKind::AndroidSdk);
+        let Mode::Command(spec) = &got[0].entry.mode else {
+            panic!("not a command")
+        };
+        assert!(
+            spec.program
+                .ends_with("cmdline-tools/latest/bin/sdkmanager")
+        );
+    }
+
+    const PNPM_LS: &str = r#"[{"path":"HOME/Library/pnpm/global/v11","dependencies":{
+      "prettier":{"version":"3.9.9","path":"HOME/Library/pnpm/global/v11/aaa/node_modules/prettier"},
+      "eslint":{"version":"9.0.0","path":"HOME/Library/pnpm/global/v11/bbb/node_modules/eslint"},
+      "@x/plugin":{"version":"1.0.0","path":"HOME/Library/pnpm/global/v11/bbb/node_modules/@x/plugin"},
+      "old-style":{"version":"1.0.0","path":"HOME/Library/pnpm/global/v11/node_modules/old-style"},
+      "-rf":{"version":"1.0.0","path":"HOME/Library/pnpm/global/v11/ccc/node_modules/-rf"},
+      "outside":{"version":"1.0.0","path":"/elsewhere/ddd/node_modules/outside"}}}]"#;
+
+    #[test]
+    fn pnpm_globals_are_install_groups_removed_by_their_first_package() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        exe(&home.join("Library/pnpm/pnpm"));
+        for g in ["aaa", "bbb", "ccc"] {
+            mk(&home.join("Library/pnpm/global/v11").join(g));
+        }
+        let json = PNPM_LS.replace("HOME", &home.to_string_lossy());
+        let runner = crate::catalog::command::FakeRunner::new(&[]).answering(&[("ls -g", &json)]);
+        let got = pnpm_globals(home, &runner, &places());
+        let rows: Vec<(String, String)> = got
+            .iter()
+            .map(|r| (r.entry.id.clone(), r.entry.label.clone()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("pnpm-global:aaa".to_string(), "prettier".to_string()),
+                (
+                    "pnpm-global:bbb".to_string(),
+                    "@x/plugin, eslint".to_string()
+                ),
+            ],
+            "the old-style, option-like and outside entries are skipped"
+        );
+        assert_eq!(command(&got[1]), ["remove", "-g", "@x/plugin"]);
+        assert!(
+            got[1]
+                .entry
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("removes all of")
+        );
+        assert!(got[0].entry.note.is_none());
+    }
+
+    #[test]
+    fn pnpm_that_cannot_answer_lists_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        exe(&d.path().join("Library/pnpm/pnpm"));
+        let bad = crate::catalog::command::FakeRunner::new(&[]).answering(&[("ls -g", "garbage")]);
+        assert!(pnpm_globals(d.path(), &bad, &places()).is_empty());
+        let silent = crate::catalog::command::FakeRunner::new(&[]);
+        assert!(pnpm_globals(d.path(), &silent, &places()).is_empty());
     }
 }

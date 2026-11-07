@@ -7,7 +7,8 @@ use ratatui::layout::Rect;
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
 use crate::bg::{Latest, Work};
-use crate::catalog::runtimes::{RuntimeEntry, discover_simulators};
+use crate::catalog::resolve::Places;
+use crate::catalog::runtimes::{RuntimeEntry, discover_slow};
 use crate::catalog::{
     CommandRunner, CommandSpec, RunControl, SystemRunner, ToolEntry, discover_tools, is_lock_wait,
 };
@@ -244,6 +245,8 @@ pub struct ReviewCommand {
     /// shown as part of this row (`(id, spec)`): a bulk mark of fifty build
     /// cache records is one reviewable row, not fifty.
     pub group: Vec<(String, CommandSpec)>,
+    /// What running it may disturb (the default Node, a pinned version).
+    pub warn: Option<String>,
 }
 
 impl ReviewCommand {
@@ -511,6 +514,8 @@ pub struct App {
     tools_rx: Option<mpsc::Receiver<(Vec<ToolEntry>, Vec<RuntimeEntry>)>>,
     /// Runtime rows that need a slow command, found once (simulators).
     runtime_extra: Vec<RuntimeEntry>,
+    /// Ids of commands that ran this session (see `BuildSource::ran`).
+    ran_commands: HashSet<String>,
     tools_started: bool,
     /// Keys of the groups the user folded (kept across rebuilds).
     closed_groups: HashSet<String>,
@@ -672,6 +677,7 @@ impl App {
             tool_entries: Vec::new(),
             tools_rx: None,
             runtime_extra: Vec::new(),
+            ran_commands: HashSet::new(),
             tools_started: false,
             closed_groups: HashSet::new(),
             targets_synced: false,
@@ -1700,7 +1706,13 @@ impl App {
                             &name,
                         );
                     }
-                    crate::targets::RowKind::Command { id, .. } => {
+                    crate::targets::RowKind::Command { id, notes, .. } => {
+                        if !self.tool_marks.contains(id)
+                            && let Some(why) = &notes.refuse
+                        {
+                            self.notice = Some(why.clone());
+                            return;
+                        }
                         if !self.tool_marks.remove(id) {
                             if let MarkState::Covered(_) = self.mark_state(&t.row.path) {
                                 self.notice =
@@ -2029,7 +2041,7 @@ impl App {
             .iter()
             .flat_map(|g| g.rows.iter().map(move |r| (g, r)))
             .filter_map(|(g, r)| match &r.kind {
-                crate::targets::RowKind::Command { id, spec }
+                crate::targets::RowKind::Command { id, spec, notes }
                     if self.tool_marks.contains(id)
                         && !self.marks.keys().any(|m| r.row.path.starts_with(m)) =>
                 {
@@ -2043,6 +2055,7 @@ impl App {
                         can_force: spec.can_force(),
                         force: false,
                         group: Vec::new(),
+                        warn: notes.warn.clone(),
                     })
                 }
                 _ => None,
@@ -2173,7 +2186,7 @@ impl App {
         work.begin("looking for installed tools", 0);
         std::thread::spawn(move || {
             let tools = discover_tools(&home, runner.as_ref(), &work);
-            let extra = discover_simulators(&home, runner.as_ref());
+            let extra = discover_slow(&home, runner.as_ref(), &Places::from_env());
             let _ = tx.send((tools, extra));
         });
         self.tools_rx = Some(rx);
@@ -2213,6 +2226,7 @@ impl App {
             policy: Arc::clone(&self.policy),
             entries: self.tool_entries.clone(),
             runtime_extra: self.runtime_extra.clone(),
+            ran: self.ran_commands.clone(),
             closed: self.closed_groups.clone(),
         };
         let work = Arc::clone(&self.build_work);
@@ -2679,6 +2693,7 @@ impl App {
         let mut docker_ran = false;
         let mut snapshots_ran = false;
         for (id, _) in std::mem::take(&mut self.pending_commands) {
+            self.ran_commands.insert(id.clone());
             docker_ran |= dockerpage::is_docker_id(&id);
             snapshots_ran |= snappage::is_snapshot_id(&id);
             self.tool_marks.remove(&id);
@@ -6091,5 +6106,111 @@ mod runtime_page_tests {
             lines.contains(&"npm uninstall -g @x/tool".to_string()),
             "{lines:?}"
         );
+    }
+
+    fn row_kind(app: &App, name: &str) -> (crate::targets::RowKind, Option<String>) {
+        let (g, r) = app
+            .tlines
+            .iter()
+            .find_map(|l| match *l {
+                Line::Row { group, row }
+                    if app.targets.row(group, row).row.name.to_string_lossy() == name =>
+                {
+                    Some((group, row))
+                }
+                _ => None,
+            })
+            .expect("row not found");
+        let t = app.targets.row(g, r);
+        (t.kind.clone(), t.note.clone())
+    }
+
+    #[test]
+    fn a_row_whose_command_ran_but_left_its_folder_becomes_a_folder_move() {
+        let mut e = fnm_env();
+        open(&mut e);
+        cursor_on(&mut e.app, None, Some("v20.9.0"));
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        crate::testutil::settle(&mut e.app);
+        e.app.settle_targets();
+        // The fake command removed nothing, so the folder is still there.
+        assert!(
+            e.home
+                .join(".local/share/fnm/node-versions/v20.9.0")
+                .exists()
+        );
+        let (kind, note) = row_kind(&e.app, "v20.9.0");
+        assert!(matches!(kind, crate::targets::RowKind::Folder), "{kind:?}");
+        assert!(
+            note.unwrap()
+                .contains("left behind by `fnm uninstall v20.9.0`")
+        );
+        // Marking it now moves the folder (a path mark, no command).
+        e.app.update(Action::Cancel); // dismiss the finish dialog
+        cursor_on(&mut e.app, None, Some("v20.9.0"));
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.tool_marks.is_empty());
+        assert_eq!(e.app.marks.len(), 1, "notice: {:?}", e.app.notice);
+        // The untouched version is still a command.
+        let (kind, _) = row_kind(&e.app, "v22.10.0");
+        assert!(matches!(kind, crate::targets::RowKind::Command { .. }));
+    }
+
+    #[test]
+    fn a_running_simulator_cannot_be_marked() {
+        use crate::catalog::runtimes::RuntimeEntry;
+        use crate::catalog::{CommandSpec, Mode, ToolEntry};
+        let udid = "AAAAAAAA-2222-3333-4444-555555555555";
+        let rel = format!("Library/Developer/CoreSimulator/Devices/{udid}/data/x.bin");
+        let mut e = env_with(&[(rel.as_str(), 4000)], |_| {});
+        let path = e
+            .home
+            .join(format!("Library/Developer/CoreSimulator/Devices/{udid}"));
+        e.app.tools_started = true; // no discovery thread: we set the rows
+        e.app.runtime_extra = vec![RuntimeEntry {
+            section: SectionKind::Simulators,
+            bulk: false,
+            warn: None,
+            refuse: Some("iPhone is running: shut it down first".to_string()),
+            entry: ToolEntry {
+                id: format!("sim:{udid}"),
+                tool: "iOS 17.2".to_string(),
+                label: "iPhone".to_string(),
+                path,
+                regen: String::new(),
+                mode: Mode::Command(CommandSpec::new(
+                    "/usr/bin/xcrun",
+                    &["simctl", "delete", udid],
+                )),
+                note: None,
+            },
+        }];
+        open(&mut e);
+        cursor_on(&mut e.app, None, Some("iPhone"));
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.tool_marks.is_empty());
+        assert!(
+            e.app
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("shut it down first")
+        );
+    }
+
+    #[test]
+    fn the_review_carries_the_warning_of_a_marked_default_version() {
+        let mut e = fnm_env();
+        open(&mut e);
+        cursor_on(&mut e.app, None, Some("v22.10.0"));
+        e.app.update(Action::ToggleMark);
+        e.app.update(Action::OpenReview);
+        let Some(Dialog::Review(r)) = &e.app.dialog else {
+            panic!("no review")
+        };
+        let w = r.commands[0].warn.clone().unwrap();
+        assert!(w.contains("default Node"), "{w}");
     }
 }

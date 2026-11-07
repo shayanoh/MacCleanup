@@ -153,6 +153,9 @@ Implemented per `docs/superpowers/plans/2026-11-06-caches-projects.md`, then ext
 - After a cleanup the scan follows the disk: moved folders leave the tree at once (`Scanner::forget_dir`), folders a command changed are scanned again (`rescan_dir`, one at a time), and the list rebuilds.
 - Progress readouts: the scan shows a moving bar and its counters; the tool lookup and the list build show their phase, and the build a filled bar by stage.
 
+**Shared with the Runtimes page** (design `2026-11-07-packages-runtimes-design.md`)
+- The Runtimes page is this list with other sections: `SectionKind::page()` says which screen shows a section (`Page::Caches` or `Page::Runtimes`), `Targets::lines(filter, page)` picks them, and `App::on_targets()` is true on both screens. Nested folders are deduplicated per page (a Node version and the packages inside it both show). Command rows carry `CommandNotes` (a `warn` shown in the review, a `refuse` that stops marking). A runtime row whose command ran this session and whose folder is still there turns into a folder move.
+
 **Deferred minor items (not fixed)**
 - A marked folder spanning both sections counts in only one band's "frees" (the footer is right).
 - A command mark survives under a covering folder mark and comes back if the folder is unmarked (it is still reviewed and needs `y`).

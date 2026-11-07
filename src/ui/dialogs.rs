@@ -179,7 +179,13 @@ pub fn review_layout(area: Rect, r: &Review) -> ReviewLayout {
     let n = r.commands.len();
     // A forceable command gets one more line saying what `f` does.
     let forceable = r.commands.iter().filter(|c| c.can_force).count();
-    let full = if n == 0 { 0 } else { n * 2 + 2 + forceable };
+    // A command with a warning gets one more line saying what it may disturb.
+    let warned = r.commands.iter().filter(|c| c.warn.is_some()).count();
+    let full = if n == 0 {
+        0
+    } else {
+        n * 2 + 2 + forceable + warned
+    };
     let compact_lines = if n == 0 { 0 } else { n + 2 };
     let max_h = area.height.saturating_sub(2) as usize;
     let height = (r.items.len() + full + 14).min(max_h).max(13);
@@ -291,8 +297,14 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
         for c in r.commands.iter().take(lay.shown_commands) {
             // The whole command: what it will do must be readable before it
             // is confirmed. Which tool, how much and where from go below.
+            // In the short layout a warning shows as a marker instead of a line.
+            let marker = if c.warn.is_some() && lay.compact {
+                Span::styled(format!("  {} ", g.warn()), Style::default().fg(CAUTION))
+            } else {
+                Span::styled(format!("  {} ", g.dot()), Style::default().fg(DANGER))
+            };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", g.dot()), Style::default().fg(DANGER)),
+                marker,
                 Span::styled(
                     fit(&c.line, (inner.width as usize).saturating_sub(4), g),
                     // A forced command is drawn in red: it skips a safety check.
@@ -317,6 +329,16 @@ fn review(frame: &mut Frame, area: Rect, g: &Glyphs, r: &Review, scroll: usize, 
                     ),
                     Style::default().fg(DIM),
                 )));
+                if let Some(w) = &c.warn {
+                    lines.push(Line::from(Span::styled(
+                        fit(
+                            &format!("    {} {w}", g.warn()),
+                            (inner.width as usize).saturating_sub(2),
+                            g,
+                        ),
+                        Style::default().fg(CAUTION),
+                    )));
+                }
                 if c.can_force {
                     lines.push(Line::from(if c.force {
                         Span::styled(
@@ -935,6 +957,7 @@ mod review_layout_tests {
                     can_force: false,
                     force: false,
                     group: Vec::new(),
+                    warn: None,
                 })
                 .collect(),
             total: Usage::default(),

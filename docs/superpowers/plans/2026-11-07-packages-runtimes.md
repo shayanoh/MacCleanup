@@ -81,7 +81,11 @@ One `discover_*` function each in `runtimes.rs`, entries as in the spec table. V
 
 ### Task 6: Leftovers and docs
 
-Row switches to a folder move when its command ran and the folder remains; final README/CLAUDE.md/spec updates.
+DONE. Row switches to a folder move when its command ran and the folder remains (`App::ran_commands`, `BuildSource::ran`); README, CLAUDE.md and the Caches design section 11 updated.
+
+### Added after the first slice (all done)
+
+Pnpm global packages by install group; review warnings (`CommandNotes::warn`); `refuse` for running simulators; old flag for uv Pythons and non-default Rust toolchains; every pinning project named; nvm alias resolution; the shell's own Node; `sdkmanager` chosen from `PATH` first. Commands checked against `--help` and docs: `simctl delete`, `pnpm remove -g` (group semantics), `sdkmanager --sdk_root --uninstall`, `uv python/tool uninstall`, `rustup toolchain uninstall`, `cargo uninstall`, `fnm uninstall`.
 
 ## Self-review
 

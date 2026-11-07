@@ -27,6 +27,7 @@ pub enum SectionKind {
     UvTools,
     RustToolchains,
     CargoBinaries,
+    PnpmGlobals,
     AndroidSdk,
     Simulators,
 }
@@ -47,11 +48,12 @@ impl SectionKind {
     }
 
     /// Sections in the order they are listed.
-    pub const ALL: [SectionKind; 11] = [
+    pub const ALL: [SectionKind; 12] = [
         SectionKind::Projects,
         SectionKind::Tools,
         SectionKind::NodeVersions,
         SectionKind::NodeGlobals,
+        SectionKind::PnpmGlobals,
         SectionKind::PackageManagers,
         SectionKind::PythonVersions,
         SectionKind::UvTools,
@@ -67,7 +69,20 @@ pub enum RowKind {
     /// A folder that is moved to ToBeDeleted.
     Folder,
     /// Cleaned by the tool's own command (never moved).
-    Command { id: String, spec: CommandSpec },
+    Command {
+        id: String,
+        spec: CommandSpec,
+        notes: Box<CommandNotes>,
+    },
+}
+
+/// What a command row says about itself beyond its command.
+#[derive(Clone, Debug, Default)]
+pub struct CommandNotes {
+    /// Shown in the review: what removing it may disturb.
+    pub warn: Option<String>,
+    /// Why it cannot be marked now (a running simulator).
+    pub refuse: Option<String>,
 }
 
 /// One row: the Explorer's [`Row`] plus what only this screen knows.
@@ -293,6 +308,9 @@ pub struct BuildSource {
     pub entries: Vec<ToolEntry>,
     /// Runtime rows found once by the slow discovery (simulators).
     pub runtime_extra: Vec<RuntimeEntry>,
+    /// Ids of commands that ran this session: a runtime row whose folder is
+    /// still there after its command ran becomes a folder move.
+    pub ran: HashSet<String>,
     pub closed: HashSet<String>,
 }
 
@@ -306,6 +324,7 @@ impl Targets {
             policy,
             entries,
             runtime_extra,
+            ran,
             closed,
         } = src;
         let (home, scan_idle) = (home.as_path(), *scan_idle);
@@ -333,6 +352,7 @@ impl Targets {
                     Mode::Command(spec) => RowKind::Command {
                         id: e.id.clone(),
                         spec: spec.clone(),
+                        notes: Box::default(),
                     },
                 },
                 regen: e.regen.clone(),
@@ -382,6 +402,15 @@ impl Targets {
             if node.is_none() && !e.path.is_file() {
                 continue;
             }
+            // Its command ran and the folder is still there: move it instead.
+            let left_behind = match &e.mode {
+                Mode::Command(spec)
+                    if ran.contains(&e.id) && node.as_ref().is_none_or(|n| n.size() > 0) =>
+                {
+                    Some(spec.display())
+                }
+                _ => None,
+            };
             cands.push(Cand {
                 path: e.path,
                 node,
@@ -395,12 +424,25 @@ impl Targets {
                 member: false,
                 name: e.label,
                 kind: match e.mode {
+                    _ if left_behind.is_some() => RowKind::Folder,
                     Mode::Folder => RowKind::Folder,
-                    Mode::Command(spec) => RowKind::Command { id: e.id, spec },
+                    Mode::Command(spec) => RowKind::Command {
+                        id: e.id,
+                        spec,
+                        notes: Box::new(CommandNotes {
+                            warn: r.warn,
+                            refuse: r.refuse,
+                        }),
+                    },
                 },
                 regen: e.regen,
-                note: e.note,
-                bulk: r.bulk,
+                bulk: r.bulk && left_behind.is_none(),
+                note: match left_behind {
+                    Some(cmd) => Some(format!(
+                        "left behind by `{cmd}`: this row now moves the folder to ToBeDeleted"
+                    )),
+                    None => e.note,
+                },
             });
         }
 
@@ -666,6 +708,7 @@ mod tests {
             policy: Arc::new(Policy::new(&s.home, &s.hold)),
             entries: entries.to_vec(),
             runtime_extra: Vec::new(),
+            ran: HashSet::new(),
             closed,
         }
     }
@@ -1057,7 +1100,7 @@ mod tests {
         let t = build(&s, &[e]);
         let row = &t.groups.iter().find(|g| g.title == "pnpm").unwrap().rows[0];
         match &row.kind {
-            RowKind::Command { id, spec: got } => {
+            RowKind::Command { id, spec: got, .. } => {
                 assert_eq!(id, "pnpm-store:v11");
                 assert_eq!(got, &spec);
             }
@@ -1399,6 +1442,7 @@ mod stress {
             policy: Arc::new(policy),
             entries: entries.to_vec(),
             runtime_extra: Vec::new(),
+            ran: HashSet::new(),
             closed: HashSet::new(),
         };
         let work = Work::new();
@@ -1442,6 +1486,7 @@ mod stress {
                 policy: Arc::new(policy),
                 entries: Vec::new(),
                 runtime_extra: Vec::new(),
+                ran: HashSet::new(),
                 closed: HashSet::new(),
             };
             let t = Instant::now();

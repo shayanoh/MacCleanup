@@ -415,6 +415,7 @@ impl App {
             can_force: false,
             force: false,
             group: Vec::new(),
+            warn: None,
         };
         let mut out: Vec<(ItemKind, ReviewCommand, String)> = Vec::new();
         let mut trim = false;

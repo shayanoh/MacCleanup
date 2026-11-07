@@ -343,6 +343,7 @@ fn section_line(app: &App, kind: SectionKind, width: usize) -> TextLine<'static>
         SectionKind::Tools => (" TOOLS & CACHES", Color::Magenta),
         SectionKind::NodeVersions => (" NODE VERSIONS", Color::Green),
         SectionKind::NodeGlobals => (" NODE GLOBAL PACKAGES", Color::Cyan),
+        SectionKind::PnpmGlobals => (" PNPM GLOBAL PACKAGES", Color::Cyan),
         SectionKind::PackageManagers => (" PACKAGE MANAGERS (COREPACK)", Color::Yellow),
         SectionKind::PythonVersions => (" PYTHON (UV)", Color::Blue),
         SectionKind::UvTools => (" UV TOOLS", Color::Magenta),

@@ -620,6 +620,7 @@ mod tests {
                     can_force: false,
                     force: false,
                     group: Vec::new(),
+                    warn: None,
                 })
                 .collect(),
             total: Usage::default(),

@@ -3169,3 +3169,50 @@ fn time_machine_heading_is_the_select_all_row_and_measuring_shows_state() {
     assert!(busy.contains("measuring snapshot 1 of 1"), "{busy}");
     assert!(busy.contains("1 queued"), "{busy}");
 }
+
+#[test]
+fn the_review_shows_what_a_marked_default_node_version_may_disturb() {
+    use maccleanup::targets::Line;
+    use std::os::unix::fs::symlink;
+    let base = "home";
+    let _ = base;
+    let mut e = make_app_with(
+        &[
+            (
+                ".local/share/fnm/node-versions/v22.10.0/installation/bin/node",
+                100,
+            ),
+            (
+                ".local/share/fnm/node-versions/v20.9.0/installation/bin/node",
+                100,
+            ),
+        ],
+        GlyphMode::Nerd,
+        |home| {
+            let fnm = home.join(".local/share/fnm");
+            fs::create_dir_all(fnm.join("aliases")).unwrap();
+            symlink(
+                fnm.join("node-versions/v22.10.0/installation"),
+                fnm.join("aliases/default"),
+            )
+            .unwrap();
+        },
+    );
+    e.app.update(Action::GoTo(Screen::Runtimes));
+    wait_tools(&mut e.app);
+    let at = e
+        .app
+        .tlines
+        .iter()
+        .position(|l| match *l {
+            Line::Row { group, row } => e.app.targets.row(group, row).row.name == "v22.10.0",
+            _ => false,
+        })
+        .expect("the default version is listed");
+    e.app.tcursor = at;
+    e.app.update(Action::ToggleMark);
+    e.app.update(Action::OpenReview);
+    let text = render(&mut e.app, 140, 40);
+    assert!(text.contains("fnm uninstall v22.10.0"), "{text}");
+    assert!(text.contains("this is the default Node"), "{text}");
+}

@@ -297,6 +297,7 @@ impl App {
                     can_force: false,
                     force: false,
                     group: Vec::new(),
+                    warn: None,
                 })
             })
             .collect()
