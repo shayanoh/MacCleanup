@@ -15,4 +15,5 @@ pub use tools::{Mode, ToolEntry, discover_tools};
 pub mod appfiles;
 pub mod apppolicy;
 pub mod apps;
+pub mod leftovers;
 pub mod split;
