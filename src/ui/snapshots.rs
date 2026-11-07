@@ -11,6 +11,13 @@ use ratatui::widgets::{Paragraph, Wrap};
 use super::{ACCENT, CAUTION, DANGER, DIM, SELECTED_BG, fit, pad, panel, right};
 use crate::app::App;
 use crate::fmt::human_size;
+use crate::snapshots::Held;
+
+/// `730 MB - 1.2 GB`, or one size when both ends read the same.
+fn range(h: &Held) -> String {
+    let (lo, hi) = (human_size(h.low), human_size(h.high));
+    if lo == hi { lo } else { format!("{lo} - {hi}") }
+}
 
 /// `2026-11-07-032842` shown as `2026-11-07 03:28:42`.
 fn pretty(date: &str) -> String {
@@ -44,9 +51,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     );
     if count > 0 {
         totals.push_str(&format!(
-            " {} measured {} of {} snapshot(s)",
+            " {} measured {} in {} snapshot(s)",
             g.dot(),
-            human_size(measured),
+            range(&measured),
             count
         ));
     }
@@ -76,7 +83,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         Rect::new(inner.x, inner.y + 1, inner.width, 1),
     );
 
-    let size_w = 14;
+    let size_w = 20;
     let kind_w = 17;
     let name_w = width.saturating_sub(4 + size_w + kind_w + 2).max(8);
     let header = format!(
@@ -125,11 +132,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
                     .is_some_and(|d| app.snaps.measuring.contains(d));
                 let size = match (&snap.date, measuring) {
                     (_, true) => "measuring...".to_string(),
-                    (Some(d), _) => app
-                        .snaps
-                        .sizes
-                        .get(d)
-                        .map_or("press m".to_string(), |b| human_size(*b)),
+                    (Some(d), _) => app.snaps.sizes.get(d).map_or("press m".to_string(), range),
                     (None, _) => "-".to_string(),
                 };
                 let label = snap

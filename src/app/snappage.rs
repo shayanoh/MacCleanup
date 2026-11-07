@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
 use super::*;
-use crate::snapshots::{self, Settle, Snapshot};
+use crate::snapshots::{self, Held, Settle, Snapshot};
 
 /// Is this key in the shared selection a snapshot's?
 pub fn is_snapshot_id(id: &str) -> bool {
@@ -15,7 +15,7 @@ pub fn is_snapshot_id(id: &str) -> bool {
 }
 
 /// What a measuring job hands back: each date with its size or the reason it failed.
-pub type Measured = Vec<(String, Result<u64, String>)>;
+pub type Measured = Vec<(String, Result<Held, String>)>;
 
 pub struct SnapState {
     pub job: Latest<Result<Vec<Snapshot>, String>>,
@@ -29,7 +29,7 @@ pub struct SnapState {
     pub offset: usize,
     /// Estimated bytes each Time Machine snapshot holds, by date. Present
     /// only after the user measured it (a minute on a big disk).
-    pub sizes: HashMap<String, u64>,
+    pub sizes: HashMap<String, Held>,
     pub measure: Latest<Measured>,
     pub cancel: Arc<AtomicBool>,
     pub measuring: Vec<String>,
@@ -60,8 +60,12 @@ impl SnapState {
 
     /// Sum of the sizes measured so far, and how many Time Machine snapshots
     /// they cover.
-    pub fn measured_total(&self) -> (u64, usize) {
-        (self.sizes.values().sum(), self.sizes.len())
+    pub fn measured_total(&self) -> (Held, usize) {
+        let sum = self.sizes.values().fold(Held::default(), |a, h| Held {
+            low: a.low + h.low,
+            high: a.high + h.high,
+        });
+        (sum, self.sizes.len())
     }
 
     fn dates(&self) -> Vec<String> {
@@ -207,6 +211,7 @@ impl App {
             return;
         }
         let runner = Arc::clone(&self.runner);
+        let every = self.snaps.dates();
         let cancel = Arc::new(AtomicBool::new(false));
         self.snaps.cancel = Arc::clone(&cancel);
         self.snaps.measuring = dates.clone();
@@ -214,7 +219,7 @@ impl App {
             dates
                 .into_iter()
                 .map(|d| {
-                    let r = snapshots::measure(&*runner, &d, &cancel);
+                    let r = snapshots::measure(&*runner, &d, &every, &cancel);
                     (d, r)
                 })
                 .collect()
@@ -237,7 +242,7 @@ impl App {
                     tool: "Time Machine".to_string(),
                     line: spec.display(),
                     spec,
-                    up_to: self.snaps.sizes.get(date).copied().unwrap_or(0),
+                    up_to: self.snaps.sizes.get(date).map_or(0, |h| h.high),
                     path: PathBuf::new(),
                     can_force: false,
                     force: false,

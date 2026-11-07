@@ -186,28 +186,53 @@ fn relocate(vol: &Volume, ino: u64) -> Option<PathBuf> {
     Some(vol.mount.join(rel.strip_prefix("/").unwrap_or(rel)))
 }
 
+/// What deleting a snapshot would free, as a range in bytes. `low` counts
+/// only files that are really gone or rewritten; `high` also counts files
+/// that were renamed or moved as if they were deleted. File data only: the
+/// file system's own records (directories, extents) are not in either number,
+/// so Disk Utility can read a little more.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    pub low: u64,
+    pub high: u64,
+}
+
 /// What one estimate needs, shared by the walking threads.
 struct Estimate<'a> {
     live: &'a Path,
     vol: Option<Volume>,
+    /// The other snapshots' folders: what they also hold is not private.
+    others: &'a [PathBuf],
     cancel: &'a AtomicBool,
-    total: AtomicU64,
+    low: AtomicU64,
+    high: AtomicU64,
 }
 
-/// What the snapshot at `snap` holds that `live` no longer does, in bytes.
-/// A file gone from `live` counts in full, unless the same file (inode) lives
-/// on under another name; one whose size or modification time differs counts
-/// what the live copy does not still share with it; the same file counts
+/// What the snapshot at `snap` holds that `live` no longer does, and no
+/// other snapshot in `others` holds either (what Disk Utility calls Private
+/// Size). A file gone from `live` counts in full; one rewritten counts what
+/// the live copy does not still share with it; one that was renamed or moved
+/// (same inode elsewhere) counts only in `high`; an unchanged one counts
 /// nothing. `None` if `cancel` was set.
-pub fn estimate_held(snap: &Path, live: &Path, cancel: &AtomicBool) -> Option<u64> {
+pub fn estimate_held(
+    snap: &Path,
+    live: &Path,
+    others: &[PathBuf],
+    cancel: &AtomicBool,
+) -> Option<Held> {
     let est = Estimate {
         live,
         vol: volume_of(live),
+        others,
         cancel,
-        total: AtomicU64::new(0),
+        low: AtomicU64::new(0),
+        high: AtomicU64::new(0),
     };
     rayon::scope(|s| walk(snap, snap.to_path_buf(), &est, s));
-    (!cancel.load(Relaxed)).then(|| est.total.load(Relaxed))
+    (!cancel.load(Relaxed)).then(|| Held {
+        low: est.low.load(Relaxed),
+        high: est.high.load(Relaxed),
+    })
 }
 
 fn walk<'s>(root: &'s Path, dir: PathBuf, est: &'s Estimate<'s>, s: &rayon::Scope<'s>) {
@@ -227,36 +252,65 @@ fn walk<'s>(root: &'s Path, dir: PathBuf, est: &'s Estimate<'s>, s: &rayon::Scop
         } else if meta.is_file()
             && let Ok(rel) = path.strip_prefix(root)
         {
-            est.total
-                .fetch_add(held_by_file(&meta, &est.live.join(rel), est), Relaxed);
+            let (low, high) = held_by_file(&meta, rel, est);
+            est.low.fetch_add(low, Relaxed);
+            est.high.fetch_add(high, Relaxed);
         }
     }
 }
 
-fn held_by_file(snap: &fs::Metadata, live_path: &Path, est: &Estimate) -> u64 {
+/// The same file in the same state: inode, size and modification time.
+fn same_state(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.ino() == b.ino()
+        && a.len() == b.len()
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+}
+
+/// `(low, high)` bytes of one snapshot file that only this snapshot holds.
+fn held_by_file(snap: &fs::Metadata, rel: &Path, est: &Estimate) -> (u64, u64) {
     let snap_bytes = snap.blocks() * 512;
-    let live_path = match fs::symlink_metadata(live_path) {
-        Ok(_) => live_path.to_path_buf(),
+    let live_path = est.live.join(rel);
+    let (low, high) = match fs::symlink_metadata(&live_path) {
+        Ok(live) => {
+            let held = rewritten(snap, &live, &live_path);
+            (held, held)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Not at the same path: renamed or moved (same inode), or deleted.
-            match est
+            let moved = est
                 .vol
                 .as_ref()
                 .and_then(|v| relocate(v, snap.ino()))
                 // A mounted snapshot is its own device: a hit on the same
                 // device is the snapshot's own file, not a live one.
-                .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.dev() != snap.dev()))
-            {
-                Some(moved) => moved,
-                None => return snap_bytes,
+                .and_then(|p| {
+                    let m = fs::symlink_metadata(&p).ok()?;
+                    (m.dev() != snap.dev()).then(|| rewritten(snap, &m, &p))
+                });
+            match moved {
+                Some(held) => (held, snap_bytes),
+                None => (snap_bytes, snap_bytes),
             }
         }
         // Any other failure says nothing about the file.
-        Err(_) => return 0,
+        Err(_) => return (0, 0),
     };
-    let Ok(live) = fs::symlink_metadata(&live_path) else {
-        return 0;
-    };
+    if (low > 0 || high > 0)
+        && est
+            .others
+            .iter()
+            .any(|o| fs::symlink_metadata(o.join(rel)).is_ok_and(|m| same_state(snap, &m)))
+    {
+        // Another snapshot holds the same data: it is private to neither.
+        return (0, 0);
+    }
+    (low, high)
+}
+
+/// What the snapshot holds of a file that still exists live as `live`: 0 if
+/// it is unchanged, else its blocks minus those the live copy still shares.
+fn rewritten(snap: &fs::Metadata, live: &fs::Metadata, live_path: &Path) -> u64 {
     if live.len() == snap.len()
         && live.mtime() == snap.mtime()
         && live.mtime_nsec() == snap.mtime_nsec()
@@ -265,28 +319,27 @@ fn held_by_file(snap: &fs::Metadata, live_path: &Path, est: &Estimate) -> u64 {
     }
     // The live copy's own private bytes are not shared with the snapshot; the
     // rest of its blocks are. (A cloned live file says nothing: assume none.)
-    let shared = match clone_facts(&live_path) {
+    let shared = match clone_facts(live_path) {
         Some(c) if c.refcnt <= 1 => (live.blocks() * 512).saturating_sub(c.private),
         _ => 0,
     };
-    snap_bytes.saturating_sub(shared)
+    (snap.blocks() * 512).saturating_sub(shared)
 }
 
-/// How much deleting the Time Machine snapshot of `date` would free, about.
-/// Uses the mount the system already made, or mounts the snapshot read-only
-/// itself (no password) and unmounts it afterwards.
-pub fn measure(runner: &dyn CommandRunner, date: &str, cancel: &AtomicBool) -> Result<u64, String> {
-    if !valid_date(date) {
-        return Err(format!("{date} is not a snapshot date"));
-    }
-    let live = Path::new(LIVE_ROOT);
-    if let Some(mount) = find_mount(Path::new(BACKUPDB), date) {
-        return estimate_held(&mount, live, cancel).ok_or_else(|| "cancelled".to_string());
+/// A snapshot mounted for reading: by the system, or by us (`owned`).
+struct Mounted {
+    path: PathBuf,
+    owned: bool,
+}
+
+fn mount(runner: &dyn CommandRunner, date: &str) -> Result<Mounted, String> {
+    if let Some(path) = find_mount(Path::new(BACKUPDB), date) {
+        return Ok(Mounted { path, owned: false });
     }
     let dir = std::env::temp_dir().join(format!("maccleanup-snap-{date}"));
     fs::create_dir_all(&dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
     let name = format!("{TM_PREFIX}{date}.local");
-    let mount = CommandSpec::new(
+    let spec = CommandSpec::new(
         MOUNT_APFS,
         &[
             "-o",
@@ -297,15 +350,52 @@ pub fn measure(runner: &dyn CommandRunner, date: &str, cancel: &AtomicBool) -> R
             &dir.to_string_lossy(),
         ],
     );
-    let result = if runner.run(&mount, &RunControl::new()).ok {
-        let r = estimate_held(&dir, live, cancel).ok_or_else(|| "cancelled".to_string());
-        let unmount = CommandSpec::new(DISKUTIL, &["unmount", &dir.to_string_lossy()]);
-        runner.run(&unmount, &RunControl::new());
-        r
+    if runner.run(&spec, &RunControl::new()).ok {
+        Ok(Mounted {
+            path: dir,
+            owned: true,
+        })
     } else {
+        let _ = fs::remove_dir(&dir);
         Err("could not mount the snapshot read-only".to_string())
-    };
-    let _ = fs::remove_dir(&dir);
+    }
+}
+
+fn unmount(runner: &dyn CommandRunner, m: Mounted) {
+    if m.owned {
+        let spec = CommandSpec::new(DISKUTIL, &["unmount", &m.path.to_string_lossy()]);
+        runner.run(&spec, &RunControl::new());
+        let _ = fs::remove_dir(&m.path);
+    }
+}
+
+/// How much deleting the Time Machine snapshot of `date` would free. `all` is
+/// every snapshot's date: what another one also holds is not counted. Uses
+/// the mounts the system already made, or mounts snapshots read-only itself
+/// (no password) and unmounts those afterwards.
+pub fn measure(
+    runner: &dyn CommandRunner,
+    date: &str,
+    all: &[String],
+    cancel: &AtomicBool,
+) -> Result<Held, String> {
+    if !valid_date(date) {
+        return Err(format!("{date} is not a snapshot date"));
+    }
+    let target = mount(runner, date)?;
+    // The others are best effort: one that cannot be mounted is not compared.
+    let others: Vec<Mounted> = all
+        .iter()
+        .filter(|d| d.as_str() != date && valid_date(d))
+        .filter_map(|d| mount(runner, d).ok())
+        .collect();
+    let paths: Vec<PathBuf> = others.iter().map(|m| m.path.clone()).collect();
+    let result = estimate_held(&target.path, Path::new(LIVE_ROOT), &paths, cancel)
+        .ok_or_else(|| "cancelled".to_string());
+    for m in others {
+        unmount(runner, m);
+    }
+    unmount(runner, target);
     result
 }
 
@@ -417,7 +507,9 @@ mod tests {
         // rewritten since: its old bytes are held
         write(&snap.join("changed"), 30_000);
         write(&live.join("changed"), 50_000);
-        let held = estimate_held(&snap, &live, &AtomicBool::new(false)).unwrap();
+        let held = estimate_held(&snap, &live, &[], &AtomicBool::new(false))
+            .unwrap()
+            .low;
         assert!(held >= 70_000, "{held}");
         assert!(
             held < 70_000 + 3 * 4096 * 2,
@@ -438,12 +530,36 @@ mod tests {
     }
 
     #[test]
+    fn what_another_snapshot_also_holds_is_not_private() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b, live) = (
+            t.path().join("a"),
+            t.path().join("b"),
+            t.path().join("live"),
+        );
+        // in both snapshots (the same file), gone live: held by both, private to neither
+        write(&a.join("shared"), 40_000);
+        fs::create_dir_all(&b).unwrap();
+        fs::hard_link(a.join("shared"), b.join("shared")).unwrap();
+        // only in a
+        write(&a.join("only_a"), 40_000);
+        fs::create_dir_all(&live).unwrap();
+        let stop = AtomicBool::new(false);
+        let alone = estimate_held(&a, &live, &[], &stop).unwrap().low;
+        let with_b = estimate_held(&a, &live, std::slice::from_ref(&b), &stop)
+            .unwrap()
+            .low;
+        assert!(alone >= 80_000, "{alone}");
+        assert!((40_000..40_000 + 2 * 4096).contains(&with_b), "{with_b}");
+    }
+
+    #[test]
     fn estimate_stops_when_cancelled() {
         let t = tempfile::tempdir().unwrap();
         write(&t.path().join("snap/a"), 10);
         let stop = AtomicBool::new(true);
         assert_eq!(
-            estimate_held(&t.path().join("snap"), &t.path().join("live"), &stop),
+            estimate_held(&t.path().join("snap"), &t.path().join("live"), &[], &stop),
             None
         );
     }
