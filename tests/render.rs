@@ -3158,4 +3158,13 @@ fn time_machine_heading_is_the_select_all_row_and_measuring_shows_state() {
     e.app.snaps.progress.start(0, 1);
     let measuring = render(&mut e.app, 120, 30);
     assert!(measuring.contains("mounting..."), "{measuring}");
+    // A running job: the status line says which snapshot and what was found.
+    e.app.snaps.measure.spawn(|| {
+        std::thread::sleep(Duration::from_millis(1500));
+        Vec::new()
+    });
+    e.app.snaps.queue = vec!["2026-11-08-000000".to_string()];
+    let busy = render(&mut e.app, 120, 30);
+    assert!(busy.contains("measuring snapshot 1 of 1"), "{busy}");
+    assert!(busy.contains("1 queued"), "{busy}");
 }

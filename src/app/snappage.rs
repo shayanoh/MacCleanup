@@ -33,6 +33,10 @@ pub struct SnapState {
     pub measure: Latest<Measured>,
     pub cancel: Arc<AtomicBool>,
     pub measuring: Vec<String>,
+    /// Dates asked for while a measurement ran; they run next, in order.
+    pub queue: Vec<String>,
+    /// The tick the running measurement began on (for its elapsed time).
+    pub started_tick: u64,
     /// Files looked at and bytes found so far by the running measurement.
     pub progress: Arc<Progress>,
     pub settle: Settle,
@@ -52,6 +56,8 @@ impl SnapState {
             measure: Latest::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             measuring: Vec::new(),
+            queue: Vec::new(),
+            started_tick: 0,
             progress: Progress::new(),
             settle: Settle::default(),
         }
@@ -111,6 +117,7 @@ impl App {
                     self.snaps.items = list;
                     let dates = self.snaps.dates();
                     self.snaps.sizes.retain(|d, _| dates.contains(d));
+                    self.snaps.queue.retain(|d| dates.contains(d));
                     // A mark of a snapshot that is gone cannot run.
                     self.tool_marks.retain(|id| {
                         !is_snapshot_id(id) || dates.iter().any(|d| id.ends_with(d.as_str()))
@@ -147,6 +154,11 @@ impl App {
             }
             if let Some(e) = failed {
                 self.notice = Some(format!("Could not measure: {e}"));
+            }
+            // What was asked for meanwhile runs next.
+            if !self.snaps.queue.is_empty() {
+                let next = std::mem::take(&mut self.snaps.queue);
+                self.start_measure(next);
             }
         }
         if self.snaps.settle.active(self.tick) {
@@ -222,10 +234,26 @@ impl App {
             self.notice = Some("No Time Machine snapshot to measure".to_string());
             return;
         }
-        if self.snaps.measure.pending {
-            self.notice = Some("Already measuring: it takes a minute per snapshot".to_string());
-            return;
+        let busy = self.snaps.measure.pending;
+        let new: Vec<String> = dates
+            .into_iter()
+            .filter(|d| !self.snaps.measuring.contains(d) && !self.snaps.queue.contains(d))
+            .collect();
+        if new.is_empty() {
+            self.notice = Some("Already measuring or queued".to_string());
+        } else if busy {
+            self.notice = Some(format!(
+                "Queued {} snapshot(s): they run after the one being measured",
+                new.len()
+            ));
+            self.snaps.queue.extend(new);
+        } else {
+            self.start_measure(new);
         }
+    }
+
+    /// Start measuring `dates`, one after the other, on a thread.
+    fn start_measure(&mut self, dates: Vec<String>) {
         let runner = Arc::clone(&self.runner);
         let every = self.snaps.dates();
         let progress = Arc::clone(&self.snaps.progress);
@@ -233,6 +261,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         self.snaps.cancel = Arc::clone(&cancel);
         self.snaps.measuring = dates.clone();
+        self.snaps.started_tick = self.tick;
         self.snaps.measure.spawn(move || {
             let of = dates.len() as u64;
             dates
@@ -424,6 +453,43 @@ mod tests {
         e.app.update(Action::SnapMeasure { all: false });
         assert!(e.app.notice.as_deref().unwrap().contains("No Time Machine"));
         assert!(!e.app.snaps.measure.pending);
+    }
+
+    #[test]
+    fn m_while_measuring_queues_the_next_snapshot_and_runs_it_after() {
+        let fake = Arc::new(
+            FakeRunner::new(&[])
+                .answering(&[
+                    (
+                        "listlocalsnapshotdates",
+                        "2001-01-01-010101\n2001-01-01-020202",
+                    ),
+                    ("listSnapshots", ""),
+                ])
+                .slow(std::time::Duration::from_millis(300)),
+        );
+        let mut e = loaded(fake);
+        e.app.update(Action::SnapMeasure { all: false });
+        assert!(e.app.snaps.measure.pending);
+        e.app.update(Action::Down);
+        e.app.update(Action::SnapMeasure { all: false });
+        assert_eq!(e.app.snaps.queue, ["2001-01-01-020202"]);
+        assert!(e.app.notice.as_deref().unwrap().contains("Queued"));
+        e.app.update(Action::SnapMeasure { all: false });
+        assert!(e.app.notice.as_deref().unwrap().contains("Already"));
+        for _ in 0..4000 {
+            e.app.update(Action::Tick);
+            if e.app.snaps.sizes.len() == 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            e.app.snaps.sizes.len(),
+            2,
+            "both measured, one after the other"
+        );
+        assert!(e.app.snaps.queue.is_empty());
     }
 
     #[test]

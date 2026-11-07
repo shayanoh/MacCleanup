@@ -14,6 +14,7 @@ use super::{
     ACCENT, CAUTION, DANGER, DIM, SAFE, SELECTED_BG, fit, fit_pad, pad, panel, right, safety_color,
     safety_dot,
 };
+use crate::anim;
 use crate::app::App;
 use crate::fmt::human_size;
 use crate::safety::Safety;
@@ -67,12 +68,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = panel(&g, format!(" {} Time Machine snapshots ", g.nav(6)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if inner.height < 5 || inner.width < 30 {
+    if inner.height < 6 || inner.width < 30 {
         return;
     }
     let width = inner.width as usize;
-    app.layout.list_top = inner.y + 3;
-    app.layout.list_rows = inner.height - 4;
+    app.layout.list_top = inner.y + 4;
+    app.layout.list_rows = inner.height - 5;
     app.ensure_visible();
 
     let held = app.stack.first().map_or(0, |n| n.snapshot_held());
@@ -122,6 +123,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         Rect::new(inner.x, inner.y + 1, inner.width, 1),
     );
 
+    frame.render_widget(
+        Paragraph::new(status_line(app)),
+        Rect::new(inner.x, inner.y + 2, inner.width, 1),
+    );
+
     // Columns: cursor, mark box, icon, safety dot, name, size, kind.
     let size_w = 20;
     let kind_w = 14;
@@ -139,10 +145,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             fit(&header, width, &g),
             Style::default().fg(DIM).add_modifier(Modifier::BOLD),
         )),
-        Rect::new(inner.x, inner.y + 2, inner.width, 1),
+        Rect::new(inner.x, inner.y + 3, inner.width, 1),
     );
 
-    let list = Rect::new(inner.x, inner.y + 3, inner.width, app.layout.list_rows);
+    let list = Rect::new(inner.x, inner.y + 4, inner.width, app.layout.list_rows);
     if app.snaps.items.is_empty() {
         let (text, color) = match (&app.snaps.error, app.snaps.loaded) {
             (Some(e), _) => (e.clone(), DANGER),
@@ -197,6 +203,63 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// What the page is doing, like the Explorer's scan line: a spinner and a
+/// moving bar while it reads or measures, a check mark when it is idle.
+fn status_line(app: &App) -> Line<'static> {
+    let g = &app.glyphs;
+    let busy = |text: String| {
+        let idx = anim::spinner_frame(app.tick, g.spinner().len());
+        Line::from(vec![
+            Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
+            Span::raw(format!(" {text} ")),
+            Span::styled(
+                crate::fmt::marquee(app.tick, 10, g),
+                Style::default().fg(ACCENT),
+            ),
+        ])
+    };
+    if app.snaps.measure.pending {
+        let p = &app.snaps.progress;
+        let (index, of) = p.position();
+        let files = p.files();
+        let secs = app.tick.saturating_sub(app.snaps.started_tick) / 20;
+        let found = if files == 0 {
+            "mounting".to_string()
+        } else {
+            format!(
+                "{} files {} {} found",
+                count(files),
+                g.dot(),
+                human_size(p.held().low)
+            )
+        };
+        let queued = match app.snaps.queue.len() {
+            0 => String::new(),
+            n => format!(" {} {n} queued", g.dot()),
+        };
+        return busy(format!(
+            "measuring snapshot {} of {}{} {found} {} {}{queued}",
+            index + 1,
+            of.max(1),
+            g.ellipsis(),
+            g.dot(),
+            crate::fmt::duration(std::time::Duration::from_secs(secs)),
+        ));
+    }
+    if app.snaps.job.pending {
+        return busy(format!("reading the snapshots{}", g.ellipsis()));
+    }
+    Line::from(vec![
+        Span::styled(g.check().to_string(), Style::default().fg(SAFE)),
+        Span::raw(format!(
+            " {} Time Machine snapshot(s) {} {} measured",
+            app.snaps.items.iter().filter(|s| s.date.is_some()).count(),
+            g.dot(),
+            app.snaps.sizes.len()
+        )),
+    ])
+}
+
 /// The colored bar over the snapshots. Its box is "all marked": space on it
 /// marks or unmarks every Time Machine snapshot. Underlined while selected,
 /// since its background is already a color.
@@ -243,7 +306,12 @@ fn snapshot_line(
         .date
         .as_ref()
         .is_some_and(|d| app.snaps.measuring.contains(d));
+    let queued = snap
+        .date
+        .as_ref()
+        .is_some_and(|d| app.snaps.queue.contains(d));
     let (size, size_style) = match (&snap.date, measuring) {
+        (Some(_), false) if queued => ("queued".to_string(), Style::default().fg(CAUTION)),
         (Some(d), true) => (measuring_text(app, d), Style::default().fg(CAUTION)),
         (Some(d), false) => match app.snaps.sizes.get(d) {
             Some(h) => (range(h), Style::default()),
