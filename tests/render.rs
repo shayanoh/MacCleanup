@@ -1773,7 +1773,8 @@ fn the_menu_shows_each_pages_number_and_planned_pages_keep_theirs() {
         (4, "Uninstall"),
         (5, "Caches & Projects"),
         (6, "Docker"),
-        (7, "ToBeDeleted"),
+        (7, "Time Machine"),
+        (8, "ToBeDeleted"),
     ] {
         let line = text
             .lines()
@@ -3054,4 +3055,91 @@ fn hovering_a_nested_box_shows_a_tooltip_after_a_pause() {
     // Any other input hides it until the mouse rests again.
     e.app.update(Action::Scroll(1));
     assert!(!render(&mut e.app, 200, 60).contains("% of the graph"));
+}
+
+/// Answers only the Time Machine listings.
+struct FakeSnapshots;
+
+impl maccleanup::catalog::CommandRunner for FakeSnapshots {
+    fn run(
+        &self,
+        _: &maccleanup::catalog::CommandSpec,
+        _: &maccleanup::catalog::RunControl,
+    ) -> maccleanup::catalog::CommandResult {
+        maccleanup::catalog::CommandResult {
+            ok: true,
+            cancelled: false,
+            output_tail: String::new(),
+        }
+    }
+    fn query(&self, spec: &maccleanup::catalog::CommandSpec) -> Option<String> {
+        let full = spec.full();
+        if full.contains("listlocalsnapshotdates") {
+            Some("Snapshot dates for disk /:\n2026-11-07-032842".to_string())
+        } else if full.contains("listSnapshots") {
+            Some("|   Name:        com.apple.bless.3D4C".to_string())
+        } else {
+            None
+        }
+    }
+    fn available(&self, _: &str) -> bool {
+        false
+    }
+}
+
+fn snapshots_screen(mode: GlyphMode) -> Env {
+    let mut e = make_app_with(&[("a.txt", 10)], mode, |_| {});
+    e.app.runner = std::sync::Arc::new(FakeSnapshots);
+    e.app.update(Action::GoTo(Screen::Snapshots));
+    for _ in 0..2000 {
+        e.app.update(Action::Tick);
+        if !e.app.snaps.job.pending {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    e
+}
+
+#[test]
+fn time_machine_page_shows_snapshots_totals_free_space_and_marks() {
+    let mut e = snapshots_screen(GlyphMode::Nerd);
+    let t = render(&mut e.app, 120, 30);
+    for want in [
+        "Time Machine snapshots",
+        "held by snapshots",
+        "2026-11-07 03:28:42",
+        "press m",
+        "system, kept",
+        "free now",
+        "at start",
+        "space mark",
+    ] {
+        assert!(t.contains(want), "missing {want:?}:\n{t}");
+    }
+    e.app.update(Action::ToggleMark);
+    let marked = render(&mut e.app, 120, 30);
+    assert_ne!(t, marked, "a mark changes the row");
+}
+
+#[test]
+fn the_footer_shows_free_space_on_every_page() {
+    let mut e = snapshots_screen(GlyphMode::Nerd);
+    for screen in [Screen::Home, Screen::Explorer, Screen::Snapshots] {
+        e.app.update(Action::GoTo(screen));
+        let t = render(&mut e.app, 120, 30);
+        let last = t.lines().last().unwrap_or("");
+        assert!(
+            last.contains("free ") && last.contains("start"),
+            "{screen:?}: {last}"
+        );
+    }
+}
+
+#[test]
+fn time_machine_page_is_ascii_in_ascii_mode() {
+    let mut e = snapshots_screen(GlyphMode::Ascii);
+    for c in render_cells(&mut e.app, 120, 30) {
+        assert!(c.is_ascii(), "non-ascii cell {c:?}");
+    }
 }

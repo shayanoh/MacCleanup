@@ -137,25 +137,81 @@ pub fn find_mount(backupdb: &Path, date: &str) -> Option<PathBuf> {
     None
 }
 
-/// What the snapshot at `snap` holds that `live` no longer does, in bytes.
-/// A file gone from `live` counts in full; one whose size or modification
-/// time differs counts what the live copy does not still share with it; the
-/// same file counts nothing. `None` if `cancel` was set.
-pub fn estimate_held(snap: &Path, live: &Path, cancel: &AtomicBool) -> Option<u64> {
-    let total = AtomicU64::new(0);
-    rayon::scope(|s| walk(snap, snap.to_path_buf(), live, cancel, &total, s));
-    (!cancel.load(Relaxed)).then(|| total.load(Relaxed))
+unsafe extern "C" {
+    // sys/fsgetpath.h (macOS 10.13+): the path of an inode on a volume.
+    fn fsgetpath(
+        buf: *mut libc::c_char,
+        bufsize: usize,
+        fsid: *mut libc::fsid_t,
+        obj_id: u64,
+    ) -> isize;
 }
 
-fn walk<'s>(
-    root: &'s Path,
-    dir: PathBuf,
-    live: &'s Path,
-    cancel: &'s AtomicBool,
-    total: &'s AtomicU64,
-    s: &rayon::Scope<'s>,
-) {
-    if cancel.load(Relaxed) {
+/// A mounted volume, to find where a file that was renamed or moved lives now.
+struct Volume {
+    fsid: libc::fsid_t,
+    mount: PathBuf,
+}
+
+fn volume_of(path: &Path) -> Option<Volume> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statfs` is plain data; the path is a valid C string.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    // SAFETY: the kernel NUL-terminates `f_mntonname`.
+    let mount = unsafe { std::ffi::CStr::from_ptr(st.f_mntonname.as_ptr()) };
+    Some(Volume {
+        fsid: st.f_fsid,
+        mount: PathBuf::from(std::ffi::OsStr::from_bytes(mount.to_bytes())),
+    })
+}
+
+/// Where inode `ino` is now on `vol`, or `None` if no file has it any more.
+/// A rename keeps the inode, so this tells "moved" from "deleted".
+fn relocate(vol: &Volume, ino: u64) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut fsid = vol.fsid;
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: `buf` is writable for its length; `fsid` is a valid fsid_t.
+    let n = unsafe { fsgetpath(buf.as_mut_ptr(), buf.len(), &mut fsid, ino) };
+    if n <= 0 {
+        return None;
+    }
+    // SAFETY: on success the buffer holds a NUL-terminated path.
+    let rel = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    let rel = Path::new(std::ffi::OsStr::from_bytes(rel.to_bytes()));
+    Some(vol.mount.join(rel.strip_prefix("/").unwrap_or(rel)))
+}
+
+/// What one estimate needs, shared by the walking threads.
+struct Estimate<'a> {
+    live: &'a Path,
+    vol: Option<Volume>,
+    cancel: &'a AtomicBool,
+    total: AtomicU64,
+}
+
+/// What the snapshot at `snap` holds that `live` no longer does, in bytes.
+/// A file gone from `live` counts in full, unless the same file (inode) lives
+/// on under another name; one whose size or modification time differs counts
+/// what the live copy does not still share with it; the same file counts
+/// nothing. `None` if `cancel` was set.
+pub fn estimate_held(snap: &Path, live: &Path, cancel: &AtomicBool) -> Option<u64> {
+    let est = Estimate {
+        live,
+        vol: volume_of(live),
+        cancel,
+        total: AtomicU64::new(0),
+    };
+    rayon::scope(|s| walk(snap, snap.to_path_buf(), &est, s));
+    (!cancel.load(Relaxed)).then(|| est.total.load(Relaxed))
+}
+
+fn walk<'s>(root: &'s Path, dir: PathBuf, est: &'s Estimate<'s>, s: &rayon::Scope<'s>) {
+    if est.cancel.load(Relaxed) {
         return;
     }
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -167,22 +223,39 @@ fn walk<'s>(
             continue;
         };
         if meta.is_dir() {
-            s.spawn(move |s| walk(root, path, live, cancel, total, s));
+            s.spawn(move |s| walk(root, path, est, s));
         } else if meta.is_file()
             && let Ok(rel) = path.strip_prefix(root)
         {
-            total.fetch_add(held_by_file(&meta, &live.join(rel)), Relaxed);
+            est.total
+                .fetch_add(held_by_file(&meta, &est.live.join(rel), est), Relaxed);
         }
     }
 }
 
-fn held_by_file(snap: &fs::Metadata, live_path: &Path) -> u64 {
+fn held_by_file(snap: &fs::Metadata, live_path: &Path, est: &Estimate) -> u64 {
     let snap_bytes = snap.blocks() * 512;
-    let live = match fs::symlink_metadata(live_path) {
-        Ok(l) => l,
-        // Only "not there" means gone; any other failure says nothing.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return snap_bytes,
+    let live_path = match fs::symlink_metadata(live_path) {
+        Ok(_) => live_path.to_path_buf(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Not at the same path: renamed or moved (same inode), or deleted.
+            match est
+                .vol
+                .as_ref()
+                .and_then(|v| relocate(v, snap.ino()))
+                // A mounted snapshot is its own device: a hit on the same
+                // device is the snapshot's own file, not a live one.
+                .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.dev() != snap.dev()))
+            {
+                Some(moved) => moved,
+                None => return snap_bytes,
+            }
+        }
+        // Any other failure says nothing about the file.
         Err(_) => return 0,
+    };
+    let Ok(live) = fs::symlink_metadata(&live_path) else {
+        return 0;
     };
     if live.len() == snap.len()
         && live.mtime() == snap.mtime()
@@ -192,7 +265,7 @@ fn held_by_file(snap: &fs::Metadata, live_path: &Path) -> u64 {
     }
     // The live copy's own private bytes are not shared with the snapshot; the
     // rest of its blocks are. (A cloned live file says nothing: assume none.)
-    let shared = match clone_facts(live_path) {
+    let shared = match clone_facts(&live_path) {
         Some(c) if c.refcnt <= 1 => (live.blocks() * 512).saturating_sub(c.private),
         _ => 0,
     };
@@ -350,6 +423,18 @@ mod tests {
             held < 70_000 + 3 * 4096 * 2,
             "same file must add nothing: {held}"
         );
+    }
+
+    #[test]
+    fn relocate_finds_a_file_by_inode_and_none_for_a_missing_one() {
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("kept");
+        write(&f, 10);
+        let vol = volume_of(t.path()).unwrap();
+        let ino = fs::symlink_metadata(&f).unwrap().ino();
+        let found = relocate(&vol, ino).unwrap();
+        assert_eq!(fs::symlink_metadata(found).unwrap().ino(), ino);
+        assert_eq!(relocate(&vol, u64::MAX / 2), None);
     }
 
     #[test]

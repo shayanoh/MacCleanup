@@ -89,7 +89,7 @@ impl Glyphs {
     /// Sidebar icon for entry `i`.
     pub fn nav(&self, i: usize) -> &'static str {
         const NERD: [&str; 8] = [
-            "\u{f015}", "\u{f07c}", "\u{f12d}", "\u{f187}", "\u{f1c0}", "\u{f308}", "\u{f121}",
+            "\u{f015}", "\u{f07c}", "\u{f12d}", "\u{f187}", "\u{f1c0}", "\u{f308}", "\u{f1da}",
             "\u{f1f8}",
         ];
         match self.mode {

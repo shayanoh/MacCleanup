@@ -11,6 +11,7 @@ pub mod graph;
 pub mod holding;
 pub mod home;
 pub mod sidebar;
+pub mod snapshots;
 pub mod targets;
 
 use ratatui::Frame;
@@ -227,6 +228,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Explorer => explorer::render(frame, main, app),
         Screen::Targets => targets::render(frame, main, app),
         Screen::Docker => docker::render(frame, main, app),
+        Screen::Snapshots => snapshots::render(frame, main, app),
         Screen::DockerFiles => docker_files::render(frame, main, app),
         Screen::Holding => holding::render(frame, main, app),
     }
@@ -302,7 +304,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         &[
             "j/k choose",
             "enter open",
-            "1-7 open page",
+            "1-8 open page",
             "tab focus list",
             "q quit",
         ]
@@ -310,7 +312,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         match app.screen {
             Screen::Home => &[
                 "2 explorer",
-                "3 ToBeDeleted",
+                "8 ToBeDeleted",
                 "r/R rescan",
                 "tab menu",
                 "q quit",
@@ -349,6 +351,16 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 "J/K scroll details",
                 "r reread",
                 "s sort",
+                "tab menu",
+                "q quit",
+            ],
+            Screen::Snapshots => &[
+                "j/k move",
+                "space mark",
+                "a mark all",
+                "m/M measure",
+                "d review & delete",
+                "r reread",
                 "tab menu",
                 "q quit",
             ],

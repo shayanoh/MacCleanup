@@ -1642,7 +1642,7 @@ mod tests {
         e.app.update(Action::Down);
         assert_eq!(
             e.app.screen,
-            Screen::Holding,
+            Screen::Snapshots,
             "down from Docker, not from Home"
         );
     }

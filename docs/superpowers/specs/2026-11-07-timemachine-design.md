@@ -60,7 +60,8 @@ verified against it (138.1 MB vs 137.9 MB):
    - size or mtime differs: adds `max(0, snap_blocks - (live_blocks - live_private))`
      when the live file has no clones (`clone_facts(live).private`);
    - the same: adds nothing.
-3. Never use `private` of a file inside a snapshot: it reads 0 for every file.
+3. A file missing at the same path is looked up by inode on the live volume (`fsgetpath(2)`, declared by hand: `libc` has no binding): if it exists elsewhere it was renamed or moved and is compared like any other file. Without this a build folder (rustc renames its output) inflated one estimate from about 726 MB to 1169 MB.
+4. Never use `private` of a file inside a snapshot: it reads 0 for every file.
 
 It is measured on demand (key `m`), on a thread through `bg::Latest`, with a
 progress marquee and cancel, because it takes a minute. It is not run at start.

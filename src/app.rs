@@ -22,6 +22,7 @@ use crate::usage::Usage;
 use crate::volume;
 
 mod dockerpage;
+pub mod snappage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
@@ -29,6 +30,8 @@ pub enum Screen {
     Explorer,
     Targets,
     Docker,
+    /// Local Time Machine snapshots.
+    Snapshots,
     /// Looking inside a Docker image or volume (opened from the Docker page).
     DockerFiles,
     Holding,
@@ -78,7 +81,7 @@ pub struct SidebarEntry {
     pub screen: Option<Screen>,
 }
 
-pub const SIDEBAR: [SidebarEntry; 7] = [
+pub const SIDEBAR: [SidebarEntry; 8] = [
     SidebarEntry {
         label: "Home",
         screen: Some(Screen::Home),
@@ -102,6 +105,10 @@ pub const SIDEBAR: [SidebarEntry; 7] = [
     SidebarEntry {
         label: "Docker",
         screen: Some(Screen::Docker),
+    },
+    SidebarEntry {
+        label: "Time Machine",
+        screen: Some(Screen::Snapshots),
     },
     SidebarEntry {
         label: "ToBeDeleted",
@@ -138,6 +145,12 @@ pub enum Action {
     ToggleMark,
     /// Mark every folder that shares data with the selected row (Caches & Projects).
     MarkRelated,
+    /// Estimate what the selected snapshot (or every one) would free (Time Machine page).
+    SnapMeasure {
+        all: bool,
+    },
+    /// Mark every Time Machine snapshot, or unmark them all.
+    SnapMarkAll,
     OpenReview,
     CycleGraph,
     GrowGraph,
@@ -507,6 +520,7 @@ pub struct App {
     pub tool_marks: BTreeSet<String>,
     /// The Docker page: what was read from Docker and the list shown.
     pub docker: crate::docker::state::DockerState,
+    pub snaps: snappage::SnapState,
     /// Set-wise space of the whole selection, worked out on a thread.
     pub set_space: Latest<JointSpace>,
     set_exact: bool,
@@ -658,6 +672,7 @@ impl App {
             tools_work: Work::new(),
             tool_marks: BTreeSet::new(),
             docker: crate::docker::state::DockerState::new(),
+            snaps: snappage::SnapState::new(),
             docker_vm_before: None,
             docker_expect_gone: Vec::new(),
             docker_check_gone: Vec::new(),
@@ -744,6 +759,7 @@ impl App {
         self.held_offset = window(self.held_cursor, self.held_offset, vis);
         self.toffset = window(self.tcursor, self.toffset, vis);
         self.docker.offset = window(self.docker.cursor, self.docker.offset, vis);
+        self.snaps.offset = window(self.snaps.cursor, self.snaps.offset, vis);
         if let Some(b) = &mut self.docker.browse {
             b.offset = window(b.cursor, b.offset, vis);
         }
@@ -1029,6 +1045,9 @@ impl App {
             Action::Out => self.leave(),
             Action::ToggleMark => self.toggle_mark(),
             Action::MarkRelated => self.mark_related(),
+            Action::SnapMeasure { all } => self.measure_snapshots(all),
+            Action::SnapMarkAll if self.screen == Screen::Snapshots => self.mark_all_snapshots(),
+            Action::SnapMarkAll => {}
             Action::OpenReview => self.open_review(),
             Action::CycleGraph => {
                 self.graph = match self.graph {
@@ -1221,6 +1240,7 @@ impl App {
         self.process_refresh();
         self.poll_targets();
         self.poll_docker();
+        self.poll_snapshots();
         self.poll_browse();
         if self.set_space.poll() || !self.set_space.pending {
             // A review opened while the numbers were being worked out.
@@ -1313,6 +1333,7 @@ impl App {
                 self.rebuild_targets();
             }
             Screen::Docker => self.reload_docker(),
+            Screen::Snapshots => self.reload_snapshots(),
             Screen::DockerFiles | Screen::Home => {}
         }
         self.refresh_detail();
@@ -1326,6 +1347,7 @@ impl App {
                     Screen::Explorer,
                     Screen::Targets,
                     Screen::Docker,
+                    Screen::Snapshots,
                     Screen::Holding,
                 ];
                 let here = if self.screen == Screen::DockerFiles {
@@ -1349,6 +1371,7 @@ impl App {
                 self.ensure_visible();
             }
             (_, Screen::Docker) => self.docker_move(delta),
+            (_, Screen::Snapshots) => self.snap_move(delta),
             (_, Screen::DockerFiles) => self.browse_move(delta),
             (_, Screen::Targets) => {
                 self.tcursor = step(self.tcursor, delta, self.tlines.len());
@@ -1379,6 +1402,11 @@ impl App {
     /// Rescan the current folder (or everything). Refused while a scan runs.
     fn rescan(&mut self, all: bool) {
         if self.screen == Screen::Holding {
+            return;
+        }
+        if self.screen == Screen::Snapshots {
+            self.reload_snapshots();
+            self.notice = Some("Reading the snapshots again...".to_string());
             return;
         }
         if self.screen == Screen::Docker {
@@ -1496,6 +1524,7 @@ impl App {
             }
             Screen::Targets => self.toggle_target_mark(),
             Screen::Docker => self.toggle_docker_mark(),
+            Screen::Snapshots => self.toggle_snapshot_mark(),
             _ => {}
         }
     }
@@ -1833,7 +1862,7 @@ impl App {
     fn open_review(&mut self) {
         if !matches!(
             self.screen,
-            Screen::Explorer | Screen::Targets | Screen::Docker
+            Screen::Explorer | Screen::Targets | Screen::Docker | Screen::Snapshots
         ) {
             return;
         }
@@ -1903,6 +1932,7 @@ impl App {
                 _ => None,
             })
             .chain(self.docker_review_commands())
+            .chain(self.snap_review_commands())
             .collect()
     }
 
@@ -2000,6 +2030,7 @@ impl App {
                     }
                 }
                 Screen::Docker => self.docker_click(i),
+                Screen::Snapshots => self.snap_click(i),
                 Screen::DockerFiles => self.browse_click(i),
                 Screen::Home => {}
             }
@@ -2524,8 +2555,10 @@ impl App {
         self.cmd_job = None;
         self.cmd_ctl = None;
         let mut docker_ran = false;
+        let mut snapshots_ran = false;
         for (id, _) in std::mem::take(&mut self.pending_commands) {
             docker_ran |= dockerpage::is_docker_id(&id);
+            snapshots_ran |= snappage::is_snapshot_id(&id);
             self.tool_marks.remove(&id);
         }
         // The folders the commands cleaned changed on disk: scan them again
@@ -2567,6 +2600,9 @@ impl App {
         self.refresh_rows();
         self.rebuild_targets();
         let vm_disk = self.docker_after_commands(docker_ran);
+        if snapshots_ran {
+            self.snapshots_deleted();
+        }
         let (moved, emptied, failures) = self.last_moves;
         self.dialog = Some(Dialog::Finish(FinishInfo {
             moved,
@@ -3087,6 +3123,8 @@ mod tests {
         assert_eq!(app.screen, Screen::Targets);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Docker);
+        app.update(Action::Down);
+        assert_eq!(app.screen, Screen::Snapshots);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Holding);
         app.update(Action::Into);

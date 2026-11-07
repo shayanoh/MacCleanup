@@ -2,7 +2,7 @@
 
 A colorful, animated terminal app (Rust TUI) for macOS that shows where your disk space went and helps you free it safely. Open it, see your free space, clean up, and finish with a summary of exactly how much you got back.
 
-> **Status: milestones 1 and 2 are implemented and merged.** The disk explorer, soft delete (ToBeDeleted folder), graphs, free-space accounting, and the Caches & Projects screen (project build output and tool caches, with products kept and tool commands) work today. The remaining features under *Planned* are not built yet; see the design documents for the full scope.
+> **Status: milestones 1 to 4 (explorer, Caches & Projects, Docker, Time Machine) are implemented.** The disk explorer, soft delete (ToBeDeleted folder), graphs, free-space accounting, and the Caches & Projects screen (project build output and tool caches, with products kept and tool commands) work today. The remaining features under *Planned* are not built yet; see the design documents for the full scope.
 
 ## What works today
 
@@ -50,9 +50,16 @@ Press `6` (needs Docker Desktop). One list, drawn like Caches & Projects, of eve
 - **Giving the space back to the Mac:** deleting things inside Docker does not shrink `Docker.raw`. After any removal the app runs a trim inside Docker's VM (the `Shrink VM disk` row is marked for you; unmark it to skip it, or mark that row alone any time), and the finish screen shows what `Docker.raw` took on your Mac before and after. The trim runs from a 2.5 MB helper image the app builds itself (`maccleanup/vm-tools`, from `busybox:musl`).
 - **Safe by construction:** every Docker command uses the Docker Desktop context only, the app never uses `--force`, and `Docker.raw` and Docker Desktop's data folders are protected from being deleted as files in the Explorer and on Caches & Projects.
 
+### Time Machine
+
+- **What it does:** the Time Machine page lists the local snapshots (`tmutil listlocalsnapshotdates /`), the total the scan says they hold, and the free space now and at start. Snapshots macOS keeps for itself (updates, boot) are listed dimmed and cannot be marked.
+- **Size of each snapshot:** macOS prints none without root, so `m` (selected) or `M` (all) estimates it: the app compares the mounted snapshot with the live files (a minute on a big disk) and counts what was deleted or changed since. Files renamed or moved since the snapshot (compilers do this all the time) are recognised by inode and not counted. It is an estimate: on a small snapshot it matched Disk Utility's Private Size (138.1 MB against 137.9 MB), on a large one it could not yet be compared at the same moment. It is labelled "about"; the total on top is the scan's exact figure. With several snapshots, a block shared only by two of them is counted for both.
+- **Deleting:** space marks one, `a` marks all, `d` reviews, and one `y` runs `tmutil deletelocalsnapshots <date>` per snapshot, oldest first. No password is needed. It cannot be undone.
+- **Free space after a delete:** APFS gives the space back gradually, so for a while the app reads free space several times a second: the bottom line on every page (`free X (start Y)`) and the result screen follow it until it has stopped moving for 30 seconds.
+
 ## Planned
 
-Next are app leftovers and the app uninstaller, then the other candidates: a Time Machine snapshots screen (list, thin or delete them; for now the app only tells you how much they hold), simulators and runtimes, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed (their menu numbers already work and say they are coming).
+Next are app leftovers and the app uninstaller, then the other candidates: a packages and runtimes screen (old Node versions, global packages, cargo and Homebrew), simulators and runtimes, large and duplicate files, and the copy-this-command flow for actions that need admin rights. The sidebar already lists these, dimmed (their menu numbers already work and say they are coming).
 
 ## Build and run
 
@@ -96,6 +103,7 @@ The look assumes a [Nerd Font](https://www.nerdfonts.com/) in your terminal. Any
 | `m` (Docker) | Mark the stopped containers the selected image or volume needs removed first; press again to unmark them |
 | `b` (Docker) | Look inside the selected image or volume, read-only (`l` / `Enter` open a folder, `h` up, `Esc` back, `s` sorts, `/` filters) |
 | `J` / `K` (Docker) | Scroll the details pane (the whole command line of a layer or build step) |
+| `m` / `M` / `a` (Time Machine) | Measure the selected snapshot / every snapshot / mark all snapshots |
 | `r` / `D` / `E` (ToBeDeleted screen) | Restore / delete for good / empty all |
 | `q`, `Esc` | Quit (`Esc` first clears an active filter, then goes up a folder; quitting asks first if ToBeDeleted still holds items). While a tool command runs, `Esc` cancels it and `q` / `Ctrl-C` cancel it and quit |
 | mouse | Click rows, menu entries, and treemap boxes or bars (a click on the graph selects that row in the list); scroll with the wheel; hover a graph box for a tooltip |

@@ -65,6 +65,13 @@ pub fn map_key(key: KeyEvent, app: &App) -> Option<Action> {
         KeyCode::Char('m') if matches!(app.screen, Screen::Targets | Screen::Docker) => {
             Some(Action::MarkRelated)
         }
+        KeyCode::Char('m') if app.screen == Screen::Snapshots => {
+            Some(Action::SnapMeasure { all: false })
+        }
+        KeyCode::Char('M') if app.screen == Screen::Snapshots => {
+            Some(Action::SnapMeasure { all: true })
+        }
+        KeyCode::Char('a') if app.screen == Screen::Snapshots => Some(Action::SnapMarkAll),
         KeyCode::Char('g') => Some(Action::Top),
         KeyCode::Char('t') => Some(Action::CycleGraph),
         KeyCode::Char('s') => Some(Action::CycleSort),
