@@ -184,7 +184,8 @@ impl Policy {
             return Safety::Protected;
         }
         let Ok(rel) = path.strip_prefix(&self.home) else {
-            return Safety::Protected;
+            // Outside home only the Uninstall/Leftovers locations are offered.
+            return crate::catalog::apppolicy::app_location(path).unwrap_or(Safety::Protected);
         };
         let comps: Vec<String> = rel
             .components()
@@ -688,5 +689,28 @@ mod tests {
     fn missing_path_has_no_protected_descendant() {
         let s = sandbox();
         assert_eq!(s.policy.protected_descendant(&s.home.join("nope")), None);
+    }
+}
+
+#[cfg(test)]
+mod app_location_tests {
+    use super::*;
+
+    #[test]
+    fn policy_allows_app_locations_only() {
+        let p = Policy::new(Path::new("/Users/x"), Path::new("/Users/x/hold"));
+        assert_eq!(
+            p.classify(Path::new("/Applications/Foo.app")),
+            Safety::Caution
+        );
+        assert_eq!(p.classify(Path::new("/etc/hosts")), Safety::Protected);
+        assert_eq!(
+            p.classify(Path::new("/Applications/Safari.app")),
+            Safety::Protected
+        );
+        assert_eq!(
+            p.classify(Path::new("/Applications/Foo.app/../Safari.app")),
+            Safety::Protected
+        );
     }
 }
