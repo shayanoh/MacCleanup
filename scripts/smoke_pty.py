@@ -323,6 +323,11 @@ assert os.path.exists(os.path.join(home, "shop", "node_modules", "dep", "index.j
 
 step("uninstall: 4 lists the installed apps with an Opened column (reads the real /Applications, changes nothing)")
 send(b"4")
+if os.environ.get("EARLY"):
+    for delay in (0.4, 1.0, 1.5, 3.0, 4.0, 5.0):
+        pump(delay)
+        print(f"=== UNINSTALL after +{delay}s ===")
+        print("\n".join(screen.text().split("\n")[:12]))
 wait_for("Uninstall")
 wait_for("INSTALLED APPS", timeout=60.0)
 if COLS >= 140:
@@ -331,6 +336,7 @@ if os.environ.get("FILTER"):
     send(b"/" + os.environ["FILTER"].encode() + b"\r")
 if os.environ.get("DUMP"):
     pump(1.5); print("=== UNINSTALL ==="); print(screen.text())
+    send(b"\r"); send(b"jj"); pump(1.0); print("=== UNINSTALL details ==="); print(screen.text())
 
 step("leftovers: 3 lists groups left by removed apps, or says why it lists none")
 send(b"3")

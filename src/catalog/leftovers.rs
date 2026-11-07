@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use super::appfiles::{AppPart, BIG_VENDORS, strip_team_id};
 use super::apppolicy::is_apple_id;
 use super::apps::{InstalledIndex, vendor_of};
+use crate::bg::Work;
 
 #[derive(Clone, Debug)]
 pub struct LeftoverGroup {
@@ -89,6 +90,9 @@ fn add_part(
     }
 }
 
+/// Folders looked through, plus the launch items: the steps of the progress bar.
+const LOOK_STEPS: usize = 12;
+
 /// A group that anything touched this recently is still in use by something
 /// (an app we did not see, a service): never listed.
 pub const MIN_IDLE_DAYS: i64 = 30;
@@ -142,6 +146,18 @@ pub fn find_leftovers(
     running: &[PathBuf],
     now: i64,
 ) -> LeftoversState {
+    find_leftovers_with(index, home, lib, running, now, &Work::new())
+}
+
+/// [`find_leftovers`], saying which folder it is looking in.
+pub fn find_leftovers_with(
+    index: &InstalledIndex,
+    home: &Path,
+    lib: &Path,
+    running: &[PathBuf],
+    now: i64,
+    work: &Work,
+) -> LeftoversState {
     if !index.spotlight_ok {
         return LeftoversState::Unavailable(
             "Spotlight did not list the installed apps (it may be switched off), so leftovers \
@@ -156,7 +172,7 @@ pub fn find_leftovers(
             && !(index.vendor_has_app(id) && !BIG_VENDORS.contains(&vendor_of(id).as_str()))
     };
     let hl = home.join("Library");
-    for dir in [
+    for (i, dir) in [
         "Caches",
         "Containers",
         "Group Containers",
@@ -168,7 +184,15 @@ pub fn find_leftovers(
         "Saved Application State",
         "Cookies",
         "Application Support",
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        work.stage(
+            i,
+            LOOK_STEPS,
+            &format!("looking for leftovers in ~/Library/{dir}"),
+        );
         let Ok(rd) = fs::read_dir(hl.join(dir)) else {
             continue;
         };
@@ -190,6 +214,11 @@ pub fn find_leftovers(
             }
         }
     }
+    work.stage(
+        LOOK_STEPS - 1,
+        LOOK_STEPS,
+        "looking for leftovers among launch daemons and helper tools",
+    );
     // Launch items whose program is gone, and helper tools named like them.
     for (dir, base) in [
         ("LaunchAgents", hl.join("LaunchAgents")),

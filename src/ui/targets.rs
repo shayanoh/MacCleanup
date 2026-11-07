@@ -110,7 +110,10 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         })
         .collect();
-    if app.tlines.is_empty() {
+    let busy = !app.filter.active() && (app.apps_looking() || app.targets_building());
+    if app.tlines.is_empty() && busy {
+        lines.extend(busy_lines(app, width));
+    } else if app.tlines.is_empty() {
         let msg = if app.filter.active() {
             "(nothing matches the filter)".to_string()
         } else if app.targets_building() || app.apps_looking() {
@@ -219,10 +222,101 @@ pub(super) fn work_text(
 /// Scan activity, the tool lookup and the list build (each with a bar), and
 /// warnings when the scan root is not the home folder or Full Disk Access is
 /// missing (then caches outside what was scanned are not listed).
+/// An empty list that is still being worked on: what is happening, which
+/// step of how many, and where it is looking, all moving.
+fn busy_lines(app: &App, width: usize) -> Vec<TextLine<'static>> {
+    let g = &app.glyphs;
+    let idx = anim::spinner_frame(app.tick, g.spinner().len());
+    let accent = Style::default().fg(ACCENT);
+    let dim = Style::default().fg(DIM);
+    let title = if app.apps_looking() {
+        "Looking at your installed apps"
+    } else {
+        "Building the list"
+    };
+    let mut out = vec![TextLine::from(vec![
+        Span::styled(g.spinner()[idx].to_string(), accent),
+        Span::styled(
+            format!(" {title}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    if app.apps_looking() {
+        out.push(TextLine::from(Span::raw(fit(
+            &format!(
+                "  {}",
+                work_text(
+                    &app.apps_work.snapshot(),
+                    "looking at the installed apps",
+                    app.tick,
+                    24,
+                    g
+                )
+            ),
+            width,
+            g,
+        ))));
+    }
+    if app.targets_building() {
+        out.push(TextLine::from(Span::raw(fit(
+            &format!(
+                "  list: {}",
+                work_text(
+                    &app.build_work.snapshot(),
+                    "building the list",
+                    app.tick,
+                    24,
+                    g
+                )
+            ),
+            width,
+            g,
+        ))));
+    }
+    if !app.scanner.is_idle() {
+        out.push(TextLine::from(Span::raw(fit(
+            &format!(
+                "  your home folder is still being scanned: {} files {}",
+                app.scanner.stats().files,
+                marquee(app.tick, 8, g)
+            ),
+            width,
+            g,
+        ))));
+    }
+    out.push(TextLine::from(Span::styled(
+        fit(
+            "  Only reading: nothing is changed or deleted while this runs.",
+            width,
+            g,
+        ),
+        dim,
+    )));
+    out
+}
+
 fn status_line(app: &App, width: usize) -> TextLine<'static> {
     let g = &app.glyphs;
     let idx = anim::spinner_frame(app.tick, g.spinner().len());
     let mut spans: Vec<Span> = Vec::new();
+    if app.apps_looking() {
+        // What the apps lookup is doing right now, first and animated.
+        spans.push(Span::styled(
+            g.spinner()[idx].to_string(),
+            Style::default().fg(ACCENT),
+        ));
+        spans.push(Span::raw(format!(
+            " apps: {} {} ",
+            work_text(
+                &app.apps_work.snapshot(),
+                "looking at the installed apps",
+                app.tick,
+                8,
+                g
+            ),
+            g.dot()
+        )));
+    }
     if app.scanner.is_idle() {
         spans.push(Span::styled(
             g.check().to_string(),
@@ -387,7 +481,18 @@ fn section_line(app: &App, kind: SectionKind, width: usize) -> TextLine<'static>
             None => format!("   {marked} marked {} frees {}", g.dot(), g.ellipsis()),
         }
     };
-    let text = format!("{title}   {} on disk{frees}", human_size(disk));
+    // Folders in your home get their Frees numbers when the scan is done.
+    let waiting =
+        if matches!(kind, SectionKind::Apps | SectionKind::Leftovers) && !app.scanner.is_idle() {
+            format!(
+                "   {} home folder still scanning: Frees fills in{}",
+                g.dot(),
+                g.ellipsis()
+            )
+        } else {
+            String::new()
+        };
+    let text = format!("{title}   {} on disk{frees}{waiting}", human_size(disk));
     let padded = fit_pad(&text, width, g);
     TextLine::from(Span::styled(
         padded,
@@ -816,11 +921,38 @@ fn detail_lines(app: &App, width: usize, height: usize) -> Vec<TextLine<'static>
             ),
             dim,
         )));
-    } else {
+    } else if r.node.is_none() {
+        // Measured by walking it: outside the scanned home folder.
         out.push(TextLine::from(Span::styled(
-            fit(&format!("still scanning{}", g.ellipsis()), width, g),
-            dim,
+            fit(
+                &format!(
+                    "outside the scan {} deleting it frees about {} (plain size, clones not checked)",
+                    g.dot(),
+                    human_size(r.disk)
+                ),
+                width,
+                g,
+            ),
+            Style::default().fg(Color::Green),
         )));
+    } else {
+        let idx = anim::spinner_frame(app.tick, g.spinner().len());
+        out.push(TextLine::from(vec![
+            Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
+            Span::styled(
+                fit(
+                    &format!(
+                        " still scanning {} {} files so far {}",
+                        g.dot(),
+                        app.scanner.stats().files,
+                        marquee(app.tick, 8, g)
+                    ),
+                    width.saturating_sub(2),
+                    g,
+                ),
+                dim,
+            ),
+        ]));
     }
     if !app.marks.is_empty() || !app.tool_marks.is_empty() {
         let text = match app.joint_frees() {

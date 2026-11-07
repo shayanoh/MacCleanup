@@ -438,25 +438,24 @@ pub struct Manual {
     slots: Vec<crate::softdelete::Reserved>,
 }
 
-/// The places outside home that the Uninstall and Leftovers pages may offer:
-/// the parts of apps that are not Apple's, and of leftover groups.
-fn outside_parts(input: &AppsInput, home: &Path) -> Vec<PathBuf> {
+/// The places the Uninstall and Leftovers pages may offer: the parts of apps
+/// that are not Apple's, and of leftover groups. Outside the home folder this
+/// is the only way anything is offered; inside it, it also lets an app's own
+/// preferences file through the otherwise protected `~/Library/Preferences`.
+fn outside_parts(input: &AppsInput, _home: &Path) -> Vec<PathBuf> {
     use crate::catalog::apppolicy::is_apple_id;
     use crate::catalog::leftovers::LeftoversState;
-    let outside = |p: &PathBuf| !p.starts_with(home);
     let mut out: Vec<PathBuf> = input
         .installed
         .iter()
         .filter(|g| !is_apple_id(&g.app.id))
         .flat_map(|g| g.parts.iter().map(|p| p.path.clone()))
-        .filter(outside)
         .collect();
     if let LeftoversState::Ready(found) = &input.leftovers {
         out.extend(
             found
                 .iter()
-                .flat_map(|g| g.parts.iter().map(|p| p.path.clone()))
-                .filter(outside),
+                .flat_map(|g| g.parts.iter().map(|p| p.path.clone())),
         );
     }
     out
@@ -612,6 +611,8 @@ pub struct App {
     apps_input: Option<Arc<AppsInput>>,
     apps_rx: Option<mpsc::Receiver<AppsInput>>,
     apps_started: bool,
+    /// What the apps lookup is doing right now (shown while it runs).
+    pub apps_work: Arc<Work>,
     /// Items outside home that the last job could not move, and their sizes.
     job_failed: Vec<PathBuf>,
     job_usage: std::collections::HashMap<PathBuf, Usage>,
@@ -786,6 +787,7 @@ impl App {
             apps_input: None,
             apps_rx: None,
             apps_started: false,
+            apps_work: Work::new(),
             job_failed: Vec::new(),
             job_usage: std::collections::HashMap::new(),
             apps_roots: apps_roots_default,
@@ -2527,6 +2529,8 @@ impl App {
             self.apps_lib.clone(),
             self.apps_managers.clone(),
         );
+        let work = Arc::clone(&self.apps_work);
+        work.begin("starting", 0);
         std::thread::spawn(move || {
             let _ = tx.send(discover_apps(
                 &home,
@@ -2534,6 +2538,7 @@ impl App {
                 &roots,
                 &managers,
                 runner.as_ref(),
+                &work,
             ));
         });
         self.apps_rx = Some(rx);

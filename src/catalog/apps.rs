@@ -8,6 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::command::{CommandRunner, CommandSpec};
+use crate::bg::Work;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppBundle {
@@ -188,6 +189,7 @@ fn collect(
     seen: &mut HashSet<PathBuf>,
     out: &mut Vec<AppBundle>,
     unreadable: &mut Vec<String>,
+    found: &dyn Fn(usize),
 ) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -204,6 +206,7 @@ fn collect(
                     Some(mut b) => {
                         b.path = path.clone();
                         out.push(b);
+                        found(out.len());
                     }
                     None => {
                         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
@@ -212,7 +215,7 @@ fn collect(
                 }
             }
         } else if depth < 2 && e.file_type().is_ok_and(|t| t.is_dir()) {
-            collect(&path, depth + 1, seen, out, unreadable);
+            collect(&path, depth + 1, seen, out, unreadable, found);
         }
     }
 }
@@ -244,8 +247,15 @@ pub fn parse_md_date(text: &str) -> Option<i64> {
 
 /// Fill `last_used` from Spotlight, 50 bundles per `mdls` call. A missing
 /// answer stays 0 ("never").
-fn fill_last_used(apps: &mut [AppBundle], runner: &dyn CommandRunner) {
+fn fill_last_used(apps: &mut [AppBundle], runner: &dyn CommandRunner, work: &Work) {
+    let (total, mut done) = (apps.len(), 0usize);
     for chunk in apps.chunks_mut(50) {
+        work.stage(
+            done,
+            total,
+            "reading when each app was last opened (Spotlight)",
+        );
+        done += chunk.len();
         let mut args: Vec<String> =
             vec!["-name".into(), "kMDItemLastUsedDate".into(), "-raw".into()];
         args.extend(chunk.iter().map(|a| a.path.to_string_lossy().into_owned()));
@@ -279,12 +289,34 @@ fn fill_last_used(apps: &mut [AppBundle], runner: &dyn CommandRunner) {
 
 /// Build the index from the scan roots plus whatever Spotlight lists.
 pub fn build_index(roots: &[PathBuf], runner: &dyn CommandRunner) -> InstalledIndex {
+    build_index_with(roots, runner, &Work::new())
+}
+
+/// [`build_index`], saying what it is doing and how far it has got.
+pub fn build_index_with(
+    roots: &[PathBuf],
+    runner: &dyn CommandRunner,
+    work: &Work,
+) -> InstalledIndex {
     let mut seen = HashSet::new();
     let mut apps = Vec::new();
     let mut unreadable = Vec::new();
-    for r in roots {
-        collect(r, 0, &mut seen, &mut apps, &mut unreadable);
+    for (i, r) in roots.iter().enumerate() {
+        let (label, total) = (r.display().to_string(), roots.len());
+        // The number of apps is not known up front: a moving bar, a count.
+        work.begin(
+            &format!("reading apps in {label} ({} of {total})", i + 1),
+            0,
+        );
+        let say = |n: usize| {
+            work.begin(
+                &format!("reading apps in {label} ({} of {total}): {n} found", i + 1),
+                0,
+            )
+        };
+        collect(r, 0, &mut seen, &mut apps, &mut unreadable, &say);
     }
+    work.begin("asking Spotlight which apps exist (mdfind)", 0);
     // Spotlight knows apps in places we do not scan (other volumes, Setapp).
     let found = runner.query(&CommandSpec::new(
         "/usr/bin/mdfind",
@@ -318,14 +350,35 @@ pub fn build_index(roots: &[PathBuf], runner: &dyn CommandRunner) -> InstalledIn
         }
     }
     let mut nested = spotlight_nested;
-    for a in &apps {
-        nested_ids(&a.path, &mut nested);
-    }
-    for p in &library_apps {
-        nested_ids(p, &mut nested);
+    // Reading inside every bundle is the slow part: all apps at once on the
+    // walk pool, counting them off.
+    let paths: Vec<&Path> = apps
+        .iter()
+        .map(|a| a.path.as_path())
+        .chain(library_apps.iter().map(PathBuf::as_path))
+        .collect();
+    work.stage(
+        0,
+        paths.len(),
+        "looking inside apps for helper apps (helpers, extensions)",
+    );
+    {
+        use rayon::prelude::*;
+        let found: Vec<BTreeSet<String>> = crate::bg::walk_pool().install(|| {
+            paths
+                .par_iter()
+                .map(|p| {
+                    let mut ids = BTreeSet::new();
+                    nested_ids(p, &mut ids);
+                    work.step();
+                    ids
+                })
+                .collect()
+        });
+        nested.extend(found.into_iter().flatten());
     }
     apps.sort_by_key(|a| a.name.to_lowercase());
-    fill_last_used(&mut apps, runner);
+    fill_last_used(&mut apps, runner, work);
     InstalledIndex {
         apps,
         nested_ids: nested,
@@ -543,6 +596,17 @@ mod tests {
             idx.has_id("com.vendor.payload"),
             "its id still counts as installed"
         );
+    }
+
+    #[test]
+    fn the_index_says_what_it_is_doing() {
+        let d = tempfile::tempdir().unwrap();
+        make_app(d.path(), "Foo", "com.foo.app");
+        let work = Work::new();
+        build_index_with(&[d.path().to_path_buf()], &FakeRunner::new(&[]), &work);
+        let snap = work.snapshot();
+        assert!(snap.phase.contains("last opened"), "{snap:?}");
+        assert_eq!((snap.done, snap.total), (0, 1));
     }
 
     #[test]

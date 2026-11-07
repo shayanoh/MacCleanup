@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use super::appfiles::{AppPart, parts_of, wrappers};
 use super::appmgr::{ManagedApp, Managers, detect};
 use super::apppolicy::is_apple_id;
-use super::apps::{AppBundle, build_index, running_executables};
+use super::apps::{AppBundle, build_index_with, running_executables};
 use super::command::CommandRunner;
-use super::leftovers::{LeftoversState, find_leftovers};
+use super::leftovers::{LeftoversState, find_leftovers_with};
+use crate::bg::Work;
 
 /// One installed app and the places that belong to it.
 #[derive(Clone, Debug)]
@@ -44,31 +45,41 @@ pub fn discover_apps(
     roots: &[PathBuf],
     managers: &Managers,
     runner: &dyn CommandRunner,
+    work: &Work,
 ) -> AppsInput {
-    let index = build_index(roots, runner);
+    let index = build_index_with(roots, runner, work);
+    work.begin("checking which programs are running", 0);
     let running = running_executables(runner);
     let absorbed: BTreeSet<PathBuf> = index
         .apps
         .iter()
         .flat_map(|a| wrappers(a, &index.apps).into_iter().map(|w| w.path.clone()))
         .collect();
-    let installed = index
+    let listed: Vec<&AppBundle> = index
         .apps
         .iter()
         // macOS's own apps stay out of the list; wrapper bundles are shown
         // inside the app they belong to.
         .filter(|a| !a.path.starts_with("/System") && !absorbed.contains(&a.path))
         .filter(|a| !is_apple_id(&a.id) || a.path.starts_with("/Applications"))
-        .map(|a| AppGroup {
-            parts: parts_of(a, &index.apps, home, lib),
-            managed: detect(a, home, managers, runner),
-            app: a.clone(),
+        .collect();
+    let total = listed.len();
+    let installed: Vec<AppGroup> = listed
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| {
+            work.stage(i, total, &format!("finding the folders of {}", a.name));
+            AppGroup {
+                parts: parts_of(a, &index.apps, home, lib),
+                managed: detect(a, home, managers, runner),
+                app: a.clone(),
+            }
         })
         .collect();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let leftovers = find_leftovers(&index, home, lib, &running, now);
+    let leftovers = find_leftovers_with(&index, home, lib, &running, now, work);
     AppsInput {
         installed,
         leftovers,
@@ -94,6 +105,7 @@ mod tests {
             &default_roots(&home),
             &Managers::system(),
             &SystemRunner,
+            &Work::new(),
         );
         println!("{} installed apps", input.installed.len());
         let filter = std::env::var("APP").unwrap_or_else(|_| "Fusion".into());

@@ -265,7 +265,8 @@ fn walk_row(path: &Path, name: String) -> Option<Row> {
         scanning: false,
         node: None,
         space: None,
-        frees: None,
+        // Outside the scan: plain allocated bytes, clones are not looked at.
+        frees: Some(disk),
         mtime,
     })
 }
@@ -321,6 +322,7 @@ fn add_app_groups(
     apps: &AppsInput,
     src: &BuildSource,
     closed: &HashSet<String>,
+    work: &Work,
 ) -> Option<String> {
     use crate::catalog::apppolicy::is_apple_id;
     use crate::catalog::apps::vendor_of;
@@ -416,6 +418,7 @@ fn add_app_groups(
         .enumerate()
         .flat_map(|(si, s)| (0..s.parts.len()).map(move |pi| (si, pi)))
         .collect();
+    work.stage(0, jobs.len(), "measuring the folders of apps");
     let rows: Vec<Option<Row>> = crate::bg::walk_pool().install(|| {
         jobs.par_iter()
             .map(|&(si, pi)| {
@@ -424,10 +427,27 @@ fn add_app_groups(
                     .path
                     .file_name()
                     .map_or_else(|| p.label.clone(), |n| n.to_string_lossy().into_owned());
-                place_row(&src.root, &p.path, name)
+                let row = place_row(&src.root, &p.path, name);
+                work.step();
+                row
             })
             .collect()
     });
+    // Folders inside the scanned home: the clone- and snapshot-aware numbers,
+    // once the scan has finished (until then their Frees stays "...").
+    let mut space_of: std::collections::HashMap<usize, crate::scan::Space> = Default::default();
+    if src.scan_idle {
+        work.begin("working out what deleting each folder frees", 0);
+        let with_node: Vec<(usize, Arc<Node>)> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| Some((i, r.as_ref()?.node.clone()?)))
+            .collect();
+        let nodes: Vec<Arc<Node>> = with_node.iter().map(|(_, n)| Arc::clone(n)).collect();
+        for ((i, _), sp) in with_node.iter().zip(src.view.spaces_of(&nodes)) {
+            space_of.insert(*i, sp);
+        }
+    }
     for (si, spec) in specs.into_iter().enumerate() {
         let mut trows = Vec::new();
         for (pi, p) in spec.parts.into_iter().enumerate() {
@@ -435,6 +455,11 @@ fn add_app_groups(
             let Some(mut row) = rows[idx].clone() else {
                 continue;
             };
+            if let Some(sp) = space_of.get(&idx) {
+                row.space = Some(*sp);
+                row.disk = sp.footprint;
+                row.frees = Some(sp.frees_now);
+            }
             if spec.section == SectionKind::Apps {
                 row.mtime = spec.last_used; // "Opened" belongs to the app
             }
@@ -834,7 +859,7 @@ impl Targets {
         }
         let mut leftovers_note = None;
         if let Some(apps) = apps {
-            leftovers_note = add_app_groups(&mut groups, apps, src, closed);
+            leftovers_note = add_app_groups(&mut groups, apps, src, closed, work);
         }
         let mut t = Targets {
             groups,

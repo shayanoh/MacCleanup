@@ -178,6 +178,14 @@ impl Policy {
         }
     }
 
+    /// Did the Uninstall/Leftovers pages find this path (or a folder above it)
+    /// for a non-Apple app?
+    fn found_for_an_app(&self, path: &Path) -> bool {
+        let allowed = self.allowed.lock().unwrap_or_else(|e| e.into_inner());
+        allowed.iter().any(|a| path.starts_with(a))
+            && !crate::catalog::apppolicy::is_apple_path(path)
+    }
+
     /// Replace the set of outside-home paths this feature found. Apple's and
     /// the system's paths stay protected even inside it.
     pub fn allow_outside(&self, paths: Vec<PathBuf>) {
@@ -252,8 +260,15 @@ impl Policy {
             if comps.len() == 2 && PROTECTED_LIBRARY_SELF.contains(&second) {
                 return Safety::Protected;
             }
+            // Preferences, Cookies and the like are protected as a whole, but
+            // a file the Uninstall/Leftovers pages found for one app (its
+            // `com.foo.app.plist`) can go with that app. Apple's never can.
             if PROTECTED_LIBRARY_TREE.contains(&second) {
-                return Safety::Protected;
+                return if comps.len() >= 3 && self.found_for_an_app(path) {
+                    Safety::Caution
+                } else {
+                    Safety::Protected
+                };
             }
             // Docker Desktop's VM disk lives here: it is only ever shrunk
             // through Docker itself, never deleted as a file.
@@ -732,6 +747,43 @@ mod tests {
 #[cfg(test)]
 mod app_location_tests {
     use super::*;
+
+    #[test]
+    fn an_apps_own_preferences_file_can_go_with_the_app_but_nothing_else_in_preferences() {
+        let home = Path::new("/Users/x");
+        let p = Policy::new(home, Path::new("/Users/x/hold"));
+        let prefs = home.join("Library/Preferences");
+        for f in [
+            "com.foo.app.plist",
+            "com.other.plist",
+            ".GlobalPreferences.plist",
+        ] {
+            assert_eq!(p.classify(&prefs.join(f)), Safety::Protected, "{f}");
+        }
+        p.allow_outside(vec![
+            prefs.join("com.foo.app.plist"),
+            prefs.join("com.apple.thing.plist"),
+            home.join("Library/Cookies/com.foo.app.binarycookies"),
+        ]);
+        assert_eq!(
+            p.classify(&prefs.join("com.foo.app.plist")),
+            Safety::Caution
+        );
+        assert_eq!(
+            p.classify(&home.join("Library/Cookies/com.foo.app.binarycookies")),
+            Safety::Caution
+        );
+        assert_eq!(
+            p.classify(&prefs.join("com.other.plist")),
+            Safety::Protected
+        );
+        assert_eq!(
+            p.classify(&prefs.join("com.apple.thing.plist")),
+            Safety::Protected,
+            "Apple's stays protected even if listed"
+        );
+        assert_eq!(p.classify(&prefs), Safety::Protected, "the folder itself");
+    }
 
     #[test]
     fn policy_allows_only_what_was_found_for_an_app() {
