@@ -141,17 +141,28 @@ impl Group {
         format!("{:?}:{}", self.section, self.title)
     }
 
+    /// The rows that are not inside another row of the group: a folder and
+    /// the folder inside it both show, but their bytes count once.
+    fn outer_rows(&self) -> impl Iterator<Item = &TRow> {
+        self.rows.iter().filter(|r| {
+            !self
+                .rows
+                .iter()
+                .any(|o| o.row.path != r.row.path && r.row.path.starts_with(&o.row.path))
+        })
+    }
+
     pub fn size(&self) -> u64 {
-        self.rows.iter().map(|r| r.row.size).sum()
+        self.outer_rows().map(|r| r.row.size).sum()
     }
 
     pub fn disk(&self) -> u64 {
-        self.rows.iter().map(|r| r.row.disk).sum()
+        self.outer_rows().map(|r| r.row.disk).sum()
     }
 
     /// Sum of the rows' own Frees (None while any is unknown).
     pub fn frees(&self) -> Option<u64> {
-        self.rows.iter().map(|r| r.row.frees).sum()
+        self.outer_rows().map(|r| r.row.frees).sum()
     }
 
     /// The group as a pseudo-row, so groups sort by the same keys as rows
@@ -1762,6 +1773,35 @@ mod tests {
             t.lines(&crate::filter::parse(""), Page::Leftovers)
                 .contains(&Line::Section(SectionKind::Leftovers))
         );
+    }
+
+    #[test]
+    fn a_folder_inside_another_row_counts_once_in_the_group_total() {
+        let s = sandbox(|h| {
+            write(&h.join("Library/Application Support/V/payload/f"), 1000);
+        });
+        let outer = s.home.join("Library/Application Support/V");
+        let inner = outer.join("payload");
+        let app = bundle(&outer, "com.v.a", "V", 1);
+        let t = with_apps(
+            &s,
+            AppsInput {
+                installed: vec![AppGroup {
+                    managed: None,
+                    app,
+                    parts: vec![part(outer.clone(), "Vendor folder"), part(inner, "payload")],
+                }],
+                ..no_apps()
+            },
+        );
+        let g = t
+            .groups
+            .iter()
+            .find(|g| g.section == SectionKind::Apps)
+            .unwrap();
+        assert_eq!(g.rows.len(), 2, "both rows are listed");
+        let outer_row = g.rows.iter().find(|r| r.row.path == outer).unwrap();
+        assert_eq!(g.size(), outer_row.row.size, "but the bytes count once");
     }
 
     #[test]

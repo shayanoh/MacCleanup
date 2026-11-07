@@ -47,7 +47,8 @@ fn id_of(name: &str) -> Option<String> {
         }
     }
     let n = n.strip_prefix("group.").unwrap_or(n);
-    id_shaped(n).then(|| n.to_string())
+    // Temporary files (`...binarycookies_tmp_597_0.dat`) are not app ids.
+    (id_shaped(n) && !n.contains("_tmp_")).then(|| n.to_string())
 }
 
 /// The program a launchd plist starts, from `Program` or `ProgramArguments[0]`.
@@ -85,11 +86,58 @@ fn add_part(
     }
 }
 
+/// A group that anything touched this recently is still in use by something
+/// (an app we did not see, a service): never listed.
+pub const MIN_IDLE_DAYS: i64 = 30;
+
+/// Newest modification time (Unix seconds) among the top-level parts.
+fn newest_mtime(parts: &[AppPart]) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    parts
+        .iter()
+        .filter_map(|p| fs::symlink_metadata(&p.path).ok())
+        .map(|m| m.mtime())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Fold `a.b.c.helper` groups into `a.b.c` when both are leftovers.
+fn merge_children(groups: BTreeMap<String, LeftoverGroup>) -> Vec<LeftoverGroup> {
+    let keys: Vec<String> = groups.keys().cloned().collect();
+    let parent_of = |k: &str| {
+        keys.iter()
+            .filter(|p| p.as_str() != k && k.starts_with(&format!("{p}.")))
+            .min_by_key(|p| p.len())
+            .cloned()
+    };
+    let mut out: BTreeMap<String, LeftoverGroup> = BTreeMap::new();
+    let mut children: Vec<(String, LeftoverGroup)> = Vec::new();
+    for (k, g) in groups {
+        match parent_of(&k) {
+            Some(p) => children.push((p, g)),
+            None => {
+                out.insert(k, g);
+            }
+        }
+    }
+    for (p, g) in children {
+        if let Some(parent) = out.get_mut(&p) {
+            for part in g.parts {
+                if !parent.parts.iter().any(|x| x.path == part.path) {
+                    parent.parts.push(part);
+                }
+            }
+        }
+    }
+    out.into_values().collect()
+}
+
 pub fn find_leftovers(
     index: &InstalledIndex,
     home: &Path,
     lib: &Path,
     running_ids: &BTreeSet<String>,
+    now: i64,
 ) -> LeftoversState {
     if !index.spotlight_ok {
         return LeftoversState::Unavailable(
@@ -171,13 +219,18 @@ pub fn find_leftovers(
             }
         }
     }
-    LeftoversState::Ready(groups.into_values().collect())
+    let idle_before = now - MIN_IDLE_DAYS * 86_400;
+    groups.retain(|_, g| newest_mtime(&g.parts) < idle_before);
+    LeftoversState::Ready(merge_children(groups))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::apps::AppBundle;
+
+    /// "Now" for tests: far after the files the tests just created.
+    const LATER: i64 = 4_000_000_000;
 
     struct Env {
         _d: tempfile::TempDir,
@@ -230,13 +283,25 @@ mod tests {
     }
 
     fn run(e: &Env, idx: &InstalledIndex) -> Vec<LeftoverGroup> {
-        ready(find_leftovers(idx, &e.home, &e.lib, &BTreeSet::new()))
+        ready(find_leftovers(
+            idx,
+            &e.home,
+            &e.lib,
+            &BTreeSet::new(),
+            LATER,
+        ))
     }
 
     #[test]
     fn unavailable_when_spotlight_not_ok() {
         let e = env();
-        match find_leftovers(&index(&[], &[], false), &e.home, &e.lib, &BTreeSet::new()) {
+        match find_leftovers(
+            &index(&[], &[], false),
+            &e.home,
+            &e.lib,
+            &BTreeSet::new(),
+            LATER,
+        ) {
             LeftoversState::Unavailable(w) => assert!(w.contains("Spotlight")),
             _ => panic!("expected unavailable"),
         }
@@ -306,7 +371,7 @@ mod tests {
         let e = env();
         mk(&e.home.join("Library/Caches/com.run.app"));
         let running = BTreeSet::from(["com.run.app".to_string()]);
-        let s = find_leftovers(&index(&[], &[], true), &e.home, &e.lib, &running);
+        let s = find_leftovers(&index(&[], &[], true), &e.home, &e.lib, &running, LATER);
         assert!(ready(s).is_empty());
     }
 
@@ -340,5 +405,46 @@ mod tests {
         assert_eq!(g[0].id, "com.gone.helper");
         assert_eq!(g[0].parts.len(), 2);
         assert!(g[0].parts.iter().all(|p| p.outside_home));
+    }
+
+    #[test]
+    fn recently_touched_groups_are_not_listed() {
+        let e = env();
+        mk(&e.home.join("Library/Caches/com.busy.app"));
+        let idx = index(&[], &[], true);
+        // "Now" is the moment of creation: the folder is brand new.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let fresh = ready(find_leftovers(&idx, &e.home, &e.lib, &BTreeSet::new(), now));
+        assert!(fresh.is_empty(), "touched today means still in use");
+        let old = ready(find_leftovers(
+            &idx,
+            &e.home,
+            &e.lib,
+            &BTreeSet::new(),
+            now + 31 * 86_400,
+        ));
+        assert_eq!(old.len(), 1);
+    }
+
+    #[test]
+    fn helper_ids_fold_into_the_main_group_and_temp_files_are_ignored() {
+        let e = env();
+        let hl = e.home.join("Library");
+        mk(&hl.join("Caches/com.gone.app"));
+        mk(&hl.join("Caches/com.gone.app.helper"));
+        mk(&hl.join("HTTPStorages/com.gone.app.perplexityd"));
+        touch(&hl.join("Cookies/com.gone.other.binarycookies_tmp_597_0.dat"));
+        let g = run(&e, &index(&[], &[], true));
+        assert_eq!(
+            g.len(),
+            1,
+            "{:?}",
+            g.iter().map(|g| &g.id).collect::<Vec<_>>()
+        );
+        assert_eq!(g[0].id, "com.gone.app");
+        assert_eq!(g[0].parts.len(), 3);
     }
 }

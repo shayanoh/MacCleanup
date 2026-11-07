@@ -227,6 +227,7 @@ pub fn build_index(roots: &[PathBuf], runner: &dyn CommandRunner) -> InstalledIn
     let spotlight_ok = found
         .as_deref()
         .is_some_and(|t| t.lines().any(|l| l.starts_with("/Applications/")));
+    let mut spotlight_nested = BTreeSet::new();
     for line in found.as_deref().unwrap_or("").lines() {
         let p = PathBuf::from(line);
         // Only top-level app bundles; nested ones are covered by `nested_ids`.
@@ -237,11 +238,18 @@ pub fn build_index(roots: &[PathBuf], runner: &dyn CommandRunner) -> InstalledIn
             && seen.insert(real.clone())
             && let Some(mut b) = read_bundle(&real)
         {
-            b.path = p;
-            apps.push(b);
+            // An app that lives inside a Library folder (Fusion's downloaded
+            // payload) belongs to another app: it proves an id exists but is
+            // not a program to uninstall by itself.
+            if p.components().any(|c| c.as_os_str() == "Library") {
+                spotlight_nested.insert(b.id);
+            } else {
+                b.path = p;
+                apps.push(b);
+            }
         }
     }
-    let mut nested = BTreeSet::new();
+    let mut nested = spotlight_nested;
     for a in &apps {
         nested_ids(&a.path, &mut nested);
     }
@@ -389,6 +397,35 @@ mod tests {
         assert_eq!(foo.last_used, 0);
         assert_eq!(parse_md_date("1970-01-02 00:00:00 +0000"), Some(86_400));
         assert_eq!(parse_md_date("(null)"), None);
+    }
+
+    #[test]
+    fn spotlight_app_inside_a_library_folder_is_an_id_not_an_app() {
+        let d = tempfile::tempdir().unwrap();
+        let lib = d
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("Library/Application Support/Vendor");
+        let payload = make_app(&lib, "Payload", "com.vendor.payload");
+        let top = d.path().canonicalize().unwrap().join("Applications");
+        fs::create_dir_all(&top).unwrap();
+        let top_app = make_app(&top, "Real", "com.vendor.real");
+        let runner = FakeRunner::new(&["mdls"]).answering(&[(
+            "mdfind",
+            &format!(
+                "/Applications/x\n{}\n{}",
+                payload.display(),
+                top_app.display()
+            ),
+        )]);
+        let idx = build_index(&[], &runner);
+        let ids: Vec<_> = idx.apps.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["com.vendor.real"]);
+        assert!(
+            idx.has_id("com.vendor.payload"),
+            "its id still counts as installed"
+        );
     }
 
     #[test]

@@ -71,10 +71,70 @@ pub fn discover_apps(
             app: a.clone(),
         })
         .collect();
-    let leftovers = find_leftovers(&index, home, lib, &running_ids);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let leftovers = find_leftovers(&index, home, lib, &running_ids, now);
     AppsInput {
         installed,
         leftovers,
         running,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::command::SystemRunner;
+
+    /// Read-only report on this machine: `cargo test real_machine_report --
+    /// --ignored --nocapture`. Prints what the Uninstall and Leftovers pages
+    /// would list; changes nothing.
+    #[test]
+    #[ignore = "reads the real /Applications, ~/Library and Spotlight"]
+    fn real_machine_report() {
+        let home = PathBuf::from(std::env::var("HOME").unwrap());
+        let input = discover_apps(
+            &home,
+            Path::new("/Library"),
+            &default_roots(&home),
+            &Managers::system(),
+            &SystemRunner,
+        );
+        println!("{} installed apps", input.installed.len());
+        let filter = std::env::var("APP").unwrap_or_else(|_| "Fusion".into());
+        for g in input
+            .installed
+            .iter()
+            .filter(|g| g.app.name.contains(&filter))
+        {
+            println!(
+                "== {} ({}) {:?}",
+                g.app.name,
+                g.app.id,
+                g.managed.as_ref().map(|m| &m.id)
+            );
+            for p in &g.parts {
+                println!(
+                    "   {:<18} shared={} outside={}  {}",
+                    p.label,
+                    p.shared_vendor,
+                    p.outside_home,
+                    p.path.display()
+                );
+            }
+        }
+        match &input.leftovers {
+            LeftoversState::Ready(found) => {
+                println!("{} leftover groups", found.len());
+                for g in found {
+                    println!("== {} ({} parts)", g.id, g.parts.len());
+                    for p in g.parts.iter().take(4) {
+                        println!("   {:<18} {}", p.label, p.path.display());
+                    }
+                }
+            }
+            LeftoversState::Unavailable(w) => println!("leftovers unavailable: {w}"),
+        }
     }
 }

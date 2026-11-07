@@ -61,18 +61,28 @@ pub fn launcher_target(app: &AppBundle, home_lib: &Path) -> Option<PathBuf> {
         .then_some(p)
 }
 
+/// How many leading dot-separated parts two ids share.
+fn shared_segments(a: &str, b: &str) -> usize {
+    a.split('.')
+        .zip(b.split('.'))
+        .take_while(|(x, y)| x.eq_ignore_ascii_case(y))
+        .count()
+}
+
 /// Sibling bundles in the same folder that belong to this app (Fusion's
-/// "Service Utility" and "Remove ..." bundles): same vendor, and one name
-/// contains the other.
+/// "Service Utility" and "Remove ..." bundles): their ids share at least four
+/// leading parts with the app's, and their longer names contain its name.
+/// (`com.google.Chrome` and `com.google.Chrome.canary` share three: separate
+/// apps.)
 pub fn wrappers<'a>(app: &AppBundle, siblings: &'a [AppBundle]) -> Vec<&'a AppBundle> {
-    let (v, n) = (vendor_of(&app.id), app.name.to_lowercase());
+    let n = app.name.to_lowercase();
     siblings
         .iter()
         .filter(|s| s.path != app.path && s.path.parent() == app.path.parent())
-        .filter(|s| vendor_of(&s.id) == v)
+        .filter(|s| shared_segments(&s.id, &app.id) >= 4)
         .filter(|s| {
             let sn = s.name.to_lowercase();
-            sn.contains(&n) || n.contains(&sn)
+            sn.len() > n.len() && sn.contains(&n)
         })
         .collect()
 }
@@ -406,27 +416,50 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_bundles_in_same_dir_join() {
+    fn wrapper_bundles_in_same_dir_join_and_the_main_app_is_not_one() {
         let e = env();
         let dir = e.home.join("Applications");
+        let base = "com.autodesk.dls.streamer.scriptapp";
         let a = app(
             &dir.join("Autodesk Fusion.app"),
-            "com.autodesk.fusion",
+            &format!("{base}.Autodesk-Fusion"),
             "Autodesk Fusion",
         );
         let w = app(
             &dir.join("Remove Autodesk Fusion.app"),
-            "com.autodesk.remove",
+            &format!("{base}.Remove-Autodesk-Fusion"),
             "Remove Autodesk Fusion",
         );
         let unrelated = app(&dir.join("Other.app"), "com.autodesk.other", "Other");
-        mk(&a.path);
-        mk(&w.path);
-        mk(&unrelated.path);
+        for x in [&a, &w, &unrelated] {
+            mk(&x.path);
+        }
         let sib = [a.clone(), w.clone(), unrelated];
         let n = labels(&parts_of(&a, &sib, &e.home, &e.lib));
         assert!(n.contains(&"Remove Autodesk Fusion.app".to_string()));
         assert!(!n.contains(&"Other.app".to_string()));
+        assert_eq!(
+            wrappers(&a, &sib).len(),
+            1,
+            "the remover is a wrapper of the app"
+        );
+        assert!(wrappers(&w, &sib).is_empty(), "never the other way round");
+    }
+
+    #[test]
+    fn chrome_canary_is_not_a_wrapper_of_chrome() {
+        let dir = PathBuf::from("/Applications");
+        let a = app(
+            &dir.join("Google Chrome.app"),
+            "com.google.Chrome",
+            "Google Chrome",
+        );
+        let c = app(
+            &dir.join("Google Chrome Canary.app"),
+            "com.google.Chrome.canary",
+            "Google Chrome Canary",
+        );
+        assert!(wrappers(&a, &[a.clone(), c]).is_empty());
     }
 
     #[test]
