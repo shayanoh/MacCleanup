@@ -61,7 +61,8 @@ pub fn env_with(files: &[(&str, usize)], setup: impl FnOnce(&Path)) -> Env {
     )
     .with_runner(std::sync::Arc::new(
         crate::catalog::command::FakeRunner::new(&[]),
-    ));
+    ))
+    .with_app_roots(vec![base.join("Applications")], base.join("lib"));
     // The app starts on Home; most tests exercise the explorer.
     app.update(Action::GoTo(Screen::Explorer));
     Env {

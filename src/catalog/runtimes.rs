@@ -300,7 +300,7 @@ pub fn globals_prefix(i: &NodeInstall) -> String {
 
 /// A name that may reach a command line: letters, digits and `@ / . _ -`, and
 /// not starting with `-` (so it can never read as an option).
-fn safe_name(name: &str) -> bool {
+pub(crate) fn safe_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('-')
         && !name.contains("..")

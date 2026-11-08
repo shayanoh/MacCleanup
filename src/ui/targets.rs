@@ -42,7 +42,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let g = app.glyphs;
-    let title = format!(" {} Caches & Projects ", g.folder());
+    let page_name = match app.screen {
+        crate::app::Screen::Runtimes => "Runtimes",
+        crate::app::Screen::Uninstall => "Uninstall",
+        crate::app::Screen::Leftovers => "Leftovers",
+        _ => "Caches & Projects",
+    };
+    let title = format!(" {} {page_name} ", g.folder());
     let block = panel(&g, title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -69,7 +75,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             Rect::new(inner.x, inner.y + 2, inner.width, 1),
         );
     }
-    let c = cols(inner.width, &g);
+    let mut c = cols(inner.width, &g);
+    c.last_used = app.screen == crate::app::Screen::Uninstall;
     frame.render_widget(
         Paragraph::new(header_line(app.sort, &c, &g)),
         Rect::new(inner.x, inner.y + 2 + filter_h, inner.width, 1),
@@ -103,11 +110,23 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         })
         .collect();
-    if app.tlines.is_empty() {
+    let busy = !app.filter.active() && (app.apps_looking() || app.targets_building());
+    if app.tlines.is_empty() && busy {
+        lines.extend(busy_lines(app));
+    } else if app.tlines.is_empty() {
         let msg = if app.filter.active() {
             "(nothing matches the filter)".to_string()
-        } else if app.targets_building() {
-            format!("(building the list{})", g.ellipsis())
+        } else if app.targets_building() || app.apps_looking() {
+            format!("(looking at the installed apps{})", g.ellipsis())
+        } else if let (crate::app::Screen::Leftovers, Some(why)) =
+            (app.screen, &app.targets.leftovers_note)
+        {
+            format!("(nothing is listed: {why})")
+        } else if matches!(
+            app.screen,
+            crate::app::Screen::Uninstall | crate::app::Screen::Leftovers
+        ) {
+            "(nothing found)".to_string()
         } else if app.scanner.is_idle() {
             "(nothing to clean was found in the scan)".to_string()
         } else {
@@ -203,10 +222,65 @@ pub(super) fn work_text(
 /// Scan activity, the tool lookup and the list build (each with a bar), and
 /// warnings when the scan root is not the home folder or Full Disk Access is
 /// missing (then caches outside what was scanned are not listed).
+/// The same spans in the dim color (a row that cannot be marked).
+fn dimmed(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    spans
+        .into_iter()
+        .map(|s| {
+            let style = s.style.fg(DIM);
+            Span::styled(s.content, style)
+        })
+        .collect()
+}
+
+/// An empty list that is still being worked on: always the same two lines
+/// (a moving spinner and where to look), so nothing shifts as the work moves
+/// on. What it is doing, with its steps and bar, is on the status line above.
+fn busy_lines(app: &App) -> Vec<TextLine<'static>> {
+    let g = &app.glyphs;
+    let idx = anim::spinner_frame(app.tick, g.spinner().len());
+    let title = if app.apps_looking() {
+        "Looking at your installed apps"
+    } else {
+        "Building the list"
+    };
+    vec![
+        TextLine::from(vec![
+            Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
+            Span::styled(
+                format!(" {title}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        TextLine::from(Span::styled(
+            "  Progress is on the line above. Only reading: nothing is changed or deleted.",
+            Style::default().fg(DIM),
+        )),
+    ]
+}
+
 fn status_line(app: &App, width: usize) -> TextLine<'static> {
     let g = &app.glyphs;
     let idx = anim::spinner_frame(app.tick, g.spinner().len());
     let mut spans: Vec<Span> = Vec::new();
+    if app.apps_looking() {
+        // What the apps lookup is doing right now, first and animated.
+        spans.push(Span::styled(
+            g.spinner()[idx].to_string(),
+            Style::default().fg(ACCENT),
+        ));
+        spans.push(Span::raw(format!(
+            " apps: {} {} ",
+            work_text(
+                &app.apps_work.snapshot(),
+                "looking at the installed apps",
+                app.tick,
+                8,
+                g
+            ),
+            g.dot()
+        )));
+    }
     if app.scanner.is_idle() {
         spans.push(Span::styled(
             g.check().to_string(),
@@ -351,6 +425,8 @@ fn section_line(app: &App, kind: SectionKind, width: usize) -> TextLine<'static>
         SectionKind::CargoBinaries => (" CARGO BINARIES", Color::LightRed),
         SectionKind::AndroidSdk => (" ANDROID SDK", Color::Green),
         SectionKind::Simulators => (" IOS SIMULATORS", Color::LightBlue),
+        SectionKind::Apps => (" INSTALLED APPS", Color::Green),
+        SectionKind::Leftovers => (" LEFT BEHIND BY REMOVED APPS", Color::Yellow),
     };
     let (mut disk, mut marked) = (0u64, 0usize);
     for grp in app.targets.groups.iter().filter(|x| x.section == kind) {
@@ -369,7 +445,18 @@ fn section_line(app: &App, kind: SectionKind, width: usize) -> TextLine<'static>
             None => format!("   {marked} marked {} frees {}", g.dot(), g.ellipsis()),
         }
     };
-    let text = format!("{title}   {} on disk{frees}", human_size(disk));
+    // Folders in your home get their Frees numbers when the scan is done.
+    let waiting =
+        if matches!(kind, SectionKind::Apps | SectionKind::Leftovers) && !app.scanner.is_idle() {
+            format!(
+                "   {} home folder still scanning: Frees fills in{}",
+                g.dot(),
+                g.ellipsis()
+            )
+        } else {
+            String::new()
+        };
+    let text = format!("{title}   {} on disk{frees}{waiting}", human_size(disk));
     let padded = fit_pad(&text, width, g);
     TextLine::from(Span::styled(
         padded,
@@ -416,20 +503,53 @@ fn group_line(app: &App, gi: usize, c: &Cols) -> TextLine<'static> {
     let base = Style::default()
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
+    // An app that cannot be removed says why, in color, and the rest of its
+    // line is dimmed: Apple's own apps (yellow), running apps (green).
+    let mut tags: Vec<Span<'static>> = Vec::new();
+    if grp.apple {
+        tags.push(Span::styled(
+            format!(" {} Apple's own ", g.dot()),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if grp.running {
+        tags.push(Span::styled(
+            format!(" {} running ", g.dot()),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let tag_w: usize = tags.iter().map(|t| text_width(&t.content)).sum();
+    let dim_line = grp.apple || grp.running;
+    let base = if dim_line {
+        Style::default().fg(DIM)
+    } else {
+        base
+    };
     let mut spans = highlight(
-        &fit_pad(&name_cell, c.prefix_w + c.name_w, g),
+        &fit_pad(
+            name_cell.trim_end(),
+            (c.prefix_w + c.name_w).saturating_sub(tag_w),
+            g,
+        ),
         &positions,
         base,
         base.fg(Color::Yellow),
     );
-    spans.extend(number_spans(
+    spans.extend(tags);
+    let numbers = number_spans(
         &grp.as_row(),
         false,
         app.sort,
         None,
         c.show_modified,
+        c.last_used,
         g,
-    ));
+    );
+    spans.extend(if dim_line { dimmed(numbers) } else { numbers });
     TextLine::from(spans)
 }
 
@@ -467,6 +587,8 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD),
         MarkState::Covered(_) => Style::default().fg(DIM),
+        // Running or Apple's: cannot be marked, so it is dimmed.
+        MarkState::Unmarked if t.locked.is_some() => Style::default().fg(DIM),
         // A finished product stands out: it is kept unless marked on its own.
         MarkState::Unmarked if t.kept => Style::default().fg(Color::Cyan),
         MarkState::Unmarked => Style::default().fg(Color::Blue),
@@ -505,7 +627,20 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
     ];
     spans.extend(highlight(
         &fit_pad(
-            &format!("  {name}{}", if t.kept { "  (kept)" } else { "" }),
+            &format!(
+                "  {name}{}",
+                if t.locked.is_some() {
+                    if app.targets.groups[gi].running {
+                        "  (running)"
+                    } else {
+                        "  (Apple's)"
+                    }
+                } else if t.kept {
+                    "  (kept)"
+                } else {
+                    ""
+                }
+            ),
             c.name_w,
             g,
         ),
@@ -533,16 +668,26 @@ fn row_line(app: &App, query: &Query, gi: usize, ri: usize, c: &Cols) -> TextLin
             9,
         )
     });
-    spans.extend(number_spans(
+    let numbers = number_spans(
         &r,
         queued,
         app.sort,
         frees_text,
         c.show_modified,
+        c.last_used,
         g,
-    ));
+    );
+    spans.extend(if t.locked.is_some() {
+        dimmed(numbers)
+    } else {
+        numbers
+    });
     if c.show_share {
-        let color = if queued { DIM } else { Color::Yellow };
+        let color = if queued || t.locked.is_some() {
+            DIM
+        } else {
+            Color::Yellow
+        };
         spans.push(Span::styled(
             format!(" {share}"),
             Style::default().fg(color),
@@ -796,11 +941,38 @@ fn detail_lines(app: &App, width: usize, height: usize) -> Vec<TextLine<'static>
             ),
             dim,
         )));
-    } else {
+    } else if r.node.is_none() {
+        // Measured by walking it: outside the scanned home folder.
         out.push(TextLine::from(Span::styled(
-            fit(&format!("still scanning{}", g.ellipsis()), width, g),
-            dim,
+            fit(
+                &format!(
+                    "outside the scan {} deleting it frees about {} (plain size, clones not checked)",
+                    g.dot(),
+                    human_size(r.disk)
+                ),
+                width,
+                g,
+            ),
+            Style::default().fg(Color::Green),
         )));
+    } else {
+        let idx = anim::spinner_frame(app.tick, g.spinner().len());
+        out.push(TextLine::from(vec![
+            Span::styled(g.spinner()[idx].to_string(), Style::default().fg(ACCENT)),
+            Span::styled(
+                fit(
+                    &format!(
+                        " still scanning {} {} files so far {}",
+                        g.dot(),
+                        app.scanner.stats().files,
+                        marquee(app.tick, 8, g)
+                    ),
+                    width.saturating_sub(2),
+                    g,
+                ),
+                dim,
+            ),
+        ]));
     }
     if !app.marks.is_empty() || !app.tool_marks.is_empty() {
         let text = match app.joint_frees() {

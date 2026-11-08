@@ -16,6 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::catalog::{CommandRunner, CommandSpec, RunControl};
+use crate::elevate::{ElevatedMove, Elevator, NoElevator};
 use crate::safety::Policy;
 use crate::softdelete::{DeleteCounters, HeldItem, HoldError, Holding};
 use crate::usage::Usage;
@@ -68,8 +69,20 @@ impl DeleteJob {
         items: Vec<(PathBuf, Usage)>,
         mode: DeleteMode,
     ) -> DeleteJob {
+        DeleteJob::start_with(holding, policy, items, mode, Arc::new(NoElevator))
+    }
+
+    /// Like [`start`](Self::start); items outside the home folder that a normal
+    /// move is not allowed to touch go to `elevator` as one batch.
+    pub fn start_with(
+        holding: Arc<Holding>,
+        policy: Arc<Policy>,
+        items: Vec<(PathBuf, Usage)>,
+        mode: DeleteMode,
+        elevator: Arc<dyn Elevator>,
+    ) -> DeleteJob {
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || run_move(&holding, &policy, items, mode, &tx));
+        thread::spawn(move || run_move(&holding, &policy, items, mode, elevator.as_ref(), &tx));
         DeleteJob { rx }
     }
 
@@ -135,6 +148,7 @@ fn run_move(
     policy: &Policy,
     items: Vec<(PathBuf, Usage)>,
     mode: DeleteMode,
+    elevator: &dyn Elevator,
     tx: &mpsc::Sender<DeleteEvent>,
 ) {
     let phases = if mode == DeleteMode::SoftThenEmpty {
@@ -152,11 +166,20 @@ fn run_move(
     let (mut moved, mut emptied) = (Usage::default(), Usage::default());
     let mut held: Vec<(String, PathBuf)> = Vec::new();
 
+    // Items outside home that a normal move may not touch: one batch later.
+    let mut denied: Vec<(PathBuf, Usage)> = Vec::new();
     for (path, usage) in items {
         match holding.move_in(policy, &path, usage) {
             Ok(item) => {
                 moved += usage;
                 held.push((item.id, path.clone()));
+            }
+            Err(HoldError::Io(e))
+                if e.kind() == io::ErrorKind::PermissionDenied
+                    && !path.starts_with(policy.home()) =>
+            {
+                denied.push((path, usage));
+                continue;
             }
             Err(e) => {
                 failures += 1;
@@ -168,6 +191,56 @@ fn run_move(
         }
         done += 1;
         tally.progress(done, moved, Phase::Moving, &path);
+    }
+
+    if !denied.is_empty() {
+        let mut slots = Vec::new();
+        for (path, usage) in denied {
+            match holding.reserve(policy, &path, usage) {
+                Ok(r) => slots.push((path, usage, r)),
+                Err(e) => {
+                    failures += 1;
+                    done += 1;
+                    let _ = tx.send(DeleteEvent::Failed {
+                        path: path.clone(),
+                        error: e.to_string(),
+                    });
+                    tally.progress(done, moved, Phase::Moving, &path);
+                }
+            }
+        }
+        let moves: Vec<ElevatedMove> = slots
+            .iter()
+            .map(|(p, _, r)| ElevatedMove {
+                from: p.clone(),
+                to: r.payload.clone(),
+            })
+            .collect();
+        let result = elevator.move_all(&moves);
+        for (path, usage, r) in slots {
+            // Trust the filesystem, not the report: the item must be gone
+            // from where it was and present in its slot.
+            let landed = result.is_ok()
+                && std::fs::symlink_metadata(&path).is_err()
+                && std::fs::symlink_metadata(&r.payload).is_ok();
+            if landed {
+                moved += usage;
+                held.push((r.item.id.clone(), path.clone()));
+            } else {
+                holding.unreserve(&r);
+                failures += 1;
+                let error = match &result {
+                    Err(e) => e.to_string(),
+                    Ok(()) => "the item is still where it was".to_string(),
+                };
+                let _ = tx.send(DeleteEvent::Failed {
+                    path: path.clone(),
+                    error,
+                });
+            }
+            done += 1;
+            tally.progress(done, moved, Phase::Moving, &path);
+        }
     }
 
     if mode == DeleteMode::SoftThenEmpty {
@@ -283,6 +356,108 @@ mod tests {
             (s.home.join("p/a"), Usage::new(100, 4096)),
             (s.home.join("p/b"), Usage::new(200, 4096)),
         ]
+    }
+
+    use crate::elevate::{ElevateError, FakeElevator};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Two files in a folder we cannot write to, outside home but counted as
+    /// an app location by the policy. Skipped as root.
+    type LockedPair = (Arc<Policy>, Vec<(PathBuf, Usage)>);
+
+    fn locked_pair(s: &Sandbox) -> Option<LockedPair> {
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+        let outside = s.home.parent().unwrap().join("outside");
+        write(&outside.join("locked/a"), 10);
+        write(&outside.join("locked/b"), 10);
+        fs::set_permissions(outside.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        let policy = Arc::new(
+            Policy::new(&s.home, s.home.parent().unwrap().join("hold").as_path())
+                .with_extra_root(&outside),
+        );
+        let items = vec![
+            (outside.join("locked/a"), Usage::new(10, 4096)),
+            (outside.join("locked/b"), Usage::new(10, 4096)),
+        ];
+        Some((policy, items))
+    }
+
+    fn unlock(s: &Sandbox) {
+        let dir = s.home.parent().unwrap().join("outside/locked");
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+    }
+
+    #[test]
+    fn permission_denied_items_go_to_one_elevated_batch() {
+        let s = sandbox();
+        let Some((policy, items)) = locked_pair(&s) else {
+            return;
+        };
+        let elevator = Arc::new(FakeElevator::moving());
+        let job = DeleteJob::start_with(
+            s.holding.clone(),
+            policy,
+            items.clone(),
+            DeleteMode::SoftOnly,
+            elevator.clone(),
+        );
+        let (moved, _, failures) = finished(&run_to_end(&job));
+        unlock(&s);
+        assert_eq!(failures, 0);
+        assert_eq!(moved.size, 20);
+        let batches = elevator.batches.lock().unwrap();
+        assert_eq!(batches.len(), 1, "one prompt for all");
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(s.holding.list().unwrap().len(), 2);
+        assert!(!items[0].0.exists());
+    }
+
+    #[test]
+    fn cancelled_elevation_leaves_no_manifest_entry_and_reports_failures() {
+        let s = sandbox();
+        let Some((policy, items)) = locked_pair(&s) else {
+            return;
+        };
+        let elevator = Arc::new(FakeElevator::failing(ElevateError::Cancelled));
+        let job = DeleteJob::start_with(
+            s.holding.clone(),
+            policy,
+            items.clone(),
+            DeleteMode::SoftOnly,
+            elevator,
+        );
+        let events = run_to_end(&job);
+        unlock(&s);
+        let (moved, _, failures) = finished(&events);
+        assert_eq!((moved.size, failures), (0, 2));
+        assert!(items[0].0.exists() && items[1].0.exists(), "nothing moved");
+        assert!(
+            s.holding.list().unwrap().is_empty(),
+            "no stale manifest entry"
+        );
+        let slots = fs::read_dir(s.home.parent().unwrap().join("hold/items"))
+            .unwrap()
+            .count();
+        assert_eq!(slots, 0, "no empty slot folders left");
+    }
+
+    #[test]
+    fn normal_items_do_not_reach_the_elevator() {
+        let s = sandbox();
+        let items = two_files(&s);
+        let elevator = Arc::new(FakeElevator::moving());
+        let job = DeleteJob::start_with(
+            s.holding.clone(),
+            s.policy.clone(),
+            items,
+            DeleteMode::SoftOnly,
+            elevator.clone(),
+        );
+        let (_, _, failures) = finished(&run_to_end(&job));
+        assert_eq!(failures, 0);
+        assert!(elevator.batches.lock().unwrap().is_empty());
     }
 
     fn finished(events: &[DeleteEvent]) -> (Usage, Usage, usize) {

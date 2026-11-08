@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use crate::app::{SortBy, cmp_rows};
 use crate::bg::Work;
+use crate::catalog::appsdata::AppsInput;
+use crate::catalog::leftovers::LeftoversState;
 use crate::catalog::resolve::Places;
 use crate::catalog::runtimes::{RuntimeEntry, discover_runtimes};
 use crate::catalog::split::{SplitKind, split};
@@ -30,6 +32,10 @@ pub enum SectionKind {
     PnpmGlobals,
     AndroidSdk,
     Simulators,
+    /// Installed apps and their folders (the Uninstall page).
+    Apps,
+    /// Folders of apps that are gone (the Leftovers page).
+    Leftovers,
 }
 
 /// The screen a section is listed on: Caches & Projects or Packages & runtimes.
@@ -37,18 +43,22 @@ pub enum SectionKind {
 pub enum Page {
     Caches,
     Runtimes,
+    Uninstall,
+    Leftovers,
 }
 
 impl SectionKind {
     pub fn page(self) -> Page {
         match self {
             SectionKind::Projects | SectionKind::Tools => Page::Caches,
+            SectionKind::Apps => Page::Uninstall,
+            SectionKind::Leftovers => Page::Leftovers,
             _ => Page::Runtimes,
         }
     }
 
     /// Sections in the order they are listed.
-    pub const ALL: [SectionKind; 12] = [
+    pub const ALL: [SectionKind; 14] = [
         SectionKind::Projects,
         SectionKind::Tools,
         SectionKind::NodeVersions,
@@ -61,6 +71,8 @@ impl SectionKind {
         SectionKind::CargoBinaries,
         SectionKind::AndroidSdk,
         SectionKind::Simulators,
+        SectionKind::Apps,
+        SectionKind::Leftovers,
     ];
 }
 
@@ -97,6 +109,11 @@ pub struct TRow {
     /// A final product (a built program) that bulk marks leave alone: it is
     /// deleted only when the user marks that row itself.
     pub kept: bool,
+    /// Why the row cannot be marked now (an Apple app, a running app).
+    pub locked: Option<String>,
+    /// Bundles of the other installed apps that use this folder too; it can
+    /// be marked only when all of them are marked.
+    pub shared_with: Vec<PathBuf>,
 }
 
 impl TRow {
@@ -114,6 +131,12 @@ pub struct Group {
     pub section: SectionKind,
     pub rows: Vec<TRow>,
     pub open: bool,
+    /// The app bundles of an Uninstall group (to see if the app is running).
+    pub bundles: Vec<PathBuf>,
+    /// The app is running now (shown on the group, its rows are dimmed).
+    pub running: bool,
+    /// One of Apple's own apps: listed, never removable.
+    pub apple: bool,
 }
 
 impl Group {
@@ -122,17 +145,28 @@ impl Group {
         format!("{:?}:{}", self.section, self.title)
     }
 
+    /// The rows that are not inside another row of the group: a folder and
+    /// the folder inside it both show, but their bytes count once.
+    fn outer_rows(&self) -> impl Iterator<Item = &TRow> {
+        self.rows.iter().filter(|r| {
+            !self
+                .rows
+                .iter()
+                .any(|o| o.row.path != r.row.path && r.row.path.starts_with(&o.row.path))
+        })
+    }
+
     pub fn size(&self) -> u64 {
-        self.rows.iter().map(|r| r.row.size).sum()
+        self.outer_rows().map(|r| r.row.size).sum()
     }
 
     pub fn disk(&self) -> u64 {
-        self.rows.iter().map(|r| r.row.disk).sum()
+        self.outer_rows().map(|r| r.row.disk).sum()
     }
 
     /// Sum of the rows' own Frees (None while any is unknown).
     pub fn frees(&self) -> Option<u64> {
-        self.rows.iter().map(|r| r.row.frees).sum()
+        self.outer_rows().map(|r| r.row.frees).sum()
     }
 
     /// The group as a pseudo-row, so groups sort by the same keys as rows
@@ -165,6 +199,8 @@ pub enum Line {
 #[derive(Clone, Default)]
 pub struct Targets {
     pub groups: Vec<Group>,
+    /// Why the Leftovers page lists nothing (Spotlight is off), if so.
+    pub leftovers_note: Option<String>,
 }
 
 /// A candidate before it becomes a row.
@@ -188,6 +224,290 @@ struct Cand {
     kind: RowKind,
     regen: String,
     note: Option<String>,
+}
+
+/// Sizes of a folder or file that is not in the scan tree (outside home).
+/// Plain allocated bytes; clone sharing is not looked at (an app in
+/// `/Applications` is rarely a clone).
+fn walk_row(path: &Path, name: String) -> Option<Row> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::symlink_metadata(path).ok()?;
+    let (mut size, mut disk, mut files, mut mtime) = (0u64, 0u64, 0u64, md.mtime());
+    let is_dir = md.is_dir();
+    let mut stack = vec![path.to_path_buf()];
+    if !is_dir {
+        stack.clear();
+        size = md.len();
+        disk = md.blocks() * 512;
+        files = 1;
+    }
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(m) = e.path().symlink_metadata() else {
+                continue;
+            };
+            size += m.len();
+            disk += m.blocks() * 512;
+            mtime = mtime.max(m.mtime());
+            if m.is_dir() {
+                stack.push(e.path());
+            } else {
+                files += 1;
+            }
+        }
+    }
+    Some(Row {
+        name: name.into(),
+        path: path.to_path_buf(),
+        is_dir,
+        size,
+        disk,
+        files,
+        scanning: false,
+        node: None,
+        space: None,
+        // Outside the scan: plain allocated bytes, clones are not looked at.
+        frees: Some(disk),
+        mtime,
+    })
+}
+
+/// A row for a place of an app: from the scan tree when it is in it,
+/// otherwise by walking it.
+fn place_row(root: &Arc<Node>, path: &Path, name: String) -> Option<Row> {
+    match locate(root, path) {
+        Some(node) => Some(Row {
+            name: name.into(),
+            path: path.to_path_buf(),
+            is_dir: true,
+            size: node.size(),
+            disk: node.disk(),
+            files: node.files(),
+            scanning: !node.is_done(),
+            mtime: node.mtime(),
+            node: Some(node),
+            space: None,
+            frees: None,
+        }),
+        None => walk_row(path, name),
+    }
+}
+
+/// A place of an app, with what bulk marks and marking need to know.
+struct PartSpec {
+    path: PathBuf,
+    label: String,
+    why: String,
+    /// Skipped by bulk marks: outside home (but not the app itself), or a
+    /// vendor folder other apps use.
+    bulk_skip: bool,
+    shared_with: Vec<PathBuf>,
+    /// Removed with a package manager's command instead of a move.
+    command: Option<(String, crate::catalog::CommandSpec)>,
+}
+
+struct GroupSpec {
+    section: SectionKind,
+    title: String,
+    subtitle: String,
+    last_used: i64,
+    lock: Option<String>,
+    running: bool,
+    apple: bool,
+    bundles: Vec<PathBuf>,
+    parts: Vec<PartSpec>,
+}
+
+/// Add the Uninstall and Leftovers groups. Returns the note for an empty
+/// Leftovers page.
+fn add_app_groups(
+    groups: &mut Vec<Group>,
+    apps: &AppsInput,
+    src: &BuildSource,
+    closed: &HashSet<String>,
+    work: &Work,
+) -> Option<String> {
+    use crate::catalog::apppolicy::is_apple_id;
+    use crate::catalog::apps::vendor_of;
+    use rayon::prelude::*;
+    let mut specs: Vec<GroupSpec> = Vec::new();
+    for g in &apps.installed {
+        // What can run: the bundles and a launcher's real payload, by their
+        // real paths (`ps` reports those, not the symlink we listed).
+        let bundles: Vec<PathBuf> = g
+            .parts
+            .iter()
+            .filter(|p| p.label == "app" || p.label == "payload")
+            .map(|p| p.path.canonicalize().unwrap_or_else(|_| p.path.clone()))
+            .collect();
+        let running = apps
+            .running
+            .iter()
+            .any(|r| bundles.iter().any(|b| r.starts_with(b)));
+        let lock = if is_apple_id(&g.app.id) {
+            Some(format!("{} is one of Apple's own apps", g.app.name))
+        } else if running {
+            Some(format!("{} is running: quit it first", g.app.name))
+        } else {
+            None
+        };
+        let vendor = vendor_of(&g.app.id);
+        let partners: Vec<PathBuf> = apps
+            .installed
+            .iter()
+            .filter(|o| o.app.path != g.app.path && vendor_of(&o.app.id) == vendor)
+            .map(|o| o.app.path.clone())
+            .collect();
+        specs.push(GroupSpec {
+            section: SectionKind::Apps,
+            title: g.app.name.clone(),
+            subtitle: g.app.version.clone(),
+            last_used: g.app.last_used,
+            lock,
+            running,
+            apple: is_apple_id(&g.app.id),
+            bundles,
+            parts: g
+                .parts
+                .iter()
+                .map(|p| PartSpec {
+                    path: p.path.clone(),
+                    label: p.label.clone(),
+                    why: p.label.clone(),
+                    bulk_skip: (p.outside_home && p.label != "app") || p.shared_vendor,
+                    shared_with: if p.shared_vendor {
+                        partners.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    command: g
+                        .managed
+                        .as_ref()
+                        .filter(|_| p.label == "app" && p.path == g.app.path)
+                        .map(|m| (m.id.clone(), m.spec.clone())),
+                })
+                .collect(),
+        });
+    }
+    let mut note = None;
+    match &apps.leftovers {
+        LeftoversState::Ready(found) => {
+            for g in found {
+                specs.push(GroupSpec {
+                    section: SectionKind::Leftovers,
+                    title: g.id.clone(),
+                    subtitle: String::new(),
+                    last_used: 0,
+                    lock: None,
+                    running: false,
+                    apple: false,
+                    bundles: Vec::new(),
+                    parts: g
+                        .parts
+                        .iter()
+                        .map(|p| PartSpec {
+                            path: p.path.clone(),
+                            label: p.label.clone(),
+                            why: g.reason.clone(),
+                            bulk_skip: p.outside_home,
+                            shared_with: Vec::new(),
+                            command: None,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        LeftoversState::Unavailable(why) => note = Some(why.clone()),
+    }
+    // Measure every place on the walk pool, never on rayon's global pool.
+    let jobs: Vec<(usize, usize)> = specs
+        .iter()
+        .enumerate()
+        .flat_map(|(si, s)| (0..s.parts.len()).map(move |pi| (si, pi)))
+        .collect();
+    work.stage(0, jobs.len(), "measuring the folders of apps");
+    let rows: Vec<Option<Row>> = crate::bg::walk_pool().install(|| {
+        jobs.par_iter()
+            .map(|&(si, pi)| {
+                let p = &specs[si].parts[pi];
+                let name = p
+                    .path
+                    .file_name()
+                    .map_or_else(|| p.label.clone(), |n| n.to_string_lossy().into_owned());
+                let row = place_row(&src.root, &p.path, name);
+                work.step();
+                row
+            })
+            .collect()
+    });
+    // Folders inside the scanned home: the clone- and snapshot-aware numbers,
+    // once the scan has finished (until then their Frees stays "...").
+    let mut space_of: std::collections::HashMap<usize, crate::scan::Space> = Default::default();
+    if src.scan_idle {
+        work.begin("working out what deleting each folder frees", 0);
+        let with_node: Vec<(usize, Arc<Node>)> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| Some((i, r.as_ref()?.node.clone()?)))
+            .collect();
+        let nodes: Vec<Arc<Node>> = with_node.iter().map(|(_, n)| Arc::clone(n)).collect();
+        for ((i, _), sp) in with_node.iter().zip(src.view.spaces_of(&nodes)) {
+            space_of.insert(*i, sp);
+        }
+    }
+    for (si, spec) in specs.into_iter().enumerate() {
+        let mut trows = Vec::new();
+        for (pi, p) in spec.parts.into_iter().enumerate() {
+            let idx = jobs.iter().position(|&j| j == (si, pi)).unwrap_or(0);
+            let Some(mut row) = rows[idx].clone() else {
+                continue;
+            };
+            if let Some(sp) = space_of.get(&idx) {
+                row.space = Some(*sp);
+                row.disk = sp.footprint;
+                row.frees = Some(sp.frees_now);
+            }
+            if spec.section == SectionKind::Apps {
+                row.mtime = spec.last_used; // "Opened" belongs to the app
+            }
+            trows.push(TRow {
+                row,
+                kind: match p.command {
+                    Some((id, spec)) => RowKind::Command {
+                        id,
+                        spec,
+                        notes: Box::default(),
+                    },
+                    None => RowKind::Folder,
+                },
+                safety: src.policy.classify(&p.path),
+                regen: format!("{} of {}", p.label, spec.title),
+                note: Some(p.why),
+                kept: p.bulk_skip || spec.lock.is_some(),
+                locked: spec.lock.clone(),
+                shared_with: p.shared_with,
+            });
+        }
+        if trows.is_empty() {
+            continue;
+        }
+        let key = format!("{:?}:{}", spec.section, spec.title);
+        groups.push(Group {
+            open: !closed.contains(&key),
+            label: spec.title.clone(),
+            title: spec.title,
+            subtitle: spec.subtitle,
+            section: spec.section,
+            rows: trows,
+            bundles: spec.bundles,
+            running: spec.running,
+            apple: spec.apple,
+        });
+    }
+    note
 }
 
 fn project_kind(k: ArtifactKind) -> &'static str {
@@ -307,6 +627,8 @@ pub struct BuildSource {
     /// still there after its command ran becomes a folder move.
     pub ran: HashSet<String>,
     pub closed: HashSet<String>,
+    /// Apps and leftovers, once the Uninstall or Leftovers page asked for them.
+    pub apps: Option<Arc<AppsInput>>,
 }
 
 impl Targets {
@@ -321,6 +643,7 @@ impl Targets {
             runtime_extra,
             ran,
             closed,
+            apps,
         } = src;
         let (home, scan_idle) = (home.as_path(), *scan_idle);
         work.stage(0, 3, "listing tool caches");
@@ -515,6 +838,8 @@ impl Targets {
                 regen: c.regen,
                 note: c.note,
                 kept: c.kept,
+                locked: None,
+                shared_with: Vec::new(),
             };
             match groups
                 .iter_mut()
@@ -528,6 +853,9 @@ impl Targets {
                     subtitle: c.subtitle,
                     section: c.section,
                     rows: vec![trow],
+                    bundles: Vec::new(),
+                    running: false,
+                    apple: false,
                 }),
             }
         }
@@ -543,7 +871,14 @@ impl Targets {
                 }
             }
         }
-        let mut t = Targets { groups };
+        let mut leftovers_note = None;
+        if let Some(apps) = apps {
+            leftovers_note = add_app_groups(&mut groups, apps, src, closed, work);
+        }
+        let mut t = Targets {
+            groups,
+            leftovers_note,
+        };
         t.sort(SortBy::Disk);
         work.stage(3, 3, "done");
         t
@@ -701,6 +1036,7 @@ mod tests {
             runtime_extra: Vec::new(),
             ran: HashSet::new(),
             closed,
+            apps: None,
         }
     }
 
@@ -1362,6 +1698,266 @@ mod tests {
         assert_eq!(t.row(g, r).row.name, "target");
         assert!(t.find(&s.home.join("nope")).is_none());
     }
+
+    // --- Uninstall and Leftovers pages ---
+
+    use crate::catalog::appfiles::AppPart;
+    use crate::catalog::apps::AppBundle;
+    use crate::catalog::appsdata::{AppGroup, AppsInput};
+    use crate::catalog::leftovers::{LeftoverGroup, LeftoversState};
+
+    fn bundle(path: &Path, id: &str, name: &str, last_used: i64) -> AppBundle {
+        AppBundle {
+            path: path.to_path_buf(),
+            id: id.to_string(),
+            name: name.to_string(),
+            version: "1.0".to_string(),
+            executable: path.join("Contents/MacOS").join(name),
+            owner: "u".to_string(),
+            last_used,
+        }
+    }
+
+    fn part(path: PathBuf, label: &str) -> AppPart {
+        AppPart {
+            path,
+            label: label.to_string(),
+            shared_vendor: false,
+            outside_home: false,
+        }
+    }
+
+    fn with_apps(s: &Sandbox, apps: AppsInput) -> Targets {
+        let mut src = source(s, &[], HashSet::new());
+        src.apps = Some(Arc::new(apps));
+        Targets::build(&src, &Work::new())
+    }
+
+    fn no_apps() -> AppsInput {
+        AppsInput {
+            installed: Vec::new(),
+            leftovers: LeftoversState::Ready(Vec::new()),
+            running: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn uninstall_page_lists_app_group_with_parts() {
+        let s = sandbox(|h| {
+            write(&h.join("Applications/Foo.app/Contents/x"), 100);
+            write(&h.join("Library/Caches/com.foo.app/c"), 50);
+        });
+        let app = bundle(
+            &s.home.join("Applications/Foo.app"),
+            "com.foo.app",
+            "Foo",
+            5,
+        );
+        let t = with_apps(
+            &s,
+            AppsInput {
+                installed: vec![AppGroup {
+                    managed: None,
+                    parts: vec![
+                        part(app.path.clone(), "app"),
+                        part(s.home.join("Library/Caches/com.foo.app"), "Caches"),
+                    ],
+                    app,
+                }],
+                ..no_apps()
+            },
+        );
+        let g = t
+            .groups
+            .iter()
+            .find(|g| g.section == SectionKind::Apps)
+            .unwrap();
+        assert_eq!(g.title, "Foo");
+        assert_eq!(g.rows.len(), 2);
+        assert!(
+            g.rows.iter().all(|r| r.row.mtime == 5),
+            "Last used is the app's"
+        );
+        let q = crate::filter::parse("");
+        assert!(
+            t.lines(&q, Page::Uninstall)
+                .contains(&Line::Section(SectionKind::Apps))
+        );
+        assert!(
+            !t.lines(&q, Page::Caches)
+                .contains(&Line::Section(SectionKind::Apps))
+        );
+    }
+
+    #[test]
+    fn leftovers_page_lists_groups_by_id() {
+        let s = sandbox(|h| write(&h.join("Library/Caches/com.gone.app/c"), 10));
+        let t = with_apps(
+            &s,
+            AppsInput {
+                leftovers: LeftoversState::Ready(vec![LeftoverGroup {
+                    id: "com.gone.app".into(),
+                    parts: vec![part(s.home.join("Library/Caches/com.gone.app"), "Caches")],
+                    reason: "no app with id com.gone.app is installed".into(),
+                }]),
+                ..no_apps()
+            },
+        );
+        let g = t
+            .groups
+            .iter()
+            .find(|g| g.section == SectionKind::Leftovers)
+            .unwrap();
+        assert_eq!(g.title, "com.gone.app");
+        assert!(g.rows[0].note.as_deref().unwrap().contains("com.gone.app"));
+        assert!(
+            t.lines(&crate::filter::parse(""), Page::Leftovers)
+                .contains(&Line::Section(SectionKind::Leftovers))
+        );
+    }
+
+    #[test]
+    fn a_folder_inside_another_row_counts_once_in_the_group_total() {
+        let s = sandbox(|h| {
+            write(&h.join("Library/Application Support/V/payload/f"), 1000);
+        });
+        let outer = s.home.join("Library/Application Support/V");
+        let inner = outer.join("payload");
+        let app = bundle(&outer, "com.v.a", "V", 1);
+        let t = with_apps(
+            &s,
+            AppsInput {
+                installed: vec![AppGroup {
+                    managed: None,
+                    app,
+                    parts: vec![part(outer.clone(), "Vendor folder"), part(inner, "payload")],
+                }],
+                ..no_apps()
+            },
+        );
+        let g = t
+            .groups
+            .iter()
+            .find(|g| g.section == SectionKind::Apps)
+            .unwrap();
+        assert_eq!(g.rows.len(), 2, "both rows are listed");
+        let outer_row = g.rows.iter().find(|r| r.row.path == outer).unwrap();
+        assert_eq!(g.size(), outer_row.row.size, "but the bytes count once");
+    }
+
+    #[test]
+    fn payload_and_symlinked_bundles_count_for_the_running_check() {
+        let s = sandbox(|h| {
+            write(&h.join("real/A.app/Contents/x"), 10);
+            write(&h.join("Library/Application Support/V/payload/y"), 10);
+        });
+        std::fs::create_dir_all(s.home.join("Applications")).unwrap();
+        let link = s.home.join("Applications/A.app");
+        std::os::unix::fs::symlink(s.home.join("real/A.app"), &link).unwrap();
+        let payload = s.home.join("Library/Application Support/V/payload");
+        let t = with_apps(
+            &s,
+            AppsInput {
+                installed: vec![AppGroup {
+                    managed: None,
+                    app: bundle(&link, "com.v.a", "A", 1),
+                    parts: vec![part(link.clone(), "app"), part(payload.clone(), "payload")],
+                }],
+                // What `ps` shows: the real path of the program inside the payload.
+                running: vec![payload.join("prog")],
+                leftovers: LeftoversState::Ready(Vec::new()),
+            },
+        );
+        let g = t
+            .groups
+            .iter()
+            .find(|g| g.section == SectionKind::Apps)
+            .unwrap();
+        assert!(
+            g.rows.iter().all(|r| r.locked.is_some()),
+            "running payload locks the group"
+        );
+        assert!(g.running && !g.apple, "and the group says it is running");
+        assert!(
+            g.bundles
+                .contains(&s.home.join("real/A.app").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn leftovers_note_is_kept_when_unavailable() {
+        let s = sandbox(|_| {});
+        let t = with_apps(
+            &s,
+            AppsInput {
+                leftovers: LeftoversState::Unavailable("Spotlight is off".into()),
+                ..no_apps()
+            },
+        );
+        assert_eq!(t.leftovers_note.as_deref(), Some("Spotlight is off"));
+    }
+
+    #[test]
+    fn outside_home_app_row_is_shown_but_protected() {
+        let s = sandbox(|_| {});
+        let outside = tempfile::tempdir().unwrap();
+        let bundle_path = outside.path().canonicalize().unwrap().join("Foo.app");
+        write(&bundle_path.join("Contents/x"), 1000);
+        let app = bundle(&bundle_path, "com.foo.app", "Foo", 0);
+        let t = with_apps(
+            &s,
+            AppsInput {
+                installed: vec![AppGroup {
+                    managed: None,
+                    parts: vec![part(bundle_path.clone(), "app")],
+                    app,
+                }],
+                ..no_apps()
+            },
+        );
+        let g = t
+            .groups
+            .iter()
+            .find(|g| g.section == SectionKind::Apps)
+            .unwrap();
+        assert_eq!(g.rows[0].safety, Safety::Protected);
+        assert!(g.rows[0].row.size >= 1000, "walked: {}", g.rows[0].row.size);
+    }
+
+    #[test]
+    fn never_opened_sorts_as_oldest() {
+        let s = sandbox(|h| {
+            write(&h.join("A/a"), 10);
+            write(&h.join("B/b"), 10);
+        });
+        let (a, b) = (s.home.join("A"), s.home.join("B"));
+        let mut t = with_apps(
+            &s,
+            AppsInput {
+                installed: vec![
+                    AppGroup {
+                        managed: None,
+                        app: bundle(&a, "com.a.a", "Never", 0),
+                        parts: vec![part(a, "app")],
+                    },
+                    AppGroup {
+                        managed: None,
+                        app: bundle(&b, "com.b.b", "Recent", 100),
+                        parts: vec![part(b, "app")],
+                    },
+                ],
+                ..no_apps()
+            },
+        );
+        t.sort(SortBy::Modified);
+        let order: Vec<_> = t
+            .groups
+            .iter()
+            .filter(|g| g.section == SectionKind::Apps)
+            .map(|g| g.title.as_str())
+            .collect();
+        assert_eq!(order, ["Recent", "Never"]);
+    }
 }
 
 /// Timing check on a big clone-heavy tree. Slow, so it only runs on request:
@@ -1435,6 +2031,7 @@ mod stress {
             runtime_extra: Vec::new(),
             ran: HashSet::new(),
             closed: HashSet::new(),
+            apps: None,
         };
         let work = Work::new();
         let t = Instant::now();
@@ -1479,6 +2076,7 @@ mod stress {
                 runtime_extra: Vec::new(),
                 ran: HashSet::new(),
                 closed: HashSet::new(),
+                apps: None,
             };
             let t = Instant::now();
             let built = Targets::build(&src, &Work::new());

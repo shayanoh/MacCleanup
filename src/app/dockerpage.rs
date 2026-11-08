@@ -200,6 +200,40 @@ impl App {
         self.ensure_visible();
     }
 
+    /// `H` / `L`: fold every line, or open the sections and the items under
+    /// them (layer lists stay folded: they can be hundreds of lines).
+    pub(super) fn docker_fold_all(&mut self, open: bool) {
+        if open {
+            for _ in 0..3 {
+                let keys: Vec<String> = self
+                    .docker
+                    .lines
+                    .iter()
+                    .filter(|l| l.open == Some(false) && l.depth <= 1)
+                    .map(|l| l.key.clone())
+                    .collect();
+                if keys.is_empty() {
+                    break;
+                }
+                for k in keys {
+                    self.docker.view.set_open(&k, true);
+                }
+                self.docker_refilter();
+            }
+        } else {
+            self.docker.view.open.clear();
+            self.docker_refilter();
+        }
+        self.notice = Some(
+            if open {
+                "Opened every section and item"
+            } else {
+                "Folded everything"
+            }
+            .to_string(),
+        );
+    }
+
     fn docker_set_open(&mut self, key: &str, open: bool) {
         self.docker.view.set_open(key, open);
         self.docker_refilter();
@@ -893,6 +927,18 @@ mod tests {
         e.app.update(Action::CycleSort);
         assert_eq!(e.app.docker.view.sort, DSort::Frees);
         assert_eq!(e.app.sort, explorer_sort);
+    }
+
+    #[test]
+    fn fold_all_and_unfold_all_on_the_docker_page() {
+        let mut e = loaded_app();
+        let open = e.app.docker.lines.len();
+        e.app.update(Action::FoldAll);
+        let folded = e.app.docker.lines.len();
+        assert!(folded < open, "{folded} < {open}");
+        assert!(e.app.docker.lines.iter().all(|l| l.open != Some(true)));
+        e.app.update(Action::UnfoldAll);
+        assert!(e.app.docker.lines.len() > folded);
     }
 
     #[test]

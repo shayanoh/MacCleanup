@@ -1,6 +1,6 @@
 # Uninstaller and Leftovers pages (milestone 6)
 
-Status: proposed, waiting for approval. Written 2026-11-07.
+Status: approved and built 2026-11-07 (released as 0.9.0; the remaining gaps are listed in the README, "What is left") (plan: `docs/superpowers/plans/2026-11-07-uninstaller-leftovers.md`). Deviations: the fourth column header is "Opened" ("Last used" does not fit the shared 10-cell column); `launchctl bootout` is not run (needs root; known gap); Frees is not shown; the terminal-chain lock is covered by the running-app lock.
 
 ## Why
 

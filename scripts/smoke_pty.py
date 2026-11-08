@@ -19,7 +19,7 @@ import time
 import unicodedata
 
 BIN = sys.argv[1]
-ROWS, COLS = 30, 100
+ROWS, COLS = 30, int(os.environ.get("COLS", 100))
 
 
 class Screen:
@@ -285,7 +285,7 @@ wait_gone("still holds 1 item")
 assert pid_alive(), "Esc must keep the app running"
 
 step("holding screen and restore")
-send(b"7")
+send(b"9")  # ToBeDeleted is entry 9 since the Runtimes page
 wait_for("1 items")
 send(b"r")
 wait_for("Restored")
@@ -320,6 +320,35 @@ assert not os.path.exists(os.path.join(home, "ToBeDeleted", "items")) or not os.
     os.path.join(home, "ToBeDeleted", "items")
 ), "cancelling must move nothing"
 assert os.path.exists(os.path.join(home, "shop", "node_modules", "dep", "index.js"))
+
+step("uninstall: 4 lists the installed apps with an Opened column (reads the real /Applications, changes nothing)")
+send(b"4")
+if os.environ.get("EARLY"):
+    for delay in (0.4, 1.0, 1.5, 3.0, 4.0, 5.0):
+        pump(delay)
+        print(f"=== UNINSTALL after +{delay}s ===")
+        print("\n".join(screen.text().split("\n")[:12]))
+wait_for("Uninstall")
+wait_for("INSTALLED APPS", timeout=60.0)
+if COLS >= 140:
+    wait_for("Opened")
+if os.environ.get("FILTER"):
+    send(b"/" + os.environ["FILTER"].encode() + b"\r")
+if os.environ.get("DUMP"):
+    pump(1.5); print("=== UNINSTALL ==="); print(screen.text())
+    send(b"\r"); send(b"jj"); pump(1.0); print("=== UNINSTALL details ==="); print(screen.text())
+
+step("leftovers: 3 lists groups left by removed apps, or says why it lists none")
+send(b"3")
+wait_for("Leftovers")
+end = time.time() + 60.0
+while time.time() < end:
+    t = screen.text()
+    if "LEFT BEHIND" in t or "nothing is listed" in t or "(nothing found)" in t:
+        break
+    pump(0.2)
+else:
+    fail("the Leftovers page never settled")
 
 step("docker: 6 opens the page; with a throwaway HOME there is no Docker Desktop context, and it says so")
 send(b"6")

@@ -7,6 +7,7 @@ use ratatui::layout::Rect;
 use crate::accounting::Accounting;
 use crate::anim::Smooth;
 use crate::bg::{Latest, Work};
+use crate::catalog::appsdata::{AppsInput, discover_apps};
 use crate::catalog::resolve::Places;
 use crate::catalog::runtimes::{RuntimeEntry, discover_slow};
 use crate::catalog::{
@@ -33,12 +34,26 @@ pub enum Screen {
     Targets,
     /// Packages & runtimes: the same list as `Targets`, showing the other sections.
     Runtimes,
+    /// Installed apps with their folders: the same list as `Targets`.
+    Uninstall,
+    /// Folders of apps that are gone: the same list as `Targets`.
+    Leftovers,
     Docker,
     /// Local Time Machine snapshots.
     Snapshots,
     /// Looking inside a Docker image or volume (opened from the Docker page).
     DockerFiles,
     Holding,
+}
+
+impl Screen {
+    /// The screens that show the shared Caches & Projects style list.
+    pub fn is_list(self) -> bool {
+        matches!(
+            self,
+            Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,11 +111,11 @@ pub const SIDEBAR: [SidebarEntry; 9] = [
     },
     SidebarEntry {
         label: "Leftovers",
-        screen: None,
+        screen: Some(Screen::Leftovers),
     },
     SidebarEntry {
         label: "Uninstall",
-        screen: None,
+        screen: Some(Screen::Uninstall),
     },
     SidebarEntry {
         label: "Caches & Projects",
@@ -167,6 +182,14 @@ pub enum Action {
     GoTo(Screen),
     /// In a review: switch commands that have one to their `--force` form (`f`).
     ToggleForce,
+    /// `H`: fold every group of the list.
+    FoldAll,
+    /// `L`: open every group of the list.
+    UnfoldAll,
+    /// Copy the commands of the "run it yourself" dialog.
+    ManualCopy,
+    /// "I ran the commands": look again.
+    ManualRan,
     /// On the result screen: run the lock-blocked commands again with `--force`.
     RetryForced,
     /// A digit key: the page at this position (1-based) in the menu.
@@ -222,6 +245,9 @@ pub struct ReviewItem {
     pub path: PathBuf,
     pub usage: Usage,
     pub safety: Safety,
+    /// Outside home in a folder we cannot write to: moving it will ask for
+    /// the password (through the system's own prompt).
+    pub needs_admin: bool,
 }
 
 /// A tool's own cleanup command in the review.
@@ -293,6 +319,13 @@ pub struct Review {
 }
 
 impl Review {
+    /// Does confirming need an explicit `y` (Enter never confirms)? Tool
+    /// commands cannot be undone, and a password prompt must not come as a
+    /// surprise.
+    pub fn needs_y(&self) -> bool {
+        !self.commands.is_empty() || self.items.iter().any(|i| i.needs_admin)
+    }
+
     /// Lines of the review's scrolling list: one per folder, then the
     /// commands block (a blank line, a heading, and per command its line, its
     /// "via" line, and one more each for a warning and for a force hint).
@@ -394,6 +427,47 @@ pub enum Dialog {
     Deleting(DeleteProgress),
     Finish(FinishInfo),
     Notice(String),
+    /// The password prompt did not work out: the exact commands to run by hand.
+    Manual(Manual),
+}
+
+/// The "run it yourself" dialog for items that need administrator rights.
+#[derive(Clone, Debug)]
+pub struct Manual {
+    /// Why the automatic way did not work.
+    pub reason: String,
+    /// The commands, one per line.
+    pub lines: Vec<String>,
+    pub copied: bool,
+    slots: Vec<crate::softdelete::Reserved>,
+}
+
+/// The places the Uninstall and Leftovers pages may offer: the parts of apps
+/// that are not Apple's, and of leftover groups. Outside the home folder this
+/// is the only way anything is offered; inside it, it also lets an app's own
+/// preferences file through the otherwise protected `~/Library/Preferences`.
+fn outside_parts(input: &AppsInput, _home: &Path) -> Vec<PathBuf> {
+    use crate::catalog::apppolicy::is_apple_id;
+    use crate::catalog::leftovers::LeftoversState;
+    let mut out: Vec<PathBuf> = input
+        .installed
+        .iter()
+        .filter(|g| !is_apple_id(&g.app.id))
+        .flat_map(|g| g.parts.iter().map(|p| p.path.clone()))
+        .collect();
+    if let LeftoversState::Ready(found) = &input.leftovers {
+        out.extend(
+            found
+                .iter()
+                .flat_map(|g| g.parts.iter().map(|p| p.path.clone())),
+        );
+    }
+    out
+}
+
+/// `'text'` for a POSIX shell, whatever the text holds.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Where the selected row's disk space would go.
@@ -537,6 +611,19 @@ pub struct App {
     /// Ids of commands that ran this session (see `BuildSource::ran`).
     ran_commands: HashSet<String>,
     tools_started: bool,
+    /// Apps and leftovers for the Uninstall and Leftovers pages (read once).
+    apps_input: Option<Arc<AppsInput>>,
+    apps_rx: Option<mpsc::Receiver<AppsInput>>,
+    apps_started: bool,
+    /// What the apps lookup is doing right now (shown while it runs).
+    pub apps_work: Arc<Work>,
+    /// Items outside home that the last job could not move, and their sizes.
+    job_failed: Vec<PathBuf>,
+    job_usage: std::collections::HashMap<PathBuf, Usage>,
+    /// Where installed apps are looked for, and the system `/Library`.
+    apps_roots: Vec<std::path::PathBuf>,
+    apps_lib: std::path::PathBuf,
+    apps_managers: crate::catalog::appmgr::Managers,
     /// Keys of the groups the user folded (kept across rebuilds).
     closed_groups: HashSet<String>,
     targets_synced: bool,
@@ -645,6 +732,7 @@ impl App {
         accounting.set_pending(holding.total().unwrap_or_default());
         let free_now = volume::free_space(&root.path).unwrap_or(0);
         let total_space = volume::total_space(&root.path).unwrap_or(0);
+        let apps_roots_default = crate::catalog::appsdata::default_roots(policy.home());
         let mut app = App {
             screen: Screen::Home,
             // The menu starts focused so j/k and Enter work straight away.
@@ -700,6 +788,15 @@ impl App {
             runtime_extra: Vec::new(),
             ran_commands: HashSet::new(),
             tools_started: false,
+            apps_input: None,
+            apps_rx: None,
+            apps_started: false,
+            apps_work: Work::new(),
+            job_failed: Vec::new(),
+            job_usage: std::collections::HashMap::new(),
+            apps_roots: apps_roots_default,
+            apps_lib: std::path::PathBuf::from("/Library"),
+            apps_managers: crate::catalog::appmgr::Managers::system(),
             closed_groups: HashSet::new(),
             targets_synced: false,
             targets_job: Latest::new(),
@@ -740,6 +837,19 @@ impl App {
     /// Use another way of running tool commands (tests pass a fake).
     pub fn with_runner(mut self, runner: Arc<dyn CommandRunner>) -> App {
         self.runner = runner;
+        self
+    }
+
+    /// Where the Uninstall and Leftovers pages look for apps (tests point
+    /// this at a sandbox).
+    pub fn with_app_roots(
+        mut self,
+        roots: Vec<std::path::PathBuf>,
+        lib: std::path::PathBuf,
+    ) -> App {
+        self.apps_roots = roots;
+        self.apps_lib = lib;
+        self.apps_managers = crate::catalog::appmgr::Managers::default();
         self
     }
 
@@ -889,6 +999,8 @@ impl App {
             Screen::Explorer
                 | Screen::Targets
                 | Screen::Runtimes
+                | Screen::Uninstall
+                | Screen::Leftovers
                 | Screen::Docker
                 | Screen::DockerFiles
         ) {
@@ -1011,6 +1123,10 @@ impl App {
             Action::Quit => self.request_quit(),
             Action::Tick => self.on_tick(),
             Action::Cancel => self.cancel(),
+            Action::FoldAll => self.fold_all(false),
+            Action::UnfoldAll => self.fold_all(true),
+            Action::ManualCopy => self.manual_copy(),
+            Action::ManualRan => self.manual_ran(),
             Action::Confirm => self.confirm(),
             Action::ConfirmIrreversible => match self.dialog.take() {
                 Some(Dialog::Review(r)) => self.dialog = Some(Dialog::Irreversible(r)),
@@ -1282,6 +1398,7 @@ impl App {
             self.refresh_free();
         }
         self.poll_discovery();
+        self.poll_apps();
         self.process_refresh();
         self.poll_targets();
         self.poll_docker();
@@ -1320,6 +1437,12 @@ impl App {
     }
 
     fn cancel(&mut self) {
+        // Nothing was moved by hand: give the booked slots back.
+        if let Some(Dialog::Manual(m)) = &self.dialog {
+            for r in &m.slots {
+                self.holding.unreserve(r);
+            }
+        }
         // A move or a delete cannot be cancelled half-way; a running tool
         // command can (it is stopped, and the ones after it are skipped).
         if let Some(Dialog::Deleting(p)) = self.dialog.take() {
@@ -1362,26 +1485,87 @@ impl App {
             Some(Dialog::Irreversible(r)) => self.run_delete(r, DeleteMode::SoftThenEmpty),
             Some(Dialog::ConfirmForever(t)) => self.run_forever(t),
             Some(Dialog::Deleting(p)) => self.dialog = Some(Dialog::Deleting(p)),
+            Some(d @ Dialog::Manual(_)) => self.dialog = Some(d),
             Some(Dialog::Finish(_)) | Some(Dialog::Notice(_)) | None => {}
+        }
+    }
+
+    /// `c` in the "run it yourself" dialog: put the commands on the clipboard.
+    fn manual_copy(&mut self) {
+        let Some(Dialog::Manual(m)) = &mut self.dialog else {
+            return;
+        };
+        let text = m.lines.join("\n");
+        let spec = CommandSpec::new("/usr/bin/pbcopy", &[]).with_stdin(&text);
+        let ok = self.runner.run(&spec, &RunControl::new()).ok;
+        m.copied = ok;
+        self.notice = Some(if ok {
+            "Copied the commands".to_string()
+        } else {
+            "Could not copy; select the lines with the mouse".to_string()
+        });
+    }
+
+    /// `r`: the user ran the commands; read everything again.
+    fn manual_ran(&mut self) {
+        if let Some(Dialog::Manual(m)) = &self.dialog {
+            // Slots whose item never arrived are given back.
+            for r in &m.slots {
+                if std::fs::symlink_metadata(&r.payload).is_err() {
+                    self.holding.unreserve(r);
+                }
+            }
+            self.dialog = None;
+            self.refresh_held();
+            self.rescan(true);
+        }
+    }
+
+    /// After a delete: items outside home that could not be moved get their
+    /// exact commands, each against a booked ToBeDeleted slot, so doing it by
+    /// hand keeps the soft delete.
+    fn open_manual(&mut self, reason: String) {
+        let failed = std::mem::take(&mut self.job_failed);
+        let user = crate::elevate::current_user().unwrap_or_default();
+        let (mut slots, mut lines) = (Vec::new(), Vec::new());
+        for path in failed {
+            if std::fs::symlink_metadata(&path).is_err() {
+                continue;
+            }
+            let usage = self.job_usage.get(&path).copied().unwrap_or_default();
+            if let Ok(r) = self.holding.reserve(&self.policy, &path, usage) {
+                lines.push(format!(
+                    "sudo /bin/mv -- {} {}",
+                    shell_quote(&path.to_string_lossy()),
+                    shell_quote(&r.payload.to_string_lossy())
+                ));
+                lines.push(format!(
+                    "sudo /usr/sbin/chown -R {} {}",
+                    shell_quote(&user),
+                    shell_quote(&r.payload.to_string_lossy())
+                ));
+                slots.push(r);
+            }
+        }
+        if !slots.is_empty() {
+            self.dialog = Some(Dialog::Manual(Manual {
+                reason,
+                lines,
+                copied: false,
+                slots,
+            }));
         }
     }
 
     fn goto(&mut self, screen: Screen) {
         self.filter.editing = false;
         // The filter belongs to one list; it does not follow to another screen.
-        let own_filter = |s: Screen| {
-            matches!(
-                s,
-                Screen::Targets | Screen::Runtimes | Screen::Docker | Screen::DockerFiles
-            )
-        };
+        let own_filter =
+            |s: Screen| s.is_list() || matches!(s, Screen::Docker | Screen::DockerFiles);
         if (own_filter(self.screen) || own_filter(screen)) && self.screen != screen {
             self.reset_filter();
         }
-        let switching = matches!(
-            (self.screen, screen),
-            (Screen::Targets, Screen::Runtimes) | (Screen::Runtimes, Screen::Targets)
-        );
+        let switching = self.screen != screen && self.screen.is_list() && screen.is_list();
         self.screen = screen;
         self.transition_start = self.tick;
         if switching {
@@ -1401,6 +1585,10 @@ impl App {
                 self.start_discovery();
                 self.rebuild_targets();
             }
+            Screen::Uninstall | Screen::Leftovers => {
+                self.start_apps_discovery();
+                self.rebuild_targets();
+            }
             Screen::Docker => self.reload_docker(),
             Screen::Snapshots => self.reload_snapshots(),
             Screen::DockerFiles | Screen::Home => {}
@@ -1414,6 +1602,8 @@ impl App {
                 let order = [
                     Screen::Home,
                     Screen::Explorer,
+                    Screen::Leftovers,
+                    Screen::Uninstall,
                     Screen::Targets,
                     Screen::Docker,
                     Screen::Snapshots,
@@ -1443,7 +1633,7 @@ impl App {
             (_, Screen::Docker) => self.docker_move(delta),
             (_, Screen::Snapshots) => self.snap_move(delta),
             (_, Screen::DockerFiles) => self.browse_move(delta),
-            (_, Screen::Targets | Screen::Runtimes) => {
+            (_, Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers) => {
                 self.tcursor = step(self.tcursor, delta, self.tlines.len());
                 self.ensure_visible();
                 self.request_holders();
@@ -1493,10 +1683,7 @@ impl App {
             return;
         }
         let whole =
-            all || matches!(
-                self.screen,
-                Screen::Home | Screen::Targets | Screen::Runtimes
-            ) || self.stack.len() == 1;
+            all || self.screen == Screen::Home || self.screen.is_list() || self.stack.len() == 1;
         if whole {
             let root_path = self.stack[0].path.clone();
             let Some(root) = self.scanner.rescan_all(&root_path) else {
@@ -1595,7 +1782,9 @@ impl App {
                 let name = row.name.to_string_lossy().into_owned();
                 self.mark_path(path, usage, &name);
             }
-            Screen::Targets | Screen::Runtimes => self.toggle_target_mark(),
+            Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => {
+                self.toggle_target_mark()
+            }
             Screen::Docker => self.toggle_docker_mark(),
             Screen::Snapshots => self.toggle_snapshot_mark(),
             _ => {}
@@ -1658,15 +1847,16 @@ impl App {
 
     /// Is this the Caches & Projects list or the Packages & runtimes one?
     pub fn on_targets(&self) -> bool {
-        matches!(self.screen, Screen::Targets | Screen::Runtimes)
+        self.screen.is_list()
     }
 
     /// Which sections of the list the current screen shows.
     pub fn page(&self) -> crate::targets::Page {
-        if self.screen == Screen::Runtimes {
-            crate::targets::Page::Runtimes
-        } else {
-            crate::targets::Page::Caches
+        match self.screen {
+            Screen::Runtimes => crate::targets::Page::Runtimes,
+            Screen::Uninstall => crate::targets::Page::Uninstall,
+            Screen::Leftovers => crate::targets::Page::Leftovers,
+            _ => crate::targets::Page::Caches,
         }
     }
 
@@ -1701,7 +1891,10 @@ impl App {
     /// version (they go with it). Caches & Projects never marks commands in
     /// bulk: there each command is a cleanup the user picks on purpose.
     fn mark_bulk_commands(&mut self, keep: impl Fn(usize, &crate::targets::Group) -> bool) {
-        if self.page() != crate::targets::Page::Runtimes {
+        if !matches!(
+            self.page(),
+            crate::targets::Page::Runtimes | crate::targets::Page::Uninstall
+        ) {
             return;
         }
         let (mut ids, mut refused) = (Vec::new(), 0);
@@ -1716,7 +1909,7 @@ impl App {
                 let crate::targets::RowKind::Command { id, notes, .. } = &r.kind else {
                     continue;
                 };
-                if notes.refuse.is_some() {
+                if notes.refuse.is_some() || r.locked.is_some() {
                     refused += 1;
                 } else if !matches!(self.mark_state(&r.row.path), MarkState::Covered(_))
                     && self.version_covering(id).is_none()
@@ -1742,6 +1935,82 @@ impl App {
         self.marks_changed();
     }
 
+    /// A locked row, or a folder other installed apps still use, cannot be
+    /// marked; say why. Unmarking is always allowed.
+    fn row_blocked(&mut self, t: &TRow, name: &str) -> bool {
+        if self.marks.contains_key(&t.row.path) {
+            return false;
+        }
+        if let Some(why) = &t.locked {
+            self.notice = Some(why.clone());
+            return true;
+        }
+        if !t.shared_with.is_empty()
+            && !t
+                .shared_with
+                .iter()
+                .all(|b| self.mark_state(b) != MarkState::Unmarked)
+        {
+            self.notice = Some(format!(
+                "{name} is used by other installed apps of the same vendor: mark all of them first"
+            ));
+            return true;
+        }
+        false
+    }
+
+    /// When the review opens: unmark what became unsafe since it was marked
+    /// (an app that started running, a shared folder whose other apps are no
+    /// longer marked). Returns how many marks were dropped.
+    fn recheck_app_marks(&mut self) -> usize {
+        let apps = self
+            .targets
+            .groups
+            .iter()
+            .any(|g| g.section == SectionKind::Apps);
+        if !apps || self.marks.is_empty() {
+            return 0;
+        }
+        let running = crate::catalog::apps::running_executables(self.runner.as_ref());
+        let mut drop: Vec<(PathBuf, String)> = Vec::new();
+        for g in self
+            .targets
+            .groups
+            .iter()
+            .filter(|g| g.section == SectionKind::Apps)
+        {
+            let is_running = running
+                .iter()
+                .any(|r| g.bundles.iter().any(|b| r.starts_with(b)));
+            for r in &g.rows {
+                if !self.marks.contains_key(&r.row.path) {
+                    continue;
+                }
+                if is_running {
+                    drop.push((r.row.path.clone(), format!("{} is running", g.title)));
+                } else if !r.shared_with.is_empty()
+                    && !r
+                        .shared_with
+                        .iter()
+                        .all(|b| self.mark_state(b) != MarkState::Unmarked)
+                {
+                    drop.push((
+                        r.row.path.clone(),
+                        "a shared folder is used by an app that is not marked".to_string(),
+                    ));
+                }
+            }
+        }
+        for (p, _) in &drop {
+            self.marks.remove(p);
+        }
+        if let Some((_, why)) = drop.first() {
+            self.notice = Some(format!("Unmarked {} item(s): {why}", drop.len()));
+            self.marks_changed();
+        }
+        drop.len()
+    }
+
     fn toggle_target_mark(&mut self) {
         match self.tlines.get(self.tcursor).copied() {
             Some(Line::Row { group, row }) => {
@@ -1749,6 +2018,9 @@ impl App {
                 let name = t.row.name.to_string_lossy().into_owned();
                 match &t.kind {
                     crate::targets::RowKind::Folder => {
+                        if self.row_blocked(&t, &name) {
+                            return;
+                        }
                         self.mark_path(
                             t.row.path.clone(),
                             Usage::new(t.row.size, t.row.disk),
@@ -1757,7 +2029,7 @@ impl App {
                     }
                     crate::targets::RowKind::Command { id, notes, .. } => {
                         if !self.tool_marks.contains(id)
-                            && let Some(why) = &notes.refuse
+                            && let Some(why) = notes.refuse.as_ref().or(t.locked.as_ref())
                         {
                             self.notice = Some(why.clone());
                             return;
@@ -1784,13 +2056,48 @@ impl App {
                 let items = self.folder_rows_of(|gi, _| gi == g);
                 self.mark_many(items);
                 self.mark_bulk_commands(|gi, _| gi == g);
+                self.note_left_out(|gi, _| gi == g);
             }
             Some(Line::Section(kind)) => {
                 let items = self.folder_rows_of(|_, grp| grp.section == kind);
                 self.mark_many(items);
                 self.mark_bulk_commands(|_, grp| grp.section == kind);
+                self.note_left_out(|_, grp| grp.section == kind);
             }
             None => {}
+        }
+    }
+
+    /// After a header mark on the Uninstall or Leftovers page: say what the
+    /// mark left out and why (a running or Apple app, folders outside home or
+    /// shared with other apps), so a header never seems to do nothing.
+    fn note_left_out(&mut self, keep: impl Fn(usize, &crate::targets::Group) -> bool) {
+        let (mut locked, mut apps, mut left) = (Vec::new(), 0usize, 0usize);
+        for (_, g) in self.targets.groups.iter().enumerate().filter(|(i, g)| {
+            matches!(g.section, SectionKind::Apps | SectionKind::Leftovers) && keep(*i, g)
+        }) {
+            apps += 1;
+            if let Some(why) = g.rows.iter().find_map(|r| r.locked.clone()) {
+                locked.push(why);
+            } else {
+                left += g.rows.iter().filter(|r| r.kept && !r.is_command()).count();
+            }
+        }
+        let mut parts: Vec<String> = Vec::new();
+        match locked.len() {
+            0 => {}
+            1 if apps == 1 => parts.push(locked[0].clone()),
+            n => parts.push(format!(
+                "{n} app(s) are running or Apple's own and cannot be marked"
+            )),
+        }
+        if left > 0 {
+            parts.push(format!(
+                "{left} folder(s) outside your home or shared with other apps were left out: mark them one by one"
+            ));
+        }
+        if !parts.is_empty() {
+            self.notice = Some(parts.join(". "));
         }
     }
 
@@ -1806,7 +2113,7 @@ impl App {
             .filter(|(i, g)| keep(*i, g))
             .flat_map(|(_, g)| g.rows.iter())
             // Commands and finished products are never swept up by a bulk mark.
-            .filter(|r| !r.is_command() && !r.kept)
+            .filter(|r| !r.is_command() && !r.kept && r.locked.is_none())
             .map(|r| (r.row.path.clone(), Usage::new(r.row.size, r.row.disk)))
             .collect()
     }
@@ -2038,16 +2345,21 @@ impl App {
             Screen::Explorer
                 | Screen::Targets
                 | Screen::Runtimes
+                | Screen::Uninstall
+                | Screen::Leftovers
                 | Screen::Docker
                 | Screen::Snapshots
         ) {
             return;
         }
+        let dropped = self.recheck_app_marks();
         let commands = self.review_commands();
         self.review_scroll = 0;
         self.review_seen_end = false;
         if self.marks.is_empty() && commands.is_empty() {
-            self.notice = Some("Nothing marked yet. Press space to mark items.".to_string());
+            if dropped == 0 {
+                self.notice = Some("Nothing marked yet. Press space to mark items.".to_string());
+            }
             return;
         }
         let mut items: Vec<ReviewItem> = self
@@ -2057,6 +2369,8 @@ impl App {
                 path: path.clone(),
                 usage: *usage,
                 safety: self.policy.classify_real(path),
+                needs_admin: !path.starts_with(self.policy.home())
+                    && path.parent().is_none_or(|p| !crate::elevate::can_write(p)),
             })
             .collect();
         items.sort_by(|a, b| {
@@ -2197,7 +2511,7 @@ impl App {
                         self.held_cursor = idx;
                     }
                 }
-                Screen::Targets | Screen::Runtimes => {
+                Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => {
                     let idx = self.toffset + i;
                     if idx < self.tlines.len() {
                         if idx == self.tcursor {
@@ -2242,6 +2556,55 @@ impl App {
         self.tools_rx = Some(rx);
     }
 
+    /// Read the installed apps and the leftovers once, on a thread.
+    fn start_apps_discovery(&mut self) {
+        if self.apps_started {
+            return;
+        }
+        self.apps_started = true;
+        let (tx, rx) = mpsc::channel();
+        let runner = Arc::clone(&self.runner);
+        let home = self.policy.home().to_path_buf();
+        let (roots, lib, managers) = (
+            self.apps_roots.clone(),
+            self.apps_lib.clone(),
+            self.apps_managers.clone(),
+        );
+        let work = Arc::clone(&self.apps_work);
+        work.begin("starting", 0);
+        std::thread::spawn(move || {
+            let _ = tx.send(discover_apps(
+                &home,
+                &lib,
+                &roots,
+                &managers,
+                runner.as_ref(),
+                &work,
+            ));
+        });
+        self.apps_rx = Some(rx);
+    }
+
+    fn poll_apps(&mut self) {
+        let Some(rx) = &self.apps_rx else { return };
+        match rx.try_recv() {
+            Ok(input) => {
+                self.policy
+                    .allow_outside(outside_parts(&input, self.policy.home()));
+                self.apps_input = Some(Arc::new(input));
+                self.apps_rx = None;
+                self.rebuild_targets();
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => self.apps_rx = None,
+        }
+    }
+
+    /// Is the look for installed apps still running?
+    pub fn apps_looking(&self) -> bool {
+        self.apps_rx.is_some()
+    }
+
     fn poll_discovery(&mut self) {
         let Some(rx) = &self.tools_rx else { return };
         match rx.try_recv() {
@@ -2278,6 +2641,7 @@ impl App {
             runtime_extra: self.runtime_extra.clone(),
             ran: self.ran_commands.clone(),
             closed: self.closed_groups.clone(),
+            apps: self.apps_input.clone(),
         };
         let work = Arc::clone(&self.build_work);
         work.begin("starting", 3);
@@ -2409,6 +2773,42 @@ impl App {
         }
     }
 
+    /// `H` / `L`: fold or open every group of the list on this page.
+    fn fold_all(&mut self, open: bool) {
+        match self.screen {
+            Screen::Docker => self.docker_fold_all(open),
+            Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => {
+                // Stay on the group the cursor is in when folding.
+                let keep = match self.tlines.get(self.tcursor).copied() {
+                    Some(Line::Row { group, .. }) if !open => self
+                        .targets
+                        .groups
+                        .get(group)
+                        .map(|g| LineKey::Group(g.key())),
+                    _ => self.sel_of(self.tcursor),
+                };
+                for g in &mut self.targets.groups {
+                    g.open = open;
+                    if open {
+                        self.closed_groups.remove(&g.key());
+                    } else {
+                        self.closed_groups.insert(g.key());
+                    }
+                }
+                self.rebuild_tlines(keep);
+                self.notice = Some(
+                    if open {
+                        "Opened every group"
+                    } else {
+                        "Folded every group"
+                    }
+                    .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
     fn set_fold(&mut self, group: usize, open: bool) {
         let Some(key) = self.targets.groups.get(group).map(|g| g.key()) else {
             return;
@@ -2450,7 +2850,7 @@ impl App {
                 self.docker.cursor = group;
                 self.ensure_visible();
             }
-            Screen::Targets | Screen::Runtimes => {
+            Screen::Targets | Screen::Runtimes | Screen::Uninstall | Screen::Leftovers => {
                 // `usize::MAX` stands for the project's header line.
                 let wanted = if row == usize::MAX {
                     Line::Group(group)
@@ -2539,11 +2939,19 @@ impl App {
             phase: Phase::Moving,
             current: PathBuf::new(),
         }));
-        self.job = Some(DeleteJob::start(
+        self.job_failed.clear();
+        self.job_usage = items.iter().cloned().collect();
+        let elevator = Arc::new(crate::elevate::OsascriptElevator {
+            runner: Arc::clone(&self.runner),
+            policy: Arc::clone(&self.policy),
+            items_dir: self.holding.dir().join("items"),
+        });
+        self.job = Some(DeleteJob::start_with(
             Arc::clone(&self.holding),
             Arc::clone(&self.policy),
             items,
             mode,
+            elevator,
         ));
     }
 
@@ -2573,7 +2981,10 @@ impl App {
                         };
                     }
                 }
-                DeleteEvent::Failed { error, .. } => {
+                DeleteEvent::Failed { path, error } => {
+                    if !path.starts_with(self.policy.home()) {
+                        self.job_failed.push(path);
+                    }
                     if self.job_failure.is_none() {
                         self.job_failure = Some(error);
                     }
@@ -2595,7 +3006,11 @@ impl App {
                 return;
             }
             let (mode, free_before) = (self.job_mode, self.job_free_before);
+            let reason = self.job_failure.clone().unwrap_or_default();
             self.after_delete(mode, moved, emptied, failures, free_before);
+            if mode == DeleteMode::SoftOnly && !self.job_failed.is_empty() {
+                self.open_manual(reason);
+            }
             if self.quit_after_job {
                 self.quit_after_job = false;
                 self.request_quit();
@@ -3281,9 +3696,10 @@ mod tests {
         assert_eq!(app.screen, Screen::Home);
         app.update(Action::Click { x: 2, y: 2 }); // Explorer
         assert_eq!(app.screen, Screen::Explorer);
-        app.update(Action::Click { x: 2, y: 3 }); // Leftovers: not built yet
-        assert_eq!(app.screen, Screen::Explorer);
-        assert!(app.notice.is_some());
+        app.update(Action::Click { x: 2, y: 3 }); // Leftovers
+        assert_eq!(app.screen, Screen::Leftovers);
+        app.update(Action::Click { x: 2, y: 4 }); // Uninstall
+        assert_eq!(app.screen, Screen::Uninstall);
     }
 
     #[test]
@@ -3306,6 +3722,10 @@ mod tests {
         assert_eq!(app.screen, Screen::Home);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Explorer);
+        app.update(Action::Down);
+        assert_eq!(app.screen, Screen::Leftovers);
+        app.update(Action::Down);
+        assert_eq!(app.screen, Screen::Uninstall);
         app.update(Action::Down);
         assert_eq!(app.screen, Screen::Targets);
         app.update(Action::Down);
@@ -6352,5 +6772,432 @@ mod runtime_page_tests {
         cursor_on(&mut e.app, Some(SectionKind::Simulators), None);
         e.app.update(Action::ToggleMark);
         assert_eq!(e.app.tool_marks.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod apps_page_tests {
+    use super::*;
+    use crate::targets::Page;
+    use crate::testutil::env_with;
+
+    #[test]
+    fn page_for_screen() {
+        let mut e = env_with(&[], |_| {});
+        e.app.update(Action::GoTo(Screen::Uninstall));
+        assert_eq!(e.app.page(), Page::Uninstall);
+        e.app.update(Action::GoTo(Screen::Leftovers));
+        assert_eq!(e.app.page(), Page::Leftovers);
+        e.app.update(Action::GoTo(Screen::Targets));
+        assert_eq!(e.app.page(), Page::Caches);
+    }
+
+    #[test]
+    fn menu_digits_open_the_two_pages() {
+        let mut e = env_with(&[], |_| {});
+        e.app.update(Action::Menu(3));
+        assert_eq!(e.app.screen, Screen::Leftovers);
+        e.app.update(Action::Menu(4));
+        assert_eq!(e.app.screen, Screen::Uninstall);
+    }
+}
+
+#[cfg(test)]
+mod apps_marking_tests {
+    use super::*;
+    use crate::catalog::appfiles::AppPart;
+    use crate::catalog::apps::AppBundle;
+    use crate::catalog::appsdata::{AppGroup, AppsInput};
+    use crate::catalog::command::FakeRunner;
+    use crate::catalog::leftovers::LeftoversState;
+    use crate::testutil::{Env, env_with};
+
+    fn bundle(path: &Path, id: &str, name: &str) -> AppBundle {
+        AppBundle {
+            path: path.to_path_buf(),
+            id: id.to_string(),
+            name: name.to_string(),
+            version: String::new(),
+            executable: path.join("Contents/MacOS").join(name),
+            owner: "u".to_string(),
+            last_used: 1,
+        }
+    }
+
+    fn part(path: PathBuf, label: &str, outside: bool, shared: bool) -> AppPart {
+        AppPart {
+            path,
+            label: label.to_string(),
+            shared_vendor: shared,
+            outside_home: outside,
+        }
+    }
+
+    fn setup(groups: impl FnOnce(&Path) -> Vec<AppGroup>, running: Vec<PathBuf>) -> Env {
+        let mut e = env_with(
+            &[
+                ("A.app/Contents/x", 100),
+                ("B.app/Contents/x", 100),
+                ("Library/Caches/com.a.a/c", 50),
+                ("Library/Application Support/Vendor/v", 10),
+                ("Library/Daemon/d", 10),
+            ],
+            |_| {},
+        );
+        let installed = groups(&e.home);
+        e.app.apps_input = Some(Arc::new(AppsInput {
+            installed,
+            leftovers: LeftoversState::Ready(Vec::new()),
+            running,
+        }));
+        e.app.apps_started = true;
+        e.app.update(Action::GoTo(Screen::Uninstall));
+        e.app.settle_targets();
+        e
+    }
+
+    fn cursor_on_row(e: &mut Env, group: &str, name: &str) {
+        let idx = e
+            .app
+            .tlines
+            .iter()
+            .position(|l| match *l {
+                Line::Row { group: g, row } => {
+                    e.app.targets.groups[g].title == group
+                        && e.app.targets.row(g, row).row.name.to_string_lossy() == name
+                }
+                _ => false,
+            })
+            .expect("row not listed");
+        e.app.tcursor = idx;
+    }
+
+    fn cursor_on_group(e: &mut Env, group: &str) {
+        let idx = e
+            .app
+            .tlines
+            .iter()
+            .position(|l| matches!(*l, Line::Group(g) if e.app.targets.groups[g].title == group))
+            .expect("group not listed");
+        e.app.tcursor = idx;
+    }
+
+    fn two_apps(home: &Path) -> Vec<AppGroup> {
+        let (a, b) = (home.join("A.app"), home.join("B.app"));
+        let vendor = home.join("Library/Application Support/Vendor");
+        vec![
+            AppGroup {
+                managed: None,
+                app: bundle(&a, "com.v.a", "A"),
+                parts: vec![
+                    part(a.clone(), "app", false, false),
+                    part(home.join("Library/Caches/com.a.a"), "Caches", false, false),
+                    part(vendor.clone(), "Vendor folder", false, true),
+                    part(home.join("Library/Daemon"), "LaunchDaemons", true, false),
+                ],
+            },
+            AppGroup {
+                managed: None,
+                app: bundle(&b, "com.v.b", "B"),
+                parts: vec![part(b.clone(), "app", false, false)],
+            },
+        ]
+    }
+
+    #[test]
+    fn running_app_group_cannot_be_marked() {
+        let mut e = setup(two_apps, vec![PathBuf::new()]);
+        // Make A running: its executable is under its bundle.
+        let a = e.home.join("A.app");
+        e.app.apps_input = Some(Arc::new(AppsInput {
+            running: vec![a.join("Contents/MacOS/A")],
+            ..(*e.app.apps_input.clone().unwrap()).clone()
+        }));
+        e.app.rebuild_targets();
+        e.app.settle_targets();
+        cursor_on_row(&mut e, "A", "A.app");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.is_empty());
+        assert!(e.app.notice.as_deref().unwrap().contains("running"));
+        cursor_on_row(&mut e, "B", "B.app");
+        e.app.update(Action::ToggleMark);
+        assert_eq!(e.app.marks.len(), 1);
+    }
+
+    #[test]
+    fn header_mark_skips_outside_home_parts_and_shared_vendor_rows() {
+        let mut e = setup(two_apps, Vec::new());
+        cursor_on_group(&mut e, "A");
+        e.app.update(Action::ToggleMark);
+        let names: Vec<String> = e
+            .app
+            .marks
+            .keys()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"A.app".to_string()), "{names:?}");
+        assert!(names.contains(&"com.a.a".to_string()), "{names:?}");
+        assert!(!names.contains(&"Vendor".to_string()), "{names:?}");
+        assert!(!names.contains(&"Daemon".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn shared_vendor_folder_markable_when_all_vendor_apps_marked() {
+        let mut e = setup(two_apps, Vec::new());
+        cursor_on_row(&mut e, "A", "Vendor");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.is_empty());
+        assert!(
+            e.app
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("other installed apps")
+        );
+        for (g, n) in [("A", "A.app"), ("B", "B.app")] {
+            cursor_on_row(&mut e, g, n);
+            e.app.update(Action::ToggleMark);
+        }
+        cursor_on_row(&mut e, "A", "Vendor");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.keys().any(|p| p.ends_with("Vendor")));
+    }
+
+    #[test]
+    fn a_header_mark_on_a_running_or_apple_app_says_why() {
+        let mut e = setup(two_apps, Vec::new());
+        // Make B running: its program is inside its bundle.
+        let b = e.home.join("B.app");
+        e.app.apps_input = Some(Arc::new(AppsInput {
+            running: vec![b.join("Contents/MacOS/B")],
+            ..(*e.app.apps_input.clone().unwrap()).clone()
+        }));
+        e.app.rebuild_targets();
+        e.app.settle_targets();
+        cursor_on_group(&mut e, "B");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.is_empty());
+        assert!(
+            e.app.notice.as_deref().unwrap().contains("running"),
+            "{:?}",
+            e.app.notice
+        );
+        assert!(
+            e.app
+                .targets
+                .groups
+                .iter()
+                .any(|g| g.title == "B" && g.running)
+        );
+        // A header that skips outside-home parts says so too.
+        cursor_on_group(&mut e, "A");
+        e.app.update(Action::ToggleMark);
+        assert!(
+            e.app.notice.as_deref().unwrap().contains("left out"),
+            "{:?}",
+            e.app.notice
+        );
+    }
+
+    #[test]
+    fn apple_groups_are_flagged_apple() {
+        let e = setup(
+            |h| {
+                let a = h.join("A.app");
+                vec![AppGroup {
+                    managed: None,
+                    app: bundle(&a, "com.apple.thing", "A"),
+                    parts: vec![part(a, "app", false, false)],
+                }]
+            },
+            Vec::new(),
+        );
+        let g = e
+            .app
+            .targets
+            .groups
+            .iter()
+            .find(|g| g.title == "A")
+            .unwrap();
+        assert!(g.apple && !g.running);
+    }
+
+    #[test]
+    fn capital_h_folds_every_group_and_capital_l_opens_them_again() {
+        let mut e = setup(two_apps, Vec::new());
+        let open = e.app.tlines.len();
+        assert!(open > 3);
+        e.app.update(Action::FoldAll);
+        assert!(e.app.targets.groups.iter().all(|g| !g.open));
+        assert!(e.app.tlines.len() < open, "only section and group lines");
+        assert!(e.app.tlines.iter().all(|l| !matches!(l, Line::Row { .. })));
+        e.app.update(Action::UnfoldAll);
+        assert_eq!(e.app.tlines.len(), open);
+    }
+
+    #[test]
+    fn the_keys_for_folding_everything_work_on_list_pages_only() {
+        use crate::input::map_key;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+        let mut e = setup(two_apps, Vec::new());
+        assert_eq!(map_key(key('H'), &e.app), Some(Action::FoldAll));
+        assert_eq!(map_key(key('L'), &e.app), Some(Action::UnfoldAll));
+        e.app.update(Action::GoTo(Screen::Explorer));
+        assert_eq!(map_key(key('H'), &e.app), None);
+    }
+
+    #[test]
+    fn apple_row_refuses_with_notice() {
+        let mut e = setup(
+            |h| {
+                let a = h.join("A.app");
+                vec![AppGroup {
+                    managed: None,
+                    app: bundle(&a, "com.apple.thing", "A"),
+                    parts: vec![part(a, "app", false, false)],
+                }]
+            },
+            Vec::new(),
+        );
+        cursor_on_row(&mut e, "A", "A.app");
+        e.app.update(Action::ToggleMark);
+        assert!(e.app.marks.is_empty());
+        assert!(e.app.notice.as_deref().unwrap().contains("Apple"));
+    }
+
+    #[test]
+    fn review_rechecks_running() {
+        let mut e = setup(two_apps, Vec::new());
+        cursor_on_row(&mut e, "B", "B.app");
+        e.app.update(Action::ToggleMark);
+        assert_eq!(e.app.marks.len(), 1);
+        let exe = e.home.join("B.app/Contents/MacOS/B");
+        e.app.runner = Arc::new(FakeRunner::new(&[]).answering(&[("ps", exe.to_str().unwrap())]));
+        e.app.update(Action::OpenReview);
+        assert!(e.app.marks.is_empty(), "a running app is unmarked");
+        assert!(e.app.notice.as_deref().unwrap().contains("running"));
+    }
+
+    #[test]
+    fn manager_app_is_a_command_row_marked_by_the_header_with_its_folders() {
+        use crate::catalog::appmgr::ManagedApp;
+        use crate::catalog::command::CommandSpec;
+        let mut e = setup(
+            |h| {
+                let a = h.join("A.app");
+                vec![AppGroup {
+                    app: bundle(&a, "com.v.a", "A"),
+                    parts: vec![
+                        part(a.clone(), "app", false, false),
+                        part(h.join("Library/Caches/com.a.a"), "Caches", false, false),
+                    ],
+                    managed: Some(ManagedApp {
+                        id: "app:brew:a".into(),
+                        spec: CommandSpec::new(
+                            "/opt/homebrew/bin/brew",
+                            &["uninstall", "--cask", "a"],
+                        ),
+                    }),
+                }]
+            },
+            Vec::new(),
+        );
+        cursor_on_group(&mut e, "A");
+        e.app.update(Action::ToggleMark);
+        assert!(
+            e.app.tool_marks.contains("app:brew:a"),
+            "{:?}",
+            e.app.tool_marks
+        );
+        assert!(e.app.marks.keys().any(|p| p.ends_with("com.a.a")));
+        assert!(
+            !e.app.marks.keys().any(|p| p.ends_with("A.app")),
+            "the bundle goes by the command"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admin_flow_tests {
+    use super::*;
+    use crate::testutil::{Env, env_with, settle};
+    use std::os::unix::fs::PermissionsExt;
+
+    /// An app-like file outside home in a folder we cannot write to.
+    fn locked_outside(e: &mut Env) -> Option<PathBuf> {
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+        let outside = e.home.parent().unwrap().join("outside");
+        let file = outside.join("locked/Foo.app");
+        std::fs::create_dir_all(&file).unwrap();
+        std::fs::write(file.join("x"), b"data").unwrap();
+        std::fs::set_permissions(
+            outside.join("locked"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        e.app.policy =
+            Arc::new(Policy::new(&e.home, e.app.holding.dir()).with_extra_root(&outside));
+        e.app.marks.insert(file.clone(), Usage::new(4, 4096));
+        Some(file)
+    }
+
+    fn unlock(e: &Env) {
+        let dir = e.home.parent().unwrap().join("outside/locked");
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    }
+
+    #[test]
+    fn review_marks_admin_rows_and_needs_y() {
+        let mut e = env_with(&[("a", 1)], |_| {});
+        let Some(file) = locked_outside(&mut e) else {
+            return;
+        };
+        e.app.update(Action::GoTo(Screen::Targets));
+        e.app.update(Action::OpenReview);
+        let Some(Dialog::Review(r)) = &e.app.dialog else {
+            panic!("no review");
+        };
+        assert!(r.needs_y());
+        assert!(r.items.iter().any(|i| i.path == file && i.needs_admin));
+        unlock(&e);
+    }
+
+    #[test]
+    fn failed_prompt_opens_copy_command_dialog_with_exact_commands() {
+        let mut e = env_with(&[("a", 1)], |_| {});
+        let Some(file) = locked_outside(&mut e) else {
+            return;
+        };
+        e.app.update(Action::GoTo(Screen::Targets));
+        e.app.update(Action::OpenReview);
+        e.app.update(Action::Confirm);
+        settle(&mut e.app);
+        let Some(Dialog::Manual(m)) = &e.app.dialog else {
+            unlock(&e);
+            panic!("expected the manual dialog, got {:?}", e.app.dialog);
+        };
+        let from = format!("sudo /bin/mv -- '{}'", file.display());
+        assert!(m.lines[0].starts_with(&from), "{:?}", m.lines);
+        assert!(m.lines[0].contains("/payload'"));
+        assert!(m.lines[1].starts_with("sudo /usr/sbin/chown -R "));
+        assert!(file.exists(), "nothing moved");
+        assert_eq!(
+            e.app.holding.list().unwrap().len(),
+            1,
+            "slot is booked for the manual move"
+        );
+        // Cancel gives the slot back.
+        e.app.update(Action::Cancel);
+        assert!(e.app.holding.list().unwrap().is_empty());
+        unlock(&e);
+    }
+
+    #[test]
+    fn shell_quote_survives_quotes() {
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        assert_eq!(shell_quote("plain"), "'plain'");
     }
 }
