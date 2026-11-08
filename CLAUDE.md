@@ -113,6 +113,8 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 
 ## Design
 
+Uninstaller and Leftovers pages: `docs/superpowers/specs/2026-11-07-uninstaller-leftovers-design.md` (built in 0.9.0; what is left is in the README, "What is left").
+
 Time Machine snapshots page: `docs/superpowers/specs/2026-11-07-timemachine-design.md` (built; plan in `docs/superpowers/plans/2026-11-07-timemachine.md`). Packages & runtimes page (in progress): `docs/superpowers/specs/2026-11-07-packages-runtimes-design.md`.
 
 The approved design is `docs/superpowers/specs/2026-11-06-maccleanup-design.md`. Milestone 2 (Caches & Projects) has its own design, `docs/superpowers/specs/2026-11-06-caches-projects-design.md`, whose section 11 records what was built and what is deferred. The plans are in `docs/superpowers/plans/`. Follow them and update them when decisions change.
