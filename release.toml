@@ -1,0 +1,12 @@
+# Used by `cargo release` (see docs/development.md, "Releasing").
+# It only bumps the version, rolls CHANGELOG.md and makes the commit. CI
+# publishes to crates.io, and the tag is made by hand with `git tag -a` so its
+# message can carry the changelog (a cargo-release tag message is just a template).
+allow-branch = ["main"]
+publish = false
+push = false
+tag = false
+pre-release-commit-message = "chore: version {{version}}"
+pre-release-replacements = [
+  { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+]
