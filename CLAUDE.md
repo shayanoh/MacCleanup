@@ -125,7 +125,7 @@ Always keep `CLAUDE.md`, `README.md` (short, for users) and the detail documents
 
 ## Releasing
 
-Every user-visible change gets a line under **Unreleased** in `CHANGELOG.md`. A release is: `cargo release <level> --execute` (bumps the version, rolls the changelog, commits; `release.toml` disables its publish, push and tag), push, wait for CI on `main`, then `git tag -a vX.Y.Z -m "MacCleanup X.Y.Z" -m "$(scripts/release-notes.sh X.Y.Z)"` and push the tag. `.github/workflows/release.yml` verifies, builds both macOS targets, publishes to crates.io (behind the `release` environment) and creates the GitHub release from the changelog. Steps and failure handling: `docs/development.md` ("Releasing"). Never run `cargo publish` by hand for a version the workflow will publish.
+Every user-visible change gets a line under **Unreleased** in `CHANGELOG.md`. A release is: `cargo release <level> --execute` (bumps the version, rolls the changelog, commits; `release.toml` disables its publish, push and tag), push, wait for CI on `main`, then `git tag -a vX.Y.Z --cleanup=whitespace -m "MacCleanup X.Y.Z" -m "$(scripts/release-notes.sh X.Y.Z)"` and push the tag. `.github/workflows/release.yml` verifies, builds both macOS targets, publishes to crates.io (behind the `release` environment) and creates the GitHub release from the changelog. Steps and failure handling: `docs/development.md` ("Releasing"). Never run `cargo publish` by hand for a version the workflow will publish.
 
 ## Git
 

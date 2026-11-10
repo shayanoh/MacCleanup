@@ -44,12 +44,12 @@ cargo release minor --execute
 # 2. push the commit and wait for CI on main to go green
 git push <remote> main
 # 3. tag exactly that version; the message is the changelog
-git tag -a vX.Y.Z -m "MacCleanup X.Y.Z" -m "$(scripts/release-notes.sh X.Y.Z)"
+git tag -a vX.Y.Z --cleanup=whitespace -m "MacCleanup X.Y.Z" -m "$(scripts/release-notes.sh X.Y.Z)"
 git push <remote> vX.Y.Z
 # 4. approve the "publish" job on the Actions page (if the environment requires it)
 ```
 
-`git show vX.Y.Z` shows the tag message. Check the preview before `--execute`: it lists the version change and the changelog replacement.
+`--cleanup=whitespace` keeps the `### Added` headings (git would drop lines starting with `#`). `git show vX.Y.Z` shows the tag message. Check the preview before `--execute`: it lists the version change and the changelog replacement.
 
 ### One-time setup
 
