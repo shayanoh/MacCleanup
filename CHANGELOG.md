@@ -4,6 +4,8 @@ All notable changes to MacCleanup. The format follows [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-10
+
 ### Added
 
 - Runtimes: each Rust toolchain's extra targets (for example `wasm32-unknown-unknown`) are listed in a new **RUST TARGETS** section, one row per target with its own size, and can be removed one by one with `rustup target remove`. Marking a toolchain removes it with all its targets.
