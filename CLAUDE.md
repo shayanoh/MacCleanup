@@ -123,6 +123,10 @@ The approved design is `docs/superpowers/specs/2026-11-06-maccleanup-design.md`.
 
 Always keep `CLAUDE.md`, `README.md` (short, for users) and the detail documents in `docs/` (`features.md`, `keys.md`, `safety.md`, `known-limits.md`, `development.md`) up to date. Whenever you add or change a command, feature, rule, key binding, build step, or convention, update both (and the design doc if a decision changed) in the same change. Commands in `README.md` must reflect what actually works.
 
+## Releasing
+
+A release is a tag `vX.Y.Z` equal to the `Cargo.toml` version, pushed after CI is green on `main`; `.github/workflows/release.yml` verifies, builds both macOS targets, publishes to crates.io (behind the `release` environment) and creates the GitHub release. Steps and failure handling: `docs/development.md` ("Releasing"). Never run `cargo publish` by hand for a version the workflow will publish.
+
 ## Git
 
 - Blanket commit permission is granted for this repo: commit without asking first. This overrides the global "ask before each commit" rule for this project only.

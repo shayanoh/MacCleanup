@@ -17,3 +17,46 @@ The smoke script drives the real binary in a throwaway `HOME` (explorer, filter,
 
 - Design: [`superpowers/specs/2026-11-06-maccleanup-design.md`](superpowers/specs/2026-11-06-maccleanup-design.md)
 - Every page has its own design in [`superpowers/specs/`](superpowers/specs/) and its plan in [`superpowers/plans/`](superpowers/plans/) (Caches & Projects, Docker, Time Machine, Runtimes, Uninstall and Leftovers). Caches & Projects section 11 records what was built and what is deferred.
+
+## Releasing
+
+A release is a version tag. Pushing `vX.Y.Z` runs `.github/workflows/release.yml`:
+
+1. **verify**: the tag must equal the `Cargo.toml` version and point at a commit on `main`; then fmt, clippy, tests and the smoke script run again.
+2. **build**: release binaries for `aarch64-apple-darwin` and `x86_64-apple-darwin` (the Intel one is cross-compiled on the Apple Silicon runner, so it is built but never run in CI), each as a `.tar.gz` with a `.sha256` file.
+3. **publish**: `cargo publish` to crates.io. This job uses the `release` environment, so it can wait for your approval. A crates.io version can be yanked but never reused, which is why it comes after everything that can fail.
+4. **release**: a GitHub release with generated notes and the binaries attached.
+
+Each job needs the one before it, so a failure stops everything after it.
+
+### Steps for a new version
+
+```bash
+# 1. bump `version` in Cargo.toml, then refresh the lock file
+cargo check
+git commit -am "chore: version X.Y.Z"
+git push <remote> main
+# 2. wait for CI on main to go green
+# 3. tag exactly that version and push the tag
+git tag vX.Y.Z
+git push <remote> vX.Y.Z
+# 4. approve the "publish" job on the Actions page (if the environment requires it)
+```
+
+### One-time setup
+
+- Repository secret `CARGO_REGISTRY_TOKEN`: a crates.io API token (scope `publish-update` for this crate is enough once it exists).
+- Optional approval gate: Settings > Environments > New environment `release` > Required reviewers. Without reviewers the job runs straight away.
+
+### When something fails
+
+- **Before `publish`** (guard, tests or build): nothing is public. Fix it, then delete the tag and tag the fixed commit again:
+
+  ```bash
+  git tag -d vX.Y.Z
+  git push <remote> --delete vX.Y.Z
+  ```
+
+- **After `publish`**: the version is used for good. For a bad release, bump to the next patch version and run the steps again; `cargo yank --version X.Y.Z` hides the bad one from new installs.
+- **`release` failed after `publish`**: re-run only that job from the Actions page.
+- A tag with a hyphen (`v0.10.0-rc.1`) is published as a pre-release.

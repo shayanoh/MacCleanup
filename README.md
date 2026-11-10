@@ -48,6 +48,15 @@ cargo install --path .
 
 Either way the `maccleanup` command lands in `~/.cargo/bin`, which `rustup` normally puts on your `PATH`.
 
+### Download a binary
+
+Each [release](https://github.com/shayanoh/MacCleanup/releases) has a `.tar.gz` for Apple Silicon (`aarch64-apple-darwin`) and for Intel (`x86_64-apple-darwin`), with a `.sha256` file to check it. The binaries are not signed or notarized, so if you downloaded one in a browser, macOS will block it until you remove the quarantine flag:
+
+```bash
+tar -xzf maccleanup-vX.Y.Z-aarch64-apple-darwin.tar.gz
+xattr -d com.apple.quarantine maccleanup-vX.Y.Z-aarch64-apple-darwin/maccleanup
+```
+
 ## Use it
 
 ```bash
