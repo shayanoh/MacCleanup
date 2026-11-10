@@ -68,7 +68,7 @@
 
 - [ ] **Step 1:** Look up the `plist` crate with context7 (`resolve-library-id` then `query-docs`: reading a plist dictionary from a file, XML and binary); `cargo add plist`.
 - [ ] **Step 2: Write failing tests:** `read_bundle_reads_id_name_version` (fixture `Foo.app/Contents/Info.plist` XML), `read_bundle_none_for_missing_or_garbage_plist`, `read_bundle_binary_plist`, `index_skips_symlink_loops_and_counts_a_symlinked_app_once`, `nested_helper_ids_are_collected` (`Foo.app/Contents/Library/LoginItems/Helper.app` with `com.foo.helper`), `has_id_vendor_prefix` (installed `com.autodesk.dls.streamer.scriptapp.Autodesk-Fusion` makes `com.autodesk.dls.streamer` true and `com.google.x` false), `last_used_never_is_zero` (FakeRunner answers `mdls` with `(null)`), `spotlight_ok_false_when_query_fails`.
-- [ ] **Step 3:** Run tests → FAIL. **Step 4:** Implement. Last used: one `mdls -name kMDItemLastUsedDate -raw <paths...>` per 50 bundles, outputs NUL-separated; verify the exact output on this Mac first with the real binary (read-only, outside tests). Spotlight completeness: `mdfind kMDItemContentType == 'com.apple.application-bundle'` returns paths; ok when it returns at least one path under `/Applications`; apps it lists that are outside the scan roots are added to the index.
+- [ ] **Step 3:** Run tests → FAIL. **Step 4:** Implement. Last used: one `mdls -name kMDItemLastUsedDate -raw <paths...>` per 50 bundles, outputs NUL-separated; verify the exact output on a real Mac first with the real binary (read-only, outside tests). Spotlight completeness: `mdfind kMDItemContentType == 'com.apple.application-bundle'` returns paths; ok when it returns at least one path under `/Applications`; apps it lists that are outside the scan roots are added to the index.
 - [ ] **Step 5:** `cargo test apps` → PASS. Commit `feat: installed app index`.
 
 ### Task 3: Related folders of an app
@@ -177,7 +177,7 @@
 - [ ] **Step 1:** Update the docs listed above (new rule text: the app still never asks for or reads a password; the system prompt is used only for one batch after the review).
 - [ ] **Step 2:** `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test` all clean.
 - [ ] **Step 3:** `cargo build && python3 -I scripts/smoke_pty.py target/debug/maccleanup` with a throwaway `HOME`; confirm both pages open (keys `3`, `4`) without panics.
-- [ ] **Step 4:** Read-only check on this Mac in the real TUI (do not mark anything): the Uninstall page shows Autodesk Fusion as one group including its `webdeploy` payload; Apple apps are dimmed; the Leftovers page lists only id-based groups.
+- [ ] **Step 4:** Read-only check on a real Mac in the real TUI (do not mark anything): the Uninstall page shows Autodesk Fusion as one group including its `webdeploy` payload; Apple apps are dimmed; the Leftovers page lists only id-based groups.
 - [ ] **Step 5:** Commit `docs: Uninstaller and Leftovers pages`.
 
 ---

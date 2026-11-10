@@ -183,7 +183,7 @@ Same as Explorer / Caches & Projects (`ui/explorer.rs` helpers `cols`, `header_l
   or a no-op `CommandRunner`. Tests of discovery use sandbox `.app` fixtures under a
   throwaway `HOME`.
 
-## Builder's calls (mine, open to change)
+## Builder's calls (open to change)
 
 - Mac App Store apps are treated like other apps; they are plain folders owned by root or
   the user. Moving them works the same way.
@@ -195,7 +195,7 @@ Same as Explorer / Caches & Projects (`ui/explorer.rs` helpers `cols`, `header_l
 - Last used comes from Spotlight; if Spotlight is off or has no date, the cell says "never"
   (a reindex can make an old app look never-opened; the details pane says so).
 
-## Calls made after the builder check (mine, open to change)
+## Calls made after the builder check (open to change)
 
 - **Elevation is only the osascript prompt.** `sudo` and in-terminal prompts are not used.
   If the prompt cannot be used, the copy-the-command dialog is the fallback (decided with the user).

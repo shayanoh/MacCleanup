@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024 (cargo 1.99), ratatui 0.30 (uses its re-exported `ratatui::crossterm`), clap 4 (derive), rayon, serde + serde_json, libc (statvfs), thiserror, anyhow, unicode-width; dev: tempfile.
 
-**Spec:** `docs/superpowers/specs/2026-11-06-maccleanup-design.md` (read it; it also holds the user's decisions in sections 5, 6, 7 and 10).
+**Spec:** `docs/superpowers/specs/2026-11-06-maccleanup-design.md` (read it; it also holds the requirements in sections 5, 6, 7 and 10).
 
 ## Global Constraints
 
@@ -22,7 +22,7 @@
 - Scans are multi-threaded for maximum speed (user requirement, added 2026-11-06): the scanner pool is sized by `Scanner::default_threads()` = `available_parallelism() * 2` (directory walking is I/O-bound), one job per subdirectory, and no lock sits on the per-file hot path (the hard-link set is locked only for files with `nlink > 1`). The same applies to every later scan feature.
 - Format with `cargo fmt`; add dependencies only with `cargo add`; commit after each task (blanket commit permission in CLAUDE.md).
 - Keep `README.md` and `CLAUDE.md` updated in the same change as any command or rule change. (CLAUDE.md)
-- Sizes are shown in decimal units (1 GB = 1,000,000,000 bytes) to match Finder and Docker. (My call)
+- Sizes are shown in decimal units (1 GB = 1,000,000,000 bytes) to match Finder and Docker. (Design choice)
 
 ## Review Focus
 
@@ -402,4 +402,4 @@ Screen content to implement (from the approved mockups):
 ## Self-review notes
 
 - Spec coverage: explorer (T4, T7, T10), vim keys and mouse (T7), soft delete with recover/empty (T5, T7, T8, T10), safety deny-list (T2), review and irreversible warnings (T7, T8, T10), accounting with pending versus freed and finish screen (T3, T8, T10), two graphs resizable and hideable (T6, T7, T10), glyph/ASCII modes and animation (T1, T9, T10), responsiveness via background workers (T4, T8, T11), FDA banner (T3, T10), tiny terminal (T10). Deferred to later milestones by design: leftovers, uninstaller, caches, project artifacts, Docker, other candidates, admin-command flow, "clean suggested", before/after wrappers for external tools, treemap zoom morph animation.
-- Home "Biggest folders" stands in for "suggested wins" until later milestones supply real suggestions (my call).
+- Home "Biggest folders" stands in for "suggested wins" until later milestones supply real suggestions (design choice).
