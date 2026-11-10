@@ -20,28 +20,36 @@ The smoke script drives the real binary in a throwaway `HOME` (explorer, filter,
 
 ## Releasing
 
-A release is a version tag. Pushing `vX.Y.Z` runs `.github/workflows/release.yml`:
+A release is an annotated version tag. Pushing `vX.Y.Z` runs `.github/workflows/release.yml`:
 
-1. **verify**: the tag must equal the `Cargo.toml` version and point at a commit on `main`; then fmt, clippy, tests and the smoke script run again.
+1. **verify**: the tag must equal the `Cargo.toml` version, point at a commit on `main` and have a `CHANGELOG.md` entry; then fmt, clippy, tests and the smoke script run again.
 2. **build**: release binaries for `aarch64-apple-darwin` and `x86_64-apple-darwin` (the Intel one is cross-compiled on the Apple Silicon runner, so it is built but never run in CI), each as a `.tar.gz` with a `.sha256` file.
 3. **publish**: `cargo publish` to crates.io. This job uses the `release` environment, so it can wait for your approval. A crates.io version can be yanked but never reused, which is why it comes after everything that can fail.
-4. **release**: a GitHub release with generated notes and the binaries attached.
+4. **release**: a GitHub release whose notes are the version's `CHANGELOG.md` section, with the binaries attached.
 
 Each job needs the one before it, so a failure stops everything after it.
 
+### The changelog
+
+`CHANGELOG.md` follows Keep a Changelog. Add a line under **Unreleased** with every user-visible change (Added, Changed, Fixed, Removed). `cargo release` moves it under the new version heading with today's date. `scripts/release-notes.sh X.Y.Z` prints one version's section; the tag message and the GitHub release both come from it, so it must not be empty.
+
 ### Steps for a new version
 
+[`cargo-release`](https://github.com/crate-ci/cargo-release) (`cargo install cargo-release`) does the version bump; `release.toml` turns off its publishing, pushing and tagging, so it only edits and commits.
+
 ```bash
-# 1. bump `version` in Cargo.toml, then refresh the lock file
-cargo check
-git commit -am "chore: version X.Y.Z"
+# 1. preview, then bump: Cargo.toml, Cargo.lock, CHANGELOG.md and one commit
+cargo release minor              # dry run (use patch, minor or major)
+cargo release minor --execute
+# 2. push the commit and wait for CI on main to go green
 git push <remote> main
-# 2. wait for CI on main to go green
-# 3. tag exactly that version and push the tag
-git tag vX.Y.Z
+# 3. tag exactly that version; the message is the changelog
+git tag -a vX.Y.Z -m "MacCleanup X.Y.Z" -m "$(scripts/release-notes.sh X.Y.Z)"
 git push <remote> vX.Y.Z
 # 4. approve the "publish" job on the Actions page (if the environment requires it)
 ```
+
+`git show vX.Y.Z` shows the tag message. Check the preview before `--execute`: it lists the version change and the changelog replacement.
 
 ### One-time setup
 
@@ -59,4 +67,4 @@ git push <remote> vX.Y.Z
 
 - **After `publish`**: the version is used for good. For a bad release, bump to the next patch version and run the steps again; `cargo yank --version X.Y.Z` hides the bad one from new installs.
 - **`release` failed after `publish`**: re-run only that job from the Actions page.
-- A tag with a hyphen (`v0.10.0-rc.1`) is published as a pre-release.
+- A tag with a hyphen (`v0.11.0-rc.1`) is published as a pre-release; give it its own changelog section.
