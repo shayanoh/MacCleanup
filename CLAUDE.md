@@ -125,7 +125,26 @@ Always keep `CLAUDE.md`, `README.md` (short, for users) and the detail documents
 
 ## Releasing
 
-Every user-visible change gets a line under **Unreleased** in `CHANGELOG.md`. A release is: `cargo release <level> --execute` (bumps the version, rolls the changelog, commits; `release.toml` disables its publish, push and tag), push, wait for CI on `main`, then `git tag -a vX.Y.Z --cleanup=whitespace -m "MacCleanup X.Y.Z" -m "$(scripts/release-notes.sh X.Y.Z)"` and push the tag. `.github/workflows/release.yml` verifies, builds both macOS targets, publishes to crates.io (behind the `release` environment) and creates the GitHub release from the changelog. Steps and failure handling: `docs/development.md` ("Releasing"). Never run `cargo publish` by hand for a version the workflow will publish.
+Every user-visible change gets a line under **Unreleased** in `CHANGELOG.md` (Added, Changed, Fixed, Removed), in the same commit as the change. Background and failure handling: `docs/development.md` ("Releasing"); the pipeline is `.github/workflows/release.yml`.
+
+**When the user says "release patch", "release minor" or "release major" (or gives a version), do the whole release without asking again.** That request is the user's consent for the version commit, pushing `main`, creating and pushing the tag, and the crates.io publish the tag triggers (irreversible: a version can only be yanked). Steps:
+
+1. Preconditions: on `main`, clean tree, up to date with the remote, and `CHANGELOG.md` has entries under **Unreleased** (if it is empty, write them from `git log <last tag>..HEAD` and commit that first). If a precondition fails and you cannot fix it, stop and say why.
+2. `cargo release <level>` (dry run: check the version it proposes and the changelog replacement), then `cargo release <level> --execute --no-confirm`. It only edits `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md` and makes one commit; `release.toml` turns its publish, push and tag off.
+3. Find the remote that points at `github.com/shayanoh/MacCleanup` (`git remote -v`; here it is named `upstream`, not `origin`) and push `main` to it.
+4. Wait for the CI run on that commit to finish (`gh run list` for its id, then `gh run watch <id> --exit-status` as a background command; never poll). If it fails, stop and report; do not tag.
+5. Only when CI is green and `HEAD` is still the pushed commit, create the tag **with `git tag -a`, always annotated, never lightweight**, its message the changelog:
+
+   ```bash
+   git tag -a vX.Y.Z --cleanup=whitespace -m "MacCleanup X.Y.Z" -m "$(scripts/release-notes.sh X.Y.Z)"
+   git push <remote> vX.Y.Z
+   ```
+
+   `--cleanup=whitespace` is required: without it git drops the `### Added` heading lines. The tag must equal the `Cargo.toml` version with a `v`.
+6. Wait for the **Release** run (verify, build x2, publish, release; background `gh run watch` again). Then check that `gh release view vX.Y.Z` has the two `.tar.gz` and two `.sha256` assets and that crates.io lists the version (`curl -s -A maccleanup-release https://crates.io/api/v1/crates/maccleanup`).
+7. Report: version, links to the release and the crate, anything that failed or was skipped.
+
+Never run `cargo publish` by hand for a version the workflow will publish, never move or delete a pushed tag after `publish` succeeded (bump to the next patch instead), and never tag from a commit CI has not passed. A pre-release (`cargo release rc`, tag `vX.Y.Z-rc.N`) is published as a GitHub pre-release and still goes to crates.io; only do one when asked, with its own changelog section.
 
 ## Git
 
