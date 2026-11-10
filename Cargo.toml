@@ -2,7 +2,7 @@
 name = "maccleanup"
 version = "0.9.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 description = "A colorful terminal app for macOS that shows where your disk space went and cleans it up safely"
 license = "MIT"
 readme = "README.md"
