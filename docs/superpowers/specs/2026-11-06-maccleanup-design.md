@@ -5,7 +5,7 @@ Convention: **[Requirement]** = a requirement of the project. **[Design choice]*
 
 ## 1. Intent and why
 
-The user opens MacCleanup regularly, and especially when disk is low (their Mac is currently 94% full, 28 GB free of 466 GB). They want to see where the space went, free it safely, and finish on a celebratory message showing how much was actually freed. The product is a beautiful, animated, responsive, mouse-capable terminal app (Rust TUI) for macOS.
+The user opens MacCleanup regularly, and especially when disk is low. They want to see where the space went, free it safely, and finish on a celebratory message showing how much was actually freed. The product is a beautiful, animated, responsive, mouse-capable terminal app (Rust TUI) for macOS.
 
 Success looks like: free space visibly increases, the user trusts it never deleted anything important, and nothing ever looked frozen.
 

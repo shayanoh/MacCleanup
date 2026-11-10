@@ -30,7 +30,7 @@ Details: [docs/safety.md](docs/safety.md).
 
 ## Install
 
-**Requirements:** macOS and a recent [Rust toolchain](https://rustup.rs) (1.88 or newer). Docker, Time Machine and the other tools are only needed for their own pages.
+**Requirements:** macOS (installing on Linux or Windows stops with an error) and a recent [Rust toolchain](https://rustup.rs) (1.88 or newer). Docker, Time Machine and the other tools are only needed for their own pages.
 
 ### From crates.io
 

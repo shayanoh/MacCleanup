@@ -1,3 +1,9 @@
+// Cargo has no "supported OS" field, so stop other systems here with a clear
+// message. To support another OS later, narrow or remove this check (a patch
+// release is enough: nothing on crates.io has to change).
+#[cfg(not(target_os = "macos"))]
+compile_error!("maccleanup only supports macOS for now");
+
 pub mod accounting;
 pub mod anim;
 pub mod app;
