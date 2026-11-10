@@ -1860,8 +1860,9 @@ impl App {
         }
     }
 
-    /// A Node version that is marked removes its global packages too, so
-    /// their own marks are dropped: nothing runs twice.
+    /// A Node version that is marked removes its global packages too, and a
+    /// marked Rust toolchain its targets, so the marks of those are dropped:
+    /// nothing runs twice.
     fn drop_globals_of_marked_versions(&mut self) {
         let versions: Vec<String> = self
             .tool_marks
@@ -1869,18 +1870,27 @@ impl App {
             .filter_map(|id| {
                 id.strip_prefix("node:")
                     .map(|r| format!("node-global:{r}:"))
+                    .or_else(|| {
+                        id.strip_prefix("rustup:")
+                            .map(|t| format!("rustup-target:{t}:"))
+                    })
             })
             .collect();
         self.tool_marks
             .retain(|id| !versions.iter().any(|p| id.starts_with(p.as_str())));
     }
 
-    /// The marked Node version a global package would be removed with.
+    /// The marked Node version (or Rust toolchain) a global package (or a
+    /// target) would be removed with.
     fn version_covering(&self, id: &str) -> Option<String> {
-        let rest = id.strip_prefix("node-global:")?;
-        let mut parts = rest.splitn(3, ':');
-        let (manager, version) = (parts.next()?, parts.next()?);
-        let key = format!("node:{manager}:{version}");
+        let key = if let Some(rest) = id.strip_prefix("node-global:") {
+            let mut parts = rest.splitn(3, ':');
+            let (manager, version) = (parts.next()?, parts.next()?);
+            format!("node:{manager}:{version}")
+        } else {
+            let rest = id.strip_prefix("rustup-target:")?;
+            format!("rustup:{}", rest.split(':').next()?)
+        };
         self.tool_marks.contains(&key).then_some(key)
     }
 
@@ -2041,8 +2051,12 @@ impl App {
                                 return;
                             }
                             if self.version_covering(id).is_some() {
-                                self.notice =
-                                    Some(format!("{name} is removed with its Node version"));
+                                let with = if id.starts_with("rustup-target:") {
+                                    "toolchain"
+                                } else {
+                                    "Node version"
+                                };
+                                self.notice = Some(format!("{name} is removed with its {with}"));
                                 return;
                             }
                             self.tool_marks.insert(id.clone());
@@ -6568,6 +6582,74 @@ mod runtime_page_tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("Node version")
+        );
+    }
+
+    fn rust_env() -> Env {
+        let tc = ".rustup/toolchains/stable-x86_64-apple-darwin";
+        env_with(
+            &[
+                (".cargo/bin/rustup", 10),
+                (
+                    &format!("{tc}/lib/rustlib/x86_64-apple-darwin/lib/libstd"),
+                    9000,
+                ),
+                (
+                    &format!("{tc}/lib/rustlib/wasm32-unknown-unknown/lib/libstd"),
+                    3000,
+                ),
+                (
+                    &format!("{tc}/lib/rustlib/manifest-rustc-x86_64-apple-darwin"),
+                    1,
+                ),
+                (
+                    &format!("{tc}/lib/rustlib/manifest-rust-std-x86_64-apple-darwin"),
+                    1,
+                ),
+                (
+                    &format!("{tc}/lib/rustlib/manifest-rust-std-wasm32-unknown-unknown"),
+                    1,
+                ),
+            ],
+            |home| {
+                std::fs::set_permissions(
+                    home.join(".cargo/bin/rustup"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            },
+        )
+    }
+
+    #[test]
+    fn a_rust_target_can_go_alone_but_goes_with_its_toolchain_when_that_is_marked() {
+        let mut e = rust_env();
+        open(&mut e);
+        let target = "rustup-target:stable-x86_64-apple-darwin:wasm32-unknown-unknown";
+        // Only the extra target is listed (the host target is part of the toolchain).
+        cursor_on(&mut e.app, None, Some("wasm32-unknown-unknown"));
+        e.app.update(Action::ToggleMark);
+        assert_eq!(
+            e.app.tool_marks.iter().cloned().collect::<Vec<_>>(),
+            [target]
+        );
+        // Marking the toolchain drops the target's own mark: nothing runs twice.
+        cursor_on(&mut e.app, None, Some("stable-x86_64-apple-darwin"));
+        e.app.update(Action::ToggleMark);
+        assert_eq!(
+            e.app.tool_marks.iter().cloned().collect::<Vec<_>>(),
+            ["rustup:stable-x86_64-apple-darwin"]
+        );
+        // And while the toolchain is marked its targets cannot be marked.
+        cursor_on(&mut e.app, None, Some("wasm32-unknown-unknown"));
+        e.app.update(Action::ToggleMark);
+        assert_eq!(e.app.tool_marks.len(), 1);
+        assert!(
+            e.app
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("with its toolchain")
         );
     }
 

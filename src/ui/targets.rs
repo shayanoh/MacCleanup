@@ -422,6 +422,7 @@ fn section_line(app: &App, kind: SectionKind, width: usize) -> TextLine<'static>
         SectionKind::PythonVersions => (" PYTHON (UV)", Color::Blue),
         SectionKind::UvTools => (" UV TOOLS", Color::Magenta),
         SectionKind::RustToolchains => (" RUST TOOLCHAINS", Color::Red),
+        SectionKind::RustTargets => (" RUST TARGETS", Color::Red),
         SectionKind::CargoBinaries => (" CARGO BINARIES", Color::LightRed),
         SectionKind::AndroidSdk => (" ANDROID SDK", Color::Green),
         SectionKind::Simulators => (" IOS SIMULATORS", Color::LightBlue),

@@ -476,6 +476,7 @@ pub(crate) fn discover_runtimes_in(
     uv_pythons(home, places, &mut out);
     uv_tools(home, places, &mut out);
     rust_toolchains(home, places, &mut out);
+    rust_targets(home, places, &mut out);
     cargo_binaries(home, places, &mut out);
     android_sdk(home, places, &mut out);
     out
@@ -659,6 +660,57 @@ fn rust_toolchains(home: &Path, places: &Places, out: &mut Vec<RuntimeEntry>) {
             last.warn = Some(
                 "rustup's default toolchain: cargo and rustc stop working until you set another default"
                     .to_string(),
+            );
+        }
+    }
+}
+
+/// The extra targets of each toolchain (`rust-std` for another platform), one
+/// row each so a target can go without its toolchain. The toolchain's own host
+/// target is part of it and is not listed. Needs rustup: moving a target folder
+/// by hand would leave rustup believing it is still installed.
+fn rust_targets(home: &Path, places: &Places, out: &mut Vec<RuntimeEntry>) {
+    let Some(rustup) = find_exe(home, places, ".cargo/bin", "rustup") else {
+        return;
+    };
+    for (toolchain, dir) in real_dirs(&home.join(".rustup/toolchains")) {
+        let lib = dir.join("lib/rustlib");
+        let Ok(rd) = fs::read_dir(&lib) else {
+            continue;
+        };
+        let mut targets: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.strip_prefix("manifest-rust-std-").map(str::to_string)
+            })
+            .filter(|t| {
+                safe_name(t)
+                    && !t.contains('/')
+                    && !lib.join(format!("manifest-rustc-{t}")).exists()
+                    && lib.join(t).is_dir()
+            })
+            .collect();
+        targets.sort();
+        let group = format!("Rust {toolchain}");
+        for t in targets {
+            let spec = plain(
+                home,
+                &rustup,
+                &["target", "remove", "--toolchain", &toolchain, &t],
+            );
+            push(
+                out,
+                Item {
+                    section: SectionKind::RustTargets,
+                    id: format!("rustup-target:{toolchain}:{t}"),
+                    group: &group,
+                    label: t.clone(),
+                    path: lib.join(&t),
+                    regen: format!("reinstall with rustup target add --toolchain {toolchain} {t}"),
+                    spec: Some(spec),
+                    note: Some("removed with the toolchain too".to_string()),
+                },
             );
         }
     }
@@ -1273,6 +1325,50 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("cargo and rustc stop working")
+        );
+    }
+
+    #[test]
+    fn rust_targets_are_listed_per_toolchain_without_the_host_target() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        let tc = home.join(".rustup/toolchains/stable-x86_64-apple-darwin");
+        let lib = tc.join("lib/rustlib");
+        for t in [
+            "x86_64-apple-darwin",
+            "wasm32-unknown-unknown",
+            "aarch64-apple-darwin",
+        ] {
+            mk(&lib.join(t).join("lib"));
+            fs::write(lib.join(format!("manifest-rust-std-{t}")), "").unwrap();
+        }
+        fs::write(lib.join("manifest-rustc-x86_64-apple-darwin"), "").unwrap();
+        // A manifest without its folder, and a toolchain with no targets at all.
+        fs::write(lib.join("manifest-rust-std-gone"), "").unwrap();
+        mk(&home.join(".rustup/toolchains/1.88-x86_64-apple-darwin/lib/rustlib"));
+
+        // Without rustup nothing is listed: a folder move would corrupt its record.
+        assert!(entries(home, SectionKind::RustTargets).is_empty());
+
+        exe(&home.join(".cargo/bin/rustup"));
+        let got = entries(home, SectionKind::RustTargets);
+        let labels: Vec<&str> = got.iter().map(|r| r.entry.label.as_str()).collect();
+        assert_eq!(labels, ["aarch64-apple-darwin", "wasm32-unknown-unknown"]);
+        assert_eq!(
+            got[1].entry.id,
+            "rustup-target:stable-x86_64-apple-darwin:wasm32-unknown-unknown"
+        );
+        assert_eq!(got[1].entry.tool, "Rust stable-x86_64-apple-darwin");
+        assert_eq!(got[1].entry.path, lib.join("wasm32-unknown-unknown"));
+        assert_eq!(
+            command(&got[1]),
+            [
+                "target",
+                "remove",
+                "--toolchain",
+                "stable-x86_64-apple-darwin",
+                "wasm32-unknown-unknown"
+            ]
         );
     }
 

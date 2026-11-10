@@ -28,6 +28,8 @@ pub enum SectionKind {
     PythonVersions,
     UvTools,
     RustToolchains,
+    /// The extra targets of a toolchain (`rustup target remove`).
+    RustTargets,
     CargoBinaries,
     PnpmGlobals,
     AndroidSdk,
@@ -58,7 +60,7 @@ impl SectionKind {
     }
 
     /// Sections in the order they are listed.
-    pub const ALL: [SectionKind; 14] = [
+    pub const ALL: [SectionKind; 15] = [
         SectionKind::Projects,
         SectionKind::Tools,
         SectionKind::NodeVersions,
@@ -68,6 +70,7 @@ impl SectionKind {
         SectionKind::PythonVersions,
         SectionKind::UvTools,
         SectionKind::RustToolchains,
+        SectionKind::RustTargets,
         SectionKind::CargoBinaries,
         SectionKind::AndroidSdk,
         SectionKind::Simulators,
@@ -773,11 +776,15 @@ impl Targets {
                 .then_with(|| a.path.cmp(&b.path))
         });
         // The outer folder only wins within its own page, and a global package
-        // sits inside its Node version's folder on purpose.
+        // sits inside its Node version's folder on purpose (and a Rust target
+        // inside its toolchain's).
         let mut kept: HashSet<(Page, PathBuf)> = HashSet::new();
         cands.retain(|c| {
             let page = c.section.page();
-            let nested_ok = c.section == SectionKind::NodeGlobals;
+            let nested_ok = matches!(
+                c.section,
+                SectionKind::NodeGlobals | SectionKind::RustTargets
+            );
             if !nested_ok
                 && c.path
                     .ancestors()
