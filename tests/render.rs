@@ -3212,9 +3212,7 @@ fn time_machine_heading_is_the_select_all_row_and_measuring_shows_state() {
 #[test]
 fn the_review_shows_what_a_marked_default_node_version_may_disturb() {
     use maccleanup::targets::Line;
-    use std::os::unix::fs::symlink;
-    let base = "home";
-    let _ = base;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     let mut e = make_app_with(
         &[
             (
@@ -3235,6 +3233,12 @@ fn the_review_shows_what_a_marked_default_node_version_may_disturb() {
                 fnm.join("aliases/default"),
             )
             .unwrap();
+            // A stand-in `fnm` inside the sandbox, so the test does not depend
+            // on fnm being installed on the machine that runs it.
+            let fake = home.join(".volta/bin/fnm");
+            fs::create_dir_all(fake.parent().unwrap()).unwrap();
+            fs::write(&fake, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
         },
     );
     e.app.update(Action::GoTo(Screen::Runtimes));
