@@ -102,9 +102,9 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 - Graph clicks: `graph::render_data` returns the clickable area of every box or bar (`GraphHit`), `ui::draw` clears `App::graph_hits` each frame and the screens store what they drew; `App::click` maps a hit to the list selection. A new graph must return its hits the same way.
 - Treemap nesting and hover: `graph::render_data` returns a `GraphOut` (`hits` plus `tips`, stored with `GraphOut::store`). A treemap box whose row has a scan `Node` and is at least `NEST_MIN_W x NEST_MIN_H` cells keeps one cell of border (the top one carries the name) and draws its sub-folders plus one "(files in X)" box inside, recursively to `NEST_MAX_DEPTH`; sub-boxes are weighed like the row (`GraphData::by_size`). `fill_color(safety, selected, index, depth)` uses a darker shade set on odd depths so a box never matches the one holding it (tested). Every box and bar adds a `GraphTip` (parents before children); `Action::Hover` (mouse move) sets `App::hover`, any other action restarts `hover_since`, and `graph::tooltip` (last thing `ui::draw` paints, no dialog open) shows the innermost tip after `HOVER_TICKS`. Clicks on a nested box still select its top-level row.
 - The review list scrolls as ONE list: folders, then the commands block (`Review::body_len` counts its lines and `dialogs::review` must build exactly that many: a `debug_assert` checks). `App::review_scroll` is reset by `open_review`; `layout.review_rows` is how many lines fit, written by `ui::draw` from `dialogs::review_layout(..).body_rows`. While a review is open the navigation actions scroll it and nothing else moves. Nothing is cut on a short terminal; instead `y` is refused while the list scrolls, holds commands and `App::review_seen_end` is false (set when the scroll reaches the end, reset by `open_review`), so a command that was never on screen cannot run. `review_rows == 0` (no frame drawn yet, as in unit tests) counts as fitting.
-- Menu digits: a digit key is always the page's position in `SIDEBAR` (`Action::Menu(n)`, 1-based; planned pages show their "coming" notice). Never map a digit to a screen by hand; adding or moving a menu entry changes the numbers, so update the README key table.
+- Menu digits: a digit key is always the page's position in `SIDEBAR` (`Action::Menu(n)`, 1-based; planned pages show their "coming" notice). Never map a digit to a screen by hand; adding or moving a menu entry changes the numbers, so update the docs/keys.md key table.
 - Screens look and behave like the Explorer wherever the content allows: same columns in the same order, same sort cycle, same graph pane and keys (`g`, `[`, `]`), same filter, totals line, scrollbar, keys and mouse. A change to the Explorer's columns, keys or sort is made on every such screen in the same commit.
-- Sort order (`s`, `Action::CycleSort`) must always follow the order the column headers are drawn in the explorer (now Name, Size, On disk, Frees, Modified). Whenever a column is added, moved or removed, change the cycle, the tests and the README key table together.
+- Sort order (`s`, `Action::CycleSort`) must always follow the order the column headers are drawn in the explorer (now Name, Size, On disk, Frees, Modified). Whenever a column is added, moved or removed, change the cycle, the tests and the docs/keys.md key table together.
 - All file names shown on screen go through `ui::clean`/`fit`/`fit_start` (control characters and, in ASCII mode, non-ASCII become `?`); paths keep their tail, names keep their head.
 
 ### Testing
@@ -113,7 +113,7 @@ Add dependencies only with `cargo add`. Rust 2024 edition; ratatui 0.30 (use its
 
 ## Design
 
-Uninstaller and Leftovers pages: `docs/superpowers/specs/2026-11-07-uninstaller-leftovers-design.md` (built in 0.9.0; what is left is in the README, "What is left").
+Uninstaller and Leftovers pages: `docs/superpowers/specs/2026-11-07-uninstaller-leftovers-design.md` (built in 0.9.0; what is left is in `docs/known-limits.md`).
 
 Time Machine snapshots page: `docs/superpowers/specs/2026-11-07-timemachine-design.md` (built; plan in `docs/superpowers/plans/2026-11-07-timemachine.md`). Packages & runtimes page (in progress): `docs/superpowers/specs/2026-11-07-packages-runtimes-design.md`.
 
@@ -121,7 +121,7 @@ The approved design is `docs/superpowers/specs/2026-11-06-maccleanup-design.md`.
 
 ## Documentation upkeep
 
-Always keep `CLAUDE.md` and `README.md` up to date. Whenever you add or change a command, feature, rule, key binding, build step, or convention, update both (and the design doc if a decision changed) in the same change. Commands in `README.md` must reflect what actually works.
+Always keep `CLAUDE.md`, `README.md` (short, for users) and the detail documents in `docs/` (`features.md`, `keys.md`, `safety.md`, `known-limits.md`, `development.md`) up to date. Whenever you add or change a command, feature, rule, key binding, build step, or convention, update both (and the design doc if a decision changed) in the same change. Commands in `README.md` must reflect what actually works.
 
 ## Git
 

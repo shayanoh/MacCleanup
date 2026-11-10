@@ -2,6 +2,19 @@
 name = "maccleanup"
 version = "0.9.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A colorful terminal app for macOS that shows where your disk space went and cleans it up safely"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/shayanoh/MacCleanup"
+homepage = "https://github.com/shayanoh/MacCleanup"
+keywords = ["macos", "disk-usage", "cleanup", "tui", "cache"]
+categories = ["command-line-utilities", "filesystem"]
+exclude = [".github/", "docs/", "scripts/", "CLAUDE.md", "makefile"]
+
+[package.metadata.docs.rs]
+# the code uses macOS system calls, so docs.rs must build for a Mac
+targets = ["aarch64-apple-darwin"]
 
 [dependencies]
 anyhow = "1.0.104"
