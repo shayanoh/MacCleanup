@@ -20,6 +20,11 @@ import unicodedata
 
 BIN = sys.argv[1]
 ROWS, COLS = 30, int(os.environ.get("COLS", 100))
+# These two pages read the real machine (/Applications, Spotlight). A CI
+# runner has several full Xcode installs, so there the lookup can outlast any
+# sensible wait: a page that is up and showing its progress counts as opened.
+ON_CI = bool(os.environ.get("CI"))
+BUILDING = "Building the list"
 
 
 class Screen:
@@ -329,9 +334,16 @@ if os.environ.get("EARLY"):
         print(f"=== UNINSTALL after +{delay}s ===")
         print("\n".join(screen.text().split("\n")[:12]))
 wait_for("Uninstall")
-wait_for("INSTALLED APPS", timeout=60.0)
-if COLS >= 140:
-    wait_for("Opened")
+end = time.time() + 60.0
+while time.time() < end and "INSTALLED APPS" not in screen.text():
+    if ON_CI and BUILDING in screen.text():
+        break
+    pump(0.1)
+if "INSTALLED APPS" in screen.text():
+    if COLS >= 140:
+        wait_for("Opened")
+elif not (ON_CI and BUILDING in screen.text()):
+    fail("never saw 'INSTALLED APPS'")
 if os.environ.get("FILTER"):
     send(b"/" + os.environ["FILTER"].encode() + b"\r")
 if os.environ.get("DUMP"):
@@ -345,6 +357,8 @@ end = time.time() + 60.0
 while time.time() < end:
     t = screen.text()
     if "LEFT BEHIND" in t or "nothing is listed" in t or "(nothing found)" in t:
+        break
+    if ON_CI and BUILDING in t:
         break
     pump(0.2)
 else:
